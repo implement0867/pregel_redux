@@ -1,0 +1,115 @@
+[project]
+name = "pregel-redux"
+version = "0.1.0"
+description = "Pregel-style graph computation"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = []
+
+[build-system]
+requires = ["uv_build>=0.13.7,<0.14.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    "basedpyright>=1.40.2",
+    "pytest>=9.2.0",
+    "ruff>=0.17.4",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+filterwarnings = ["error"]
+
+[tool.basedpyright]
+pythonVersion = "3.12"
+include = ["src"]
+typeCheckingMode = "recommended"
+enableTypeIgnoreComments = false
+reportAny = "hint"
+reportConstantRedefinition = "none"
+reportExplicitAny = "none"
+reportImplicitOverride = "none"
+reportImplicitStringConcatenation = "none"
+reportInvalidCast = "none"
+reportMissingModuleSource = "none"
+reportMissingSuperCall = "none"
+reportMissingTypeStubs = "hint"
+reportUnannotatedClassAttribute = "none"
+reportUnknownLambdaType = "none"
+reportUnknownMemberType = "information"
+reportUnnecessaryComparison = "hint"
+reportUnsafeMultipleInheritance = "none"
+reportUnusedCallResult = "none"
+reportUnusedImport = "none"
+reportUnusedParameter = "none"
+
+[tool.ruff]
+line-length = 120
+target-version = "py312"
+
+[tool.ruff.lint]
+select = [
+    "A",
+    "ANN001",
+    "ANN201",
+    "ANN205",
+    "ANN206",
+    "ASYNC",
+    "B",
+    "BLE",
+    "C4",
+    "DTZ",
+    "ERA",
+    "F",
+    "FA",
+    "FAST",
+    "FBT",
+    "FLY",
+    "FURB",
+    "I",
+    "INP",
+    "N",
+    "NPY",
+    "PD",
+    "PERF",
+    "PIE",
+    "PLC0105",
+    "PLC0131",
+    "PLC0132",
+    "PLC0207",
+    "PLC0208",
+    "PLE",
+    "PLR",
+    "PLW",
+    "PYI",
+    "RET",
+    "RUF",
+    "SIM",
+    "TRY",
+    "UP",
+    "YTT",
+]
+ignore = [
+    "A002",
+    "ASYNC119",
+    "N818",
+    "PLR0904",
+    "PLR0911",
+    "PLR0912",
+    "PLR0913",
+    "PLR0915",
+    "PLR0917",
+    "PLR2004",
+    "PLW0603",
+    "RET504",
+    "RUF001",
+    "RUF077",
+    "RUF105",
+    "RUF106",
+    "RUF201",
+    "TRY003",
+    "UP048",
+    "UP051",
+    "UP052",
+]
