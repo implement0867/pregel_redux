@@ -2,7 +2,18 @@ import dataclasses
 import inspect
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
-from typing import Annotated, Any, NotRequired, Required, TypeVar, get_args, get_origin, get_type_hints, is_typeddict
+from typing import (
+    Annotated,
+    NotRequired,
+    Protocol,
+    Required,
+    TypeVar,
+    get_args,
+    get_origin,
+    get_type_hints,
+    is_typeddict,
+    runtime_checkable,
+)
 
 from pydantic import BaseModel
 
@@ -14,15 +25,22 @@ class Channel:
     reducer: Callable[..., object] | None
 
 
-def substitute_type_arguments(hint: Any, arguments: Mapping[object, object]) -> object:
+@runtime_checkable
+class SubscriptableHint(Protocol):
+    def __getitem__(self, arguments: tuple[object, ...]) -> object: ...
+
+
+def substitute_type_arguments(hint: object, arguments: Mapping[object, object]) -> object:
     match hint:
         case TypeVar():
             return arguments.get(hint, hint)
-        case _:
-            parameters = getattr(hint, "__parameters__", ())
+        case SubscriptableHint():
+            parameters = tuple[object, ...](getattr(hint, "__parameters__", ()))
             if not parameters:
                 return hint
             return hint[tuple(arguments.get(parameter, parameter) for parameter in parameters)]
+        case _:
+            return hint
 
 
 def reducer_from_metadata(metadata: tuple[object, ...]) -> Callable[..., object] | None:

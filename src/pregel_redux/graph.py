@@ -118,7 +118,7 @@ class StateGraph[StateT, InputT, OutputT]:
     def __init__[S, I, O](
         self: "StateGraph[S, I, O]", state_schema: type[S], *, input_schema: type[I], output_schema: type[O]
     ) -> None: ...
-    def __init__(self, state_schema: Any, *, input_schema: Any | None = None, output_schema: Any | None = None) -> None:
+    def __init__(self, state_schema: Any, *, input_schema: Any | None = None, output_schema: Any | None = None) -> None:  # pyright: ignore[reportExplicitAny]
         self.state_schema: type[StateT] = state_schema
         self.input_schema: type[InputT] = state_schema if input_schema is None else input_schema
         self.output_schema: type[OutputT] = state_schema if output_schema is None else output_schema
