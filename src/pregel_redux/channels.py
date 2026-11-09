@@ -10,11 +10,11 @@ from pydantic import BaseModel
 @dataclass(frozen=True)
 class Channel:
     name: str
-    value_type: Any
-    reducer: Callable[[Any, Any], Any] | None
+    value_type: object
+    reducer: Callable[..., object] | None
 
 
-def substitute_type_arguments(hint: Any, arguments: Mapping[Any, Any]) -> Any:
+def substitute_type_arguments(hint: Any, arguments: Mapping[object, object]) -> object:
     match hint:
         case TypeVar():
             return arguments.get(hint, hint)
@@ -25,25 +25,27 @@ def substitute_type_arguments(hint: Any, arguments: Mapping[Any, Any]) -> Any:
             return hint[tuple(arguments.get(parameter, parameter) for parameter in parameters)]
 
 
-def reducer_from_metadata(metadata: tuple[Any, ...]) -> Callable[[Any, Any], Any] | None:
-    if not metadata or not callable(metadata[-1]):
+def reducer_from_metadata(metadata: tuple[object, ...]) -> Callable[..., object] | None:
+    candidate = metadata[-1] if metadata else None
+    if not callable(candidate):
         return None
     positional = [
         parameter
-        for parameter in inspect.signature(metadata[-1]).parameters.values()
+        for parameter in inspect.signature(candidate).parameters.values()
         if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
     ]
-    return metadata[-1] if len(positional) == 2 else None
+    return candidate if len(positional) == 2 else None
 
 
-def channel_from_hint(name: str, hint: Any) -> Channel:
+def channel_from_hint(name: str, hint: object) -> Channel:
     unwrapped = get_args(hint)[0] if get_origin(hint) in (Required, NotRequired) else hint
     if get_origin(unwrapped) is Annotated:
-        return Channel(name, unwrapped.__origin__, reducer_from_metadata(unwrapped.__metadata__))
+        value_type, *metadata = get_args(unwrapped)
+        return Channel(name, value_type, reducer_from_metadata(tuple(metadata)))
     return Channel(name, unwrapped, None)
 
 
-def field_hints(schema_class: object) -> dict[str, Any]:
+def field_hints(schema_class: object) -> dict[str, object]:
     if is_typeddict(schema_class):
         return get_type_hints(schema_class, include_extras=True)
     if dataclasses.is_dataclass(schema_class):
@@ -62,7 +64,7 @@ def channels_from_schema(schema: object) -> dict[str, Channel]:
         case _:
             origin = get_origin(schema)
             hints = field_hints(schema if origin is None else origin)
-            arguments: dict[Any, Any] = (
+            arguments: dict[object, object] = (
                 {} if origin is None else dict(zip(origin.__parameters__, get_args(schema), strict=True))
             )
             return {
@@ -71,7 +73,7 @@ def channels_from_schema(schema: object) -> dict[str, Channel]:
             }
 
 
-def merge_channels(schemas: Iterable[Any]) -> dict[str, Channel]:
+def merge_channels(schemas: Iterable[object]) -> dict[str, Channel]:
     merged: dict[str, Channel] = {}
     for schema in schemas:
         for name, channel in channels_from_schema(schema).items():
@@ -83,7 +85,7 @@ def merge_channels(schemas: Iterable[Any]) -> dict[str, Channel]:
     return merged
 
 
-def writes_from_update(update: Any) -> dict[str, Any]:
+def writes_from_update(update: object) -> dict[str, object]:
     match update:
         case None:
             return {}
@@ -98,8 +100,8 @@ def writes_from_update(update: Any) -> dict[str, Any]:
 
 
 def apply_writes(
-    channels: Mapping[str, Channel], values: Mapping[str, Any], updates: Iterable[Mapping[str, Any]]
-) -> dict[str, Any]:
+    channels: Mapping[str, Channel], values: Mapping[str, object], updates: Iterable[Mapping[str, object]]
+) -> dict[str, object]:
     result = dict(values)
     written: set[str] = set()
     for update in updates:

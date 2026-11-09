@@ -29,7 +29,7 @@ class CompiledNode:
 
 @dataclass(frozen=True)
 class NodeResult:
-    writes: Mapping[str, Any]
+    writes: Mapping[str, object]
     targets: frozenset[str]
 
 
@@ -46,7 +46,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
     async def ainvoke(self, input: InputT, *, step_limit: int = 25) -> OutputT:
         values = apply_writes(self.channels, {}, [writes_from_update(input)])
         scheduled = self.entry_nodes
-        run_values: dict[Depends, Any] = {}
+        run_values: dict[Depends, object] = {}
         steps = 0
         async with AsyncExitStack() as run_exits:
             while scheduled:
@@ -63,7 +63,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         return self.output_schema(**{name: values[name] for name in self.output_fields if name in values})
 
     async def run_step(
-        self, names: Sequence[str], values: Mapping[str, Any], run_values: Mapping[Depends, Any]
+        self, names: Sequence[str], values: Mapping[str, object], run_values: Mapping[Depends, object]
     ) -> list[NodeResult]:
         try:
             async with asyncio.TaskGroup() as group:
@@ -75,9 +75,9 @@ class CompiledGraph[StateT, InputT, OutputT]:
         return [task.result() for task in tasks]
 
     async def run_node(
-        self, node: CompiledNode, values: Mapping[str, Any], run_values: Mapping[Depends, Any]
+        self, node: CompiledNode, values: Mapping[str, object], run_values: Mapping[Depends, object]
     ) -> NodeResult:
-        node_values = ChainMap[Depends, Any]({}, dict(run_values))
+        node_values = ChainMap[Depends, object]({}, dict(run_values))
         async with AsyncExitStack() as node_exits:
             update = await call_with_dependencies(node.action, self.state_from(values), node_values, node_exits)
             writes = writes_from_update(update)
@@ -88,11 +88,11 @@ class CompiledGraph[StateT, InputT, OutputT]:
             ]
         return NodeResult(writes, node.targets.union(*(self.targets_from_route(route) for route in routes)))
 
-    def state_from(self, values: Mapping[str, Any]) -> StateT:
+    def state_from(self, values: Mapping[str, object]) -> StateT:
         return self.state_schema(**{name: values[name] for name in self.state_fields if name in values})
 
-    def targets_from_route(self, route: Any) -> frozenset[str]:
-        selections: Sequence[Any]
+    def targets_from_route(self, route: object) -> frozenset[str]:
+        selections: Sequence[object]
         match route:
             case str() | Endpoint.end:
                 selections = [route]
@@ -138,18 +138,18 @@ class StateGraph[StateT, InputT, OutputT]:
         self.routers.setdefault(source, []).append(router)
 
     @property
-    def dependencies(self) -> frozenset[Callable[..., Any]]:
+    def dependencies(self) -> frozenset[Callable[..., object]]:
         functions = [*self.nodes.values(), *(router for routers in self.routers.values() for router in routers)]
         plans = [plan_call(function, {}) for function in functions]
         return frozenset(
             item.request.dependency for plan in plans for item in (*plan.run_providers, *plan.node_providers)
         )
 
-    def compile(
-        self, dependency_overrides: Mapping[Callable[..., Any], Callable[..., Any]] | None = None
+    def compile[ProviderT: Callable[..., object]](
+        self, dependency_overrides: Mapping[ProviderT, Callable[..., object]] | None = None
     ) -> CompiledGraph[StateT, InputT, OutputT]:
-        overrides: Mapping[Callable[..., Any], Callable[..., Any]] = (
-            {} if dependency_overrides is None else dependency_overrides
+        overrides: dict[Callable[..., object], Callable[..., object]] = (
+            {} if dependency_overrides is None else dict(dependency_overrides.items())
         )
         endpoints = {endpoint for edge in self.edges for endpoint in edge if isinstance(endpoint, str)}
         unknown = sorted((endpoints | self.routers.keys()) - self.nodes.keys())
