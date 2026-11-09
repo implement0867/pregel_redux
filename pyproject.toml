@@ -30,7 +30,6 @@ typeCheckingMode = "recommended"
 enableTypeIgnoreComments = false
 reportAny = "hint"
 reportConstantRedefinition = "none"
-reportExplicitAny = "none"
 reportImplicitOverride = "none"
 reportImplicitStringConcatenation = "none"
 reportInvalidCast = "none"
