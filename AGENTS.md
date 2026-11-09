@@ -43,3 +43,4 @@
 
 - Subscribe to your PRs.
 - Response style applies to PRs, comments.
+- A Git hook reminder about uncommitted or unpushed changes needs no reply in the chat. During a discussion, do not add a paragraph that says the changes are not committed or not pushed.
