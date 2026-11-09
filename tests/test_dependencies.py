@@ -6,7 +6,7 @@ from typing import Annotated, Literal, TypedDict
 
 import pytest
 
-from pregel_redux import Depends, Endpoint, Scope, StateGraph, provider
+from pregel_redux import Depends, Endpoint, Scope, StateGraph
 
 
 class State(TypedDict, total=False):
@@ -61,13 +61,12 @@ def test_node_scoped_provider_opens_and_closes_for_each_node_call() -> None:
 def test_run_scoped_provider_opens_one_time_and_closes_when_the_run_ends() -> None:
     journal = Journal()
 
-    @provider(scope=Scope.run)
     def client() -> Iterator[int]:
         number = journal.open("client")
         yield number
         journal.events.append(f"close client {number}")
 
-    async def use(state: State, number: Annotated[int, Depends(client)]) -> State:
+    async def use(state: State, number: Annotated[int, Depends(client, scope=Scope.run)]) -> State:
         journal.events.append("node")
         return {"seen": [number]}
 
@@ -81,11 +80,10 @@ def test_run_scoped_provider_opens_one_time_and_closes_when_the_run_ends() -> No
 def test_run_scoped_provider_of_a_node_that_never_runs_is_not_opened() -> None:
     journal = Journal()
 
-    @provider(scope=Scope.run)
     def client() -> int:
         return journal.open("client")
 
-    def use(state: State, number: Annotated[int, Depends(client)]) -> State:
+    def use(state: State, number: Annotated[int, Depends(client, scope=Scope.run)]) -> State:
         return {"seen": [number]}
 
     builder = StateGraph(State)
@@ -177,18 +175,17 @@ def test_run_scoped_provider_that_requests_a_node_scoped_provider_is_rejected_by
     def short() -> int:
         return 1
 
-    @provider(scope=Scope.run)
     def long(value: Annotated[int, Depends(short)]) -> int:
         return value
 
-    def use(state: State, value: Annotated[int, Depends(long)]) -> None:
+    def use(state: State, value: Annotated[int, Depends(long, scope=Scope.run)]) -> None:
         return None
 
     builder = StateGraph(State)
     builder.add_node("use", use)
     builder.add_edge(Endpoint.start, "use")
 
-    with pytest.raises(ValueError, match="requests node-scoped provider"):
+    with pytest.raises(ValueError, match="requests node-scoped dependency"):
         builder.compile()
 
 
@@ -222,3 +219,20 @@ def test_dependency_cycle_is_rejected_by_compile() -> None:
 
     with pytest.raises(ValueError, match="dependency cycle"):
         builder.compile()
+
+
+def test_one_provider_requested_with_two_scopes_gives_two_values() -> None:
+    journal = Journal()
+
+    def number() -> int:
+        return journal.open("number")
+
+    def use_run(state: State, value: Annotated[int, Depends(number, scope=Scope.run)]) -> State:
+        return {"seen": [value]}
+
+    def use_node(state: State, value: Annotated[int, Depends(number)]) -> State:
+        return {"seen": [value]}
+
+    graph = build_two_node_graph(use_run, use_node, parallel=False).compile()
+
+    assert asyncio.run(graph.ainvoke({})) == {"seen": [1, 2]}

@@ -7,7 +7,7 @@ from enum import Enum
 from typing import Any, Concatenate, Literal, overload
 
 from pregel_redux.channels import Channel, apply_writes, channels_from_schema, merge_channels, writes_from_update
-from pregel_redux.dependencies import CallPlan, Dependency, call_with_dependencies, open_providers, plan_call
+from pregel_redux.dependencies import CallPlan, Depends, call_with_dependencies, open_providers, plan_call
 
 
 class Endpoint(Enum):
@@ -46,7 +46,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
     async def ainvoke(self, input: InputT, *, step_limit: int = 25) -> OutputT:
         values = apply_writes(self.channels, {}, [writes_from_update(input)])
         scheduled = self.entry_nodes
-        run_values: dict[Dependency, Any] = {}
+        run_values: dict[Depends, Any] = {}
         steps = 0
         async with AsyncExitStack() as run_exits:
             while scheduled:
@@ -63,7 +63,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         return self.output_schema(**{name: values[name] for name in self.output_fields if name in values})
 
     async def run_step(
-        self, names: Sequence[str], values: Mapping[str, Any], run_values: Mapping[Dependency, Any]
+        self, names: Sequence[str], values: Mapping[str, Any], run_values: Mapping[Depends, Any]
     ) -> list[NodeResult]:
         try:
             async with asyncio.TaskGroup() as group:
@@ -75,9 +75,9 @@ class CompiledGraph[StateT, InputT, OutputT]:
         return [task.result() for task in tasks]
 
     async def run_node(
-        self, node: CompiledNode, values: Mapping[str, Any], run_values: Mapping[Dependency, Any]
+        self, node: CompiledNode, values: Mapping[str, Any], run_values: Mapping[Depends, Any]
     ) -> NodeResult:
-        node_values = ChainMap[Dependency, Any]({}, dict(run_values))
+        node_values = ChainMap[Depends, Any]({}, dict(run_values))
         async with AsyncExitStack() as node_exits:
             update = await call_with_dependencies(node.action, self.state_from(values), node_values, node_exits)
             writes = writes_from_update(update)
@@ -138,15 +138,19 @@ class StateGraph[StateT, InputT, OutputT]:
         self.routers.setdefault(source, []).append(router)
 
     @property
-    def dependencies(self) -> frozenset[Dependency]:
+    def dependencies(self) -> frozenset[Callable[..., Any]]:
         functions = [*self.nodes.values(), *(router for routers in self.routers.values() for router in routers)]
         plans = [plan_call(function, {}) for function in functions]
-        return frozenset(item.key for plan in plans for item in (*plan.run_providers, *plan.node_providers))
+        return frozenset(
+            item.request.dependency for plan in plans for item in (*plan.run_providers, *plan.node_providers)
+        )
 
     def compile(
-        self, dependency_overrides: Mapping[Dependency, Dependency] | None = None
+        self, dependency_overrides: Mapping[Callable[..., Any], Callable[..., Any]] | None = None
     ) -> CompiledGraph[StateT, InputT, OutputT]:
-        overrides: Mapping[Dependency, Dependency] = {} if dependency_overrides is None else dependency_overrides
+        overrides: Mapping[Callable[..., Any], Callable[..., Any]] = (
+            {} if dependency_overrides is None else dependency_overrides
+        )
         endpoints = {endpoint for edge in self.edges for endpoint in edge if isinstance(endpoint, str)}
         unknown = sorted((endpoints | self.routers.keys()) - self.nodes.keys())
         if unknown:
