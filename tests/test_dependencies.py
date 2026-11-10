@@ -2,7 +2,7 @@ import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import nullcontext as does_not_raise
 from operator import add
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, TypedDict
 
 import pytest
 
@@ -227,26 +227,6 @@ def test_provider_requested_two_times_in_one_node_call_runs_one_time(journal: Jo
     )
 
 
-def test_router_receives_dependencies_of_the_same_node_call(journal: Journal) -> None:
-    def provide_number() -> int:
-        return journal.open_resource("number")
-
-    def use_value(state: State, value: Annotated[int, Depends(provide_number)]) -> State:
-        return {"seen": [value]}
-
-    def choose_route(state: State, value: Annotated[int, Depends(provide_number)]) -> Literal[Endpoint.end]:
-        journal.events.append(f"route {value}")
-        return Endpoint.end
-
-    builder = build_one_node_graph(use_value)
-    builder.add_conditional_edges("use", choose_route)
-    expected_events = ["open number 1", "route 1"]
-
-    asyncio.run(builder.compile().ainvoke({}))
-
-    assert journal.events == expected_events, f"Expected {expected_events}, got {journal.events}."
-
-
 @pytest.mark.parametrize("error_type", [LookupError, ValueError, RuntimeError])
 def test_provider_cleanup_receives_the_exception_of_the_node(error_type: type[Exception]) -> None:
     caught: list[BaseException] = []
@@ -438,27 +418,6 @@ def test_node_receives_the_state_through_the_state_dependency(seen: list[int]) -
     actual = asyncio.run(build_one_node_graph(use_value).compile().ainvoke({"seen": seen}))
 
     assert actual == {"seen": [*seen, len(seen)]}, f"Expected the state dependency to equal the state, got {actual}."
-
-
-def test_provider_of_a_router_receives_the_writes_of_its_node() -> None:
-    counts: list[int] = []
-
-    def count_values(state: StateDep[State]) -> int:
-        return len(state.get("seen", []))
-
-    def use_value(state: State) -> State:
-        return {"seen": [1]}
-
-    def choose_route(state: State, count: Annotated[int, Depends(count_values)]) -> Literal[Endpoint.end]:
-        counts.append(count)
-        return Endpoint.end
-
-    builder = build_one_node_graph(use_value)
-    builder.add_conditional_edges("use", choose_route)
-
-    asyncio.run(builder.compile().ainvoke({}))
-
-    assert counts == [1], f"Expected the router provider to see one value, got {counts}."
 
 
 def test_type_alias_with_depends_supplies_its_value() -> None:

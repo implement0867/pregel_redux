@@ -5,7 +5,7 @@ from typing import Annotated, Literal, TypedDict
 
 import pytest
 
-from pregel_redux import Endpoint, StateGraph
+from pregel_redux import Command, Endpoint, StateGraph
 
 
 class State[T](TypedDict, total=False):
@@ -55,22 +55,18 @@ def build_parallel_graph[T](produce: Callable[[], T]) -> StateGraph[State[T], St
 
 
 def build_routed_graph(results: list[bool]) -> StateGraph[State[str], State[str], State[str]]:
-    def skip_update(state: State[str]) -> None:
-        return None
+    def route_work(state: State[str]) -> Command[Literal["work"]]:
+        return Command(goto=Endpoint.end if state.get("items") else "work")
 
     def do_work(state: State[str]) -> State[str]:
         if results.pop(0):
             return {"items": ["done"]}
         return {"failures": state.get("failures", 0) + 1}
 
-    def choose_route(state: State[str]) -> str | Literal[Endpoint.end]:
-        return Endpoint.end if state.get("items") else "work"
-
     builder = StateGraph(State[str])
-    builder.add_node("router", skip_update)
+    builder.add_node("router", route_work)
     builder.add_node("work", do_work)
     builder.add_edge(Endpoint.start, "router")
-    builder.add_conditional_edges("router", choose_route)
     builder.add_edge("work", "router")
     return builder
 
@@ -81,10 +77,6 @@ def add_edge_to_unknown_target(builder: StateGraph[State[int], State[int], State
 
 def add_edge_from_unknown_source(builder: StateGraph[State[int], State[int], State[int]]) -> None:
     builder.add_edge("missing", "first")
-
-
-def add_router_to_unknown_source(builder: StateGraph[State[int], State[int], State[int]]) -> None:
-    builder.add_conditional_edges("missing", lambda state: Endpoint.end)
 
 
 @pytest.fixture
@@ -163,28 +155,6 @@ def test_router_runs_a_failed_node_again_as_a_routing_decision(
     assert actual == expected, f"Expected {expected}, got {actual}. The router must schedule the node until it is done."
 
 
-def test_router_receives_the_writes_of_its_own_node() -> None:
-    def write_latest(state: State[int]) -> State[int]:
-        return {"latest": 5}
-
-    def choose_route(state: State[int]) -> list[str | Literal[Endpoint.end]]:
-        return ["record"] if state.get("latest") == 5 else [Endpoint.end]
-
-    def record_latest(state: State[int]) -> State[int]:
-        return {"items": [state.get("latest", 0)]}
-
-    builder = StateGraph(State[int])
-    builder.add_node("write", write_latest)
-    builder.add_node("record", record_latest)
-    builder.add_edge(Endpoint.start, "write")
-    builder.add_conditional_edges("write", choose_route)
-    expected = {"latest": 5, "items": [5]}
-
-    actual = asyncio.run(builder.compile().ainvoke({}))
-
-    assert actual == expected, f"Expected {expected}, got {actual}. The router must see the write of its own node."
-
-
 @pytest.mark.parametrize("step_limit", [1, 2, 4, 9])
 def test_graph_that_does_not_finish_within_the_step_limit_raises(step_limit: int) -> None:
     graph = build_routed_graph([False] * 10).compile()
@@ -232,27 +202,9 @@ def test_exceptions_of_two_nodes_leave_the_run_as_a_group(
     assert actual == {LookupError, ValueError}, f"Expected the two node exceptions, got {actual}."
 
 
-@pytest.mark.parametrize("route", ["missing", ["first", "missing"]], ids=["name", "sequence"])
-def test_router_that_returns_an_unknown_node_raises(
-    parallel_builder: StateGraph[State[int], State[int], State[int]], route: str | list[str]
-) -> None:
-    parallel_builder.add_conditional_edges("first", lambda state: route)
-
-    with pytest.raises(ValueError):
-        asyncio.run(parallel_builder.compile().ainvoke({}))
-
-
-@pytest.mark.parametrize("route", [3, None, 1.5], ids=repr)
-def test_route_of_an_unsupported_type_is_rejected(
-    parallel_builder: StateGraph[State[int], State[int], State[int]], route: object
-) -> None:
-    with pytest.raises(TypeError):
-        parallel_builder.compile().resolve_targets(route)
-
-
 @pytest.mark.parametrize(
     "add_invalid_edge",
-    [add_edge_to_unknown_target, add_edge_from_unknown_source, add_router_to_unknown_source],
+    [add_edge_to_unknown_target, add_edge_from_unknown_source],
 )
 def test_edge_of_an_unknown_node_is_rejected_by_compile(
     parallel_builder: StateGraph[State[int], State[int], State[int]],
