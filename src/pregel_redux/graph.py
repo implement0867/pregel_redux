@@ -57,17 +57,24 @@ class CompiledGraph[StateT, InputT, OutputT]:
                 for name in names:
                     for plan in (self.nodes[name].action, *self.nodes[name].routers):
                         await open_providers(plan.run_providers, run_values, run_exits)
-                results = await self.run_step(names, values, run_values)
-                values = apply_writes(self.channels, values, [result.writes for result in results])
+                async with AsyncExitStack() as step_exits:
+                    results = await self.run_step(names, values, run_values, step_exits)
+                    values = apply_writes(self.channels, values, [result.writes for result in results])
                 scheduled = frozenset[str]().union(*(result.targets for result in results))
         return self.output_schema(**{name: values[name] for name in self.output_fields if name in values})
 
     async def run_step(
-        self, names: Sequence[str], values: Mapping[str, object], run_values: Mapping[Depends, object]
+        self,
+        names: Sequence[str],
+        values: Mapping[str, object],
+        run_values: Mapping[Depends, object],
+        step_exits: AsyncExitStack,
     ) -> list[NodeResult]:
         try:
             async with asyncio.TaskGroup() as group:
-                tasks = [group.create_task(self.run_node(self.nodes[name], values, run_values)) for name in names]
+                tasks = [
+                    group.create_task(self.run_node(self.nodes[name], values, run_values, step_exits)) for name in names
+                ]
         except ExceptionGroup as failures:
             if len(failures.exceptions) == 1:
                 raise failures.exceptions[0] from None
@@ -75,18 +82,24 @@ class CompiledGraph[StateT, InputT, OutputT]:
         return [task.result() for task in tasks]
 
     async def run_node(
-        self, node: CompiledNode, values: Mapping[str, object], run_values: Mapping[Depends, object]
+        self,
+        node: CompiledNode,
+        values: Mapping[str, object],
+        run_values: Mapping[Depends, object],
+        step_exits: AsyncExitStack,
     ) -> NodeResult:
         node_values = ChainMap[Depends, object]({}, dict(run_values))
         async with AsyncExitStack() as node_exits:
             update = await execute_plan(node.action, self.build_state(values), node_values, node_exits)
             writes = extract_writes(update)
-            written = apply_writes(self.channels, values, [writes])
+            written = apply_writes(self.channels, values, [writes]) if node.routers else values
             routes = [
                 await execute_plan(router, self.build_state(written), node_values, node_exits)
                 for router in node.routers
             ]
-        return NodeResult(writes, node.targets.union(*(self.resolve_targets(route) for route in routes)))
+            result = NodeResult(writes, node.targets.union(*(self.resolve_targets(route) for route in routes)))
+            step_exits.push_async_callback(node_exits.pop_all().aclose)
+        return result
 
     def build_state(self, values: Mapping[str, object]) -> StateT:
         return self.state_schema(**{name: values[name] for name in self.state_fields if name in values})

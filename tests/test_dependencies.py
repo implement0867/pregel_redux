@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import nullcontext as does_not_raise
 from operator import add
 from typing import Annotated, Literal, TypedDict
 
@@ -114,26 +115,27 @@ def test_provider_of_each_kind_supplies_its_value(provider: Callable[..., object
     assert actual == {"seen": [7]}, f"Expected the node to receive 7 from {provider.__name__}, got {actual}."
 
 
-@pytest.mark.parametrize("parallel", [True, False], ids=["parallel", "sequential"])
-def test_node_scoped_provider_opens_and_closes_for_each_node_call(journal: Journal, *, parallel: bool) -> None:
+@pytest.mark.parametrize(
+    ("parallel", "expected_events"),
+    [
+        (False, ["open link 1", "node 1", "close 1", "open link 2", "node 2", "close 2"]),
+        (True, ["open link 1", "node 1", "open link 2", "node 2", "close 2", "close 1"]),
+    ],
+    ids=["sequential-closes-after-each-step", "parallel-closes-after-the-step"],
+)
+def test_node_scoped_provider_opens_and_closes_for_each_node_call(
+    journal: Journal, *, parallel: bool, expected_events: list[str]
+) -> None:
     async def open_connection() -> AsyncIterator[int]:
-        number = journal.open_resource("connection")
+        number = journal.open_resource("link")
         yield number
-        journal.events.append(f"close connection {number}")
+        journal.events.append(f"close {number}")
 
     def use_value(state: State, number: Annotated[int, Depends(open_connection)]) -> State:
         journal.events.append(f"node {number}")
         return {"seen": [number]}
 
     graph = build_two_node_graph(use_value, use_value, parallel=parallel).compile()
-    expected_events = [
-        "open connection 1",
-        "node 1",
-        "close connection 1",
-        "open connection 2",
-        "node 2",
-        "close connection 2",
-    ]
 
     actual = asyncio.run(graph.ainvoke({}))
 
@@ -305,3 +307,68 @@ def test_one_provider_requested_with_two_scopes_gives_two_values(journal: Journa
 def test_function_with_too_few_parameters_for_the_state_is_rejected(state_parameters: int) -> None:
     with pytest.raises(TypeError):
         read_dependency_parameters(lambda: None, state_parameters=state_parameters)
+
+
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [None, LookupError("cleanup failed"), ValueError("cleanup failed")],
+    ids=["cleanup-succeeds", "cleanup-raises-lookup-error", "cleanup-raises-value-error"],
+)
+def test_node_scoped_cleanup_runs_after_the_writes_of_the_step_are_applied(
+    journal: Journal, cleanup_error: Exception | None
+) -> None:
+    def combine_values(current: list[int], update: list[int]) -> list[int]:
+        journal.events.append("reduce")
+        return current + update
+
+    class ReducedState(TypedDict, total=False):
+        seen: Annotated[list[int], combine_values]
+
+    def open_connection() -> Iterator[int]:
+        yield 1
+        journal.events.append("cleanup")
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    def use_value(state: ReducedState, value: Annotated[int, Depends(open_connection)]) -> ReducedState:
+        return {"seen": [value]}
+
+    builder = StateGraph(ReducedState)
+    builder.add_node("use", use_value)
+    builder.add_edge(Endpoint.start, "use")
+
+    expectation = does_not_raise() if cleanup_error is None else pytest.raises(type(cleanup_error))
+
+    with expectation:
+        asyncio.run(builder.compile().ainvoke({"seen": [0]}))
+
+    assert journal.events == ["reduce", "cleanup"], (
+        f"Expected the reducer call before the cleanup, got {journal.events}. "
+        "The update of a node must stand before its dependencies close."
+    )
+
+
+@pytest.mark.parametrize("error_type", [LookupError, ValueError])
+def test_cleanup_of_a_finished_node_runs_when_another_node_of_the_step_fails(
+    journal: Journal, error_type: type[Exception]
+) -> None:
+    def open_connection() -> Iterator[int]:
+        number = journal.open_resource("link")
+        yield number
+        journal.events.append(f"close {number}")
+
+    def use_value(state: State, number: Annotated[int, Depends(open_connection)]) -> State:
+        return {"seen": [number]}
+
+    def raise_error(state: State) -> State:
+        raise error_type("no value")
+
+    graph = build_two_node_graph(use_value, raise_error, parallel=True).compile()
+    expected_events = ["open link 1", "close 1"]
+
+    with pytest.raises(error_type):
+        asyncio.run(graph.ainvoke({}))
+
+    assert journal.events == expected_events, (
+        f"Expected {expected_events}, got {journal.events}. A finished node must not keep its dependency open."
+    )
