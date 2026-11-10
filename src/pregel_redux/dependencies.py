@@ -18,6 +18,12 @@ class Depends:
 
 
 def read_state() -> object:
+    """Marker for the state of the current node call.
+
+    The library never calls this function. The library compares a requested dependency
+    against it, and passes the state to the parameter that requests it. To request the
+    state, annotate a parameter with StateDep.
+    """
     raise RuntimeError("read_state supplies a value only as a node-scoped dependency of a graph")
 
 

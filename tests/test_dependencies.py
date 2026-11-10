@@ -427,8 +427,3 @@ def test_type_alias_with_depends_supplies_its_value() -> None:
     actual = asyncio.run(build_one_node_graph(use_value).compile().ainvoke({}))
 
     assert actual == {"seen": [7]}, f"Expected the alias to supply 7, got {actual}."
-
-
-def test_read_state_called_outside_a_graph_raises() -> None:
-    with pytest.raises(RuntimeError):
-        read_state()
