@@ -6,14 +6,14 @@ from typing import Annotated, TypedDict
 
 import pytest
 
-from pregel_redux import Depends, Endpoint, Scope, StateDep, StateGraph
+from pregel_redux import Depends, Endpoint, Reducer, Scope, StateDep, StateGraph
 from pregel_redux.dependencies import read_dependency_parameters, read_state
 from pregel_redux.graph import Node
 from tests.conftest import Journal
 
 
 class State(TypedDict, total=False):
-    seen: Annotated[list[int], add]
+    seen: Annotated[list[int], Reducer(add)]
 
 
 def build_one_node_graph(node: Node[State]) -> StateGraph[State, State, State]:
@@ -324,7 +324,7 @@ def test_node_scoped_cleanup_runs_after_the_writes_of_the_step_are_applied(
         return current + update
 
     class ReducedState(TypedDict, total=False):
-        seen: Annotated[list[int], combine_values]
+        seen: Annotated[list[int], Reducer(combine_values)]
 
     def open_connection() -> Iterator[int]:
         yield 1

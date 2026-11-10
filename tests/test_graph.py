@@ -5,21 +5,21 @@ from typing import Annotated, Literal, TypedDict
 
 import pytest
 
-from pregel_redux import Command, Endpoint, StateGraph
+from pregel_redux import Command, Endpoint, Reducer, StateGraph
 
 
 class State[T](TypedDict, total=False):
-    items: Annotated[list[T], add]
+    items: Annotated[list[T], Reducer(add)]
     latest: T
     failures: int
 
 
 class Input[T](TypedDict):
-    items: Annotated[list[T], add]
+    items: Annotated[list[T], Reducer(add)]
 
 
 class Output[T](TypedDict):
-    items: Annotated[list[T], add]
+    items: Annotated[list[T], Reducer(add)]
     latest: T
 
 

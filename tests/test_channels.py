@@ -6,27 +6,36 @@ from typing import Annotated, NotRequired, TypedDict
 import pytest
 from pydantic import BaseModel
 
-from pregel_redux.channels import Channel, apply_writes, build_channels, extract_writes, merge_channels
+from pregel_redux import Depends
+from pregel_redux.channels import (
+    Channel,
+    Reducer,
+    apply_writes,
+    build_channel,
+    build_channels,
+    extract_writes,
+    merge_channels,
+)
 
 
 class DictState[T](TypedDict):
-    items: Annotated[list[T], add]
+    items: Annotated[list[T], Reducer(add)]
     latest: NotRequired[T]
 
 
 @dataclass
 class DataclassState[T]:
-    items: Annotated[list[T], add]
+    items: Annotated[list[T], Reducer(add)]
     latest: T
 
 
 class ModelState[T](BaseModel):
-    items: Annotated[list[T], add]
+    items: Annotated[list[T], Reducer(add)]
     latest: T
 
 
 class OtherReducerState(TypedDict):
-    items: Annotated[list[int], mul]
+    items: Annotated[list[int], Reducer(mul)]
 
 
 class ModelUpdate(BaseModel):
@@ -73,6 +82,42 @@ def test_unparameterized_generic_schema_keeps_its_type_parameter() -> None:
     actual = build_channels(DictState)["items"]
 
     assert actual == expected, f"Expected {expected}, got {actual}. The type parameter must stay in the value type."
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [(Reducer(add),), (Reducer(add), "note"), ("note", Reducer(add)), ("note", Reducer(add), mul)],
+    ids=["marker-alone", "marker-first", "marker-last", "marker-in-the-middle"],
+)
+def test_reducer_marker_at_any_position_gives_the_reducer_of_the_channel(metadata: tuple[object, ...]) -> None:
+    expected = Channel("items", list[int], add)
+
+    actual = build_channel("items", Annotated[list[int], *metadata])
+
+    assert actual == expected, f"Expected {expected}, got {actual}. The Reducer marker must give the reducer."
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [(add,), (mul,), ("note", add), (Depends(list),)],
+    ids=["add", "mul", "callable-in-last-position", "other-marker"],
+)
+def test_annotation_without_a_reducer_marker_gives_a_channel_without_a_reducer(metadata: tuple[object, ...]) -> None:
+    expected = Channel("items", list[int], None)
+
+    actual = build_channel("items", Annotated[list[int], *metadata])
+
+    assert actual == expected, f"Expected {expected}, got {actual}. Only a Reducer marker declares a reducer."
+
+
+@pytest.mark.parametrize(
+    "metadata",
+    [(Reducer(add), Reducer(add)), (Reducer(add), Reducer(mul)), (Reducer(add), "note", Reducer(mul))],
+    ids=["same-reducer-two-times", "two-reducers", "two-reducers-apart"],
+)
+def test_field_with_more_than_one_reducer_marker_is_rejected(metadata: tuple[object, ...]) -> None:
+    with pytest.raises(TypeError):
+        build_channel("items", Annotated[list[int], *metadata])
 
 
 @pytest.mark.parametrize("schema", [list[int], int, "State", None], ids=repr)

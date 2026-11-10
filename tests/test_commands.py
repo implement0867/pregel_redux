@@ -7,7 +7,7 @@ from typing import Annotated, Literal, TypedDict
 import pytest
 from pydantic import BaseModel, ValidationError
 
-from pregel_redux import Command, Depends, Endpoint, Send, StateDep, StateGraph
+from pregel_redux import Command, Depends, Endpoint, Reducer, Send, StateDep, StateGraph
 from pregel_redux.commands import resolve_goto
 from tests.conftest import Journal
 
@@ -16,8 +16,8 @@ type Goto = str | Literal[Endpoint.end] | Send | list[str | Literal[Endpoint.end
 
 class State(TypedDict, total=False):
     topics: list[str]
-    jokes: Annotated[list[str], add]
-    visits: Annotated[list[str], add]
+    jokes: Annotated[list[str], Reducer(add)]
+    visits: Annotated[list[str], Reducer(add)]
 
 
 class TopicsInput(TypedDict, total=False):

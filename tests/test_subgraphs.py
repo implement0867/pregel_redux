@@ -8,14 +8,14 @@ from typing import Annotated, TypedDict
 
 import pytest
 
-from pregel_redux import Command, Depends, Endpoint, Scope, Send, StateGraph
+from pregel_redux import Command, Depends, Endpoint, Reducer, Scope, Send, StateGraph
 from tests.conftest import Journal
 
 
 class State(TypedDict, total=False):
     topics: list[str]
-    jokes: Annotated[list[str], add]
-    visits: Annotated[list[str], add]
+    jokes: Annotated[list[str], Reducer(add)]
+    visits: Annotated[list[str], Reducer(add)]
 
 
 class TopicsInput(TypedDict, total=False):
@@ -23,7 +23,7 @@ class TopicsInput(TypedDict, total=False):
 
 
 class JokesOutput(TypedDict, total=False):
-    jokes: Annotated[list[str], add]
+    jokes: Annotated[list[str], Reducer(add)]
 
 
 def build_joke_writer(joke: str) -> Callable[[State], JokesOutput]:
