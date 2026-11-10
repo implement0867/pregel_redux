@@ -89,7 +89,8 @@ class CompiledGraph[StateT, InputT, OutputT]:
         step_exits: AsyncExitStack,
     ) -> NodeResult:
         node_values = ChainMap[Depends, object]({}, dict(run_values))
-        async with AsyncExitStack() as node_exits:
+        result: NodeResult | None = None
+        async with AsyncExitStack[bool]() as node_exits:
             update = await execute_plan(node.action, self.build_state(values), node_values, node_exits)
             writes = extract_writes(update)
             written = apply_writes(self.channels, values, [writes]) if node.routers else values
@@ -99,6 +100,8 @@ class CompiledGraph[StateT, InputT, OutputT]:
             ]
             result = NodeResult(writes, node.targets.union(*(self.resolve_targets(route) for route in routes)))
             step_exits.push_async_callback(node_exits.pop_all().aclose)
+        if result is None:
+            raise RuntimeError(f"a dependency of {node.action.function!r} suppressed the exception of its node")
         return result
 
     def build_state(self, values: Mapping[str, object]) -> StateT:

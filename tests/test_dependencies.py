@@ -372,3 +372,18 @@ def test_cleanup_of_a_finished_node_runs_when_another_node_of_the_step_fails(
     assert journal.events == expected_events, (
         f"Expected {expected_events}, got {journal.events}. A finished node must not keep its dependency open."
     )
+
+
+@pytest.mark.parametrize("error_type", [LookupError, ValueError])
+def test_provider_that_suppresses_the_exception_of_its_node_is_rejected(error_type: type[Exception]) -> None:
+    def open_test_resource() -> Iterator[int]:
+        try:
+            yield 1
+        except error_type:
+            return
+
+    def raise_error(state: State, value: Annotated[int, Depends(open_test_resource)]) -> State:
+        raise error_type("no value")
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(build_one_node_graph(raise_error).compile().ainvoke({}))
