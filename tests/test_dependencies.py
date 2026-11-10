@@ -79,6 +79,17 @@ def build_graph_with_two_markers() -> StateGraph[State, State, State]:
     return build_one_node_graph(use_value)
 
 
+def build_graph_with_variadic_parameter() -> StateGraph[State, State, State]:
+    def use_value(state: State, *values: Annotated[int, Depends(return_value)]) -> None:
+        return None
+
+    return build_one_node_graph(use_value)
+
+
+def build_graph_without_state_parameter() -> StateGraph[State, State, State]:
+    return build_one_node_graph(lambda: None)
+
+
 def build_graph_with_dependency_cycle() -> StateGraph[State, State, State]:
     def provide_first(value: int) -> int:
         return value
@@ -262,6 +273,8 @@ def test_override_replaces_a_provider_for_every_node(
         (build_graph_with_plain_parameter, TypeError),
         (build_graph_with_plain_provider_parameter, TypeError),
         (build_graph_with_two_markers, TypeError),
+        (build_graph_with_variadic_parameter, TypeError),
+        (build_graph_without_state_parameter, TypeError),
     ],
 )
 def test_invalid_dependency_is_rejected_by_compile(

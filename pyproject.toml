@@ -16,12 +16,13 @@ build-backend = "uv_build"
 dev = [
     "basedpyright>=1.40.2",
     "pytest>=9.2.0",
+    "pytest-cov>=7.1.0",
     "ruff>=0.17.4",
 ]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["-ra", "--strict-markers", "--strict-config"]
+addopts = ["-ra", "--strict-markers", "--strict-config", "--cov=pregel_redux", "--cov-report=term-missing"]
 filterwarnings = ["error"]
 
 [tool.basedpyright]
@@ -115,3 +116,9 @@ ignore = [
     "UP051",
     "UP052",
 ]
+
+[tool.coverage.run]
+branch = true
+
+[tool.coverage.report]
+fail_under = 100
