@@ -75,6 +75,13 @@ class CompiledGraph[StateT, InputT, OutputT]:
         async with AsyncExitStack() as run_exits:
             return await self.run_steps(input, Run({}, run_exits, asyncio.Lock(), step_limit))
 
+    def invoke(self, input: InputT, *, step_limit: int = 25) -> OutputT:
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.ainvoke(input, step_limit=step_limit))
+        raise RuntimeError("invoke cannot run inside a running event loop, so await ainvoke there")
+
     async def run_steps(self, input: object, run: Run) -> OutputT:
         values = apply_writes(self.channels, {}, [extract_writes(input)])
         names = self.entry_nodes
@@ -116,8 +123,9 @@ class CompiledGraph[StateT, InputT, OutputT]:
                 assert_never(call.node.action)
 
     async def call_function(self, plan: CallPlan, call: NodeCall, run: Run, step_exits: AsyncExitStack) -> Outcome:
-        async with run.lock:
-            await open_providers(plan.run_providers, run.values, run.exits)
+        if plan.run_providers:
+            async with run.lock:
+                await open_providers(plan.run_providers, run.values, run.exits)
         node_values = ChainMap[Depends, object]({}, dict(run.values))
         outcome: Outcome | None = None
         async with AsyncExitStack[bool]() as node_exits:

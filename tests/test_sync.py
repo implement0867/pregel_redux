@@ -1,0 +1,178 @@
+import asyncio
+import threading
+from collections.abc import Callable, Iterator
+from functools import partial
+from operator import add
+from typing import Annotated, TypedDict
+
+import pytest
+
+from pregel_redux import Depends, Endpoint, Reducer, Scope, StateGraph
+from tests.conftest import Journal
+
+
+class State(TypedDict, total=False):
+    released: Annotated[list[bool], Reducer(add)]
+
+
+def build_blocked_node(wait_for_release: Callable[[], bool]) -> Callable[..., object]:
+    def wait_in_node(state: State) -> State:
+        return {"released": [wait_for_release()]}
+
+    return wait_in_node
+
+
+def build_node_with_blocked_provider(wait_for_release: Callable[[], bool], *, scope: Scope) -> Callable[..., object]:
+    async def read_provided(state: State, released: Annotated[bool, Depends(wait_for_release, scope=scope)]) -> State:
+        return {"released": [released]}
+
+    return read_provided
+
+
+def build_node_with_blocked_generator_provider(
+    wait_for_release: Callable[[], bool], *, scope: Scope
+) -> Callable[..., object]:
+    def provide_released() -> Iterator[bool]:
+        yield wait_for_release()
+
+    async def read_provided(state: State, released: Annotated[bool, Depends(provide_released, scope=scope)]) -> State:
+        return {"released": [released]}
+
+    return read_provided
+
+
+@pytest.mark.parametrize(
+    "build_blocked",
+    [
+        build_blocked_node,
+        partial(build_node_with_blocked_provider, scope=Scope.node),
+        partial(build_node_with_blocked_provider, scope=Scope.run),
+        partial(build_node_with_blocked_generator_provider, scope=Scope.node),
+        partial(build_node_with_blocked_generator_provider, scope=Scope.run),
+    ],
+    ids=["node", "node-scoped-provider", "run-scoped-provider", "node-scoped-generator", "run-scoped-generator"],
+)
+def test_sync_function_that_blocks_lets_an_async_node_of_the_same_step_run(
+    build_blocked: Callable[[Callable[[], bool]], Callable[..., object]],
+) -> None:
+    release = threading.Event()
+
+    async def release_blocked(state: State) -> None:
+        release.set()
+
+    builder = StateGraph(State)
+    builder.add_node("blocked", build_blocked(lambda: release.wait(timeout=1)))
+    builder.add_node("release", release_blocked)
+    builder.add_edge(Endpoint.start, "blocked")
+    builder.add_edge(Endpoint.start, "release")
+
+    actual = asyncio.run(builder.compile().ainvoke({}))
+
+    assert actual == {"released": [True]}, (
+        f"Expected the async node to release the sync function, got {actual}. "
+        "A sync function must not block the event loop."
+    )
+
+
+@pytest.mark.parametrize("count", [2, 3, 5])
+def test_sync_nodes_of_one_step_run_at_the_same_time(count: int) -> None:
+    barrier = threading.Barrier(count, timeout=1)
+
+    def meet_other_nodes(state: State) -> State:
+        barrier.wait()
+        return {"released": [True]}
+
+    builder = StateGraph(State)
+    for index in range(count):
+        builder.add_node(f"node-{index}", meet_other_nodes)
+        builder.add_edge(Endpoint.start, f"node-{index}")
+    expected: State = {"released": [True] * count}
+
+    actual = asyncio.run(builder.compile().ainvoke({}))
+
+    assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+@pytest.mark.parametrize("released", [[], [True], [True, False]], ids=repr)
+@pytest.mark.parametrize("is_async", [False, True], ids=["sync-node", "async-node"])
+def test_invoke_gives_the_output_of_ainvoke(released: list[bool], *, is_async: bool) -> None:
+    def write_sync(state: State) -> State:
+        return {"released": [True]}
+
+    async def write_async(state: State) -> State:
+        return {"released": [True]}
+
+    builder = StateGraph(State)
+    builder.add_node("write", write_async if is_async else write_sync)
+    builder.add_edge(Endpoint.start, "write")
+    graph = builder.compile()
+    expected = asyncio.run(graph.ainvoke({"released": released}))
+
+    actual = graph.invoke({"released": released})
+
+    assert actual == expected, f"Expected {expected}, got {actual}. invoke must give the output of ainvoke."
+
+
+@pytest.mark.parametrize("step_limit", [1, 2])
+def test_invoke_applies_the_step_limit(step_limit: int) -> None:
+    builder = StateGraph(State)
+    for index in range(step_limit + 1):
+        builder.add_node(f"node-{index}", lambda state: None)
+        builder.add_edge(Endpoint.start if index == 0 else f"node-{index - 1}", f"node-{index}")
+
+    with pytest.raises(RuntimeError):
+        builder.compile().invoke({}, step_limit=step_limit)
+
+
+def test_invoke_inside_a_running_event_loop_is_rejected() -> None:
+    builder = StateGraph(State)
+    builder.add_node("write", lambda state: None)
+    builder.add_edge(Endpoint.start, "write")
+    graph = builder.compile()
+
+    async def call_invoke() -> State:
+        return graph.invoke({})
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(call_invoke())
+
+
+@pytest.mark.parametrize("scope", list(Scope), ids=lambda scope: scope.name)
+@pytest.mark.parametrize("error_type", [LookupError, ValueError])
+def test_sync_provider_that_opens_while_another_node_fails_is_closed(
+    journal: Journal, error_type: type[Exception], scope: Scope
+) -> None:
+    opened = threading.Event()
+    release = threading.Event()
+
+    def open_connection() -> Iterator[int]:
+        number = journal.open_resource("link")
+        opened.set()
+        release.wait(timeout=1)
+        try:
+            yield number
+        finally:
+            journal.events.append(f"close {number}")
+
+    def use_value(state: State, number: Annotated[int, Depends(open_connection, scope=scope)]) -> None:
+        journal.events.append(f"node {number}")
+
+    async def raise_error(state: State) -> None:
+        await asyncio.to_thread(opened.wait, 1)
+        asyncio.get_running_loop().call_later(0.05, release.set)
+        raise error_type("no value")
+
+    builder = StateGraph(State)
+    builder.add_node("use", use_value)
+    builder.add_node("fail", raise_error)
+    builder.add_edge(Endpoint.start, "use")
+    builder.add_edge(Endpoint.start, "fail")
+    expected = ["open link 1", "close 1"]
+
+    with pytest.raises(error_type):
+        asyncio.run(builder.compile().ainvoke({}))
+
+    assert journal.events == expected, (
+        f"Expected the events {expected}, got {journal.events}. "
+        "A provider that finishes its open step after the cancellation must close, and its node must not run."
+    )

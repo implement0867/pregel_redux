@@ -283,7 +283,7 @@ def test_each_send_opens_its_own_node_scoped_dependencies(journal: Journal, coun
 
     actual = asyncio.run(builder.compile().ainvoke({}))
 
-    assert actual.get("jokes", []) == expected, f"Expected one dependency value for each send, got {actual}."
+    assert sorted(actual.get("jokes", [])) == expected, f"Expected one dependency value for each send, got {actual}."
 
 
 @pytest.mark.parametrize("topic", ["cats", "dogs"])

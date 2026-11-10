@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import nullcontext as does_not_raise
 from operator import add
@@ -151,7 +152,7 @@ def test_node_scoped_provider_opens_and_closes_for_each_node_call(
         yield number
         journal.events.append(f"close {number}")
 
-    def use_value(state: State, number: Annotated[int, Depends(open_connection)]) -> State:
+    async def use_value(state: State, number: Annotated[int, Depends(open_connection)]) -> State:
         journal.events.append(f"node {number}")
         return {"seen": [number]}
 
@@ -359,10 +360,14 @@ def test_cleanup_of_a_finished_node_runs_when_another_node_of_the_step_fails(
         yield number
         journal.events.append(f"close {number}")
 
+    used = threading.Event()
+
     def use_value(state: State, number: Annotated[int, Depends(open_connection)]) -> State:
+        used.set()
         return {"seen": [number]}
 
     def raise_error(state: State) -> State:
+        used.wait(timeout=1)
         raise error_type("no value")
 
     graph = build_two_node_graph(use_value, raise_error, parallel=True).compile()
