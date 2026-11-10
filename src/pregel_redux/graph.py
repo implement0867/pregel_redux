@@ -3,7 +3,7 @@ from collections import ChainMap
 from collections.abc import Callable, Mapping, Sequence
 from contextlib import AsyncExitStack
 from dataclasses import dataclass
-from typing import Any, Concatenate, Literal, overload
+from typing import Any, Concatenate, Literal, Never, Protocol, assert_never, overload, runtime_checkable
 
 from pregel_redux.channels import Channel, apply_writes, build_channels, extract_writes, merge_channels
 from pregel_redux.commands import Endpoint, Outcome, Send, read_declared_targets, read_outcome
@@ -12,9 +12,28 @@ from pregel_redux.dependencies import CallPlan, Depends, execute_plan, open_prov
 type Node[InputT] = Callable[Concatenate[InputT, ...], object]
 
 
+@runtime_checkable
+class GraphBuilder(Protocol):
+    @property
+    def input_schema(self) -> Callable[..., object]: ...
+    @property
+    def dependencies(self) -> frozenset[Callable[..., object]]: ...
+    def compile(
+        self, dependency_overrides: Mapping[Callable[..., object], Callable[..., object]] | None = None
+    ) -> "CompiledGraph[object, Never, object]": ...
+
+
+@dataclass(frozen=True)
+class Run:
+    values: dict[Depends, object]
+    exits: AsyncExitStack
+    lock: asyncio.Lock
+    step_limit: int
+
+
 @dataclass(frozen=True)
 class CompiledNode:
-    action: CallPlan
+    action: "CallPlan | CompiledGraph[object, Never, object]"
     input_schema: Callable[..., object]
     input_fields: frozenset[str]
     targets: frozenset[str]
@@ -53,62 +72,60 @@ class CompiledGraph[StateT, InputT, OutputT]:
     entry_nodes: frozenset[str]
 
     async def ainvoke(self, input: InputT, *, step_limit: int = 25) -> OutputT:
+        async with AsyncExitStack() as run_exits:
+            return await self.run_steps(input, Run({}, run_exits, asyncio.Lock(), step_limit))
+
+    async def run_steps(self, input: object, run: Run) -> OutputT:
         values = apply_writes(self.channels, {}, [extract_writes(input)])
         names = self.entry_nodes
         sends: tuple[Send, ...] = ()
-        run_values: dict[Depends, object] = {}
         steps = 0
-        async with AsyncExitStack() as run_exits:
-            while names or sends:
-                if steps == step_limit:
-                    raise RuntimeError(f"the graph did not finish within {step_limit} steps")
-                steps += 1
-                calls = [
-                    *(NodeCall(self.nodes[name], self.nodes[name].build_input(values)) for name in sorted(names)),
-                    *(NodeCall(self.nodes[send.node], self.nodes[send.node].build_send_input(send)) for send in sends),
-                ]
-                for call in calls:
-                    await open_providers(call.node.action.run_providers, run_values, run_exits)
-                async with AsyncExitStack() as step_exits:
-                    outcomes = await self.run_step(calls, run_values, step_exits)
-                    values = apply_writes(self.channels, values, [outcome.writes for outcome in outcomes])
-                names = frozenset[str]().union(*(outcome.routes.targets for outcome in outcomes))
-                sends = tuple(send for outcome in outcomes for send in outcome.routes.sends)
+        while names or sends:
+            if steps == run.step_limit:
+                raise RuntimeError(f"the graph did not finish within {run.step_limit} steps")
+            steps += 1
+            calls = [
+                *(NodeCall(self.nodes[name], self.nodes[name].build_input(values)) for name in sorted(names)),
+                *(NodeCall(self.nodes[send.node], self.nodes[send.node].build_send_input(send)) for send in sends),
+            ]
+            async with AsyncExitStack() as step_exits:
+                outcomes = await self.run_step(calls, run, step_exits)
+                values = apply_writes(self.channels, values, [outcome.writes for outcome in outcomes])
+            names = frozenset[str]().union(*(outcome.routes.targets for outcome in outcomes))
+            sends = tuple(send for outcome in outcomes for send in outcome.routes.sends)
         return self.output_schema(**{name: values[name] for name in self.output_fields if name in values})
 
-    async def run_step(
-        self,
-        calls: Sequence[NodeCall],
-        run_values: Mapping[Depends, object],
-        step_exits: AsyncExitStack,
-    ) -> list[Outcome]:
+    async def run_step(self, calls: Sequence[NodeCall], run: Run, step_exits: AsyncExitStack) -> list[Outcome]:
         try:
             async with asyncio.TaskGroup() as group:
-                tasks = [
-                    group.create_task(self.run_node(call.node, call.node_input, run_values, step_exits))
-                    for call in calls
-                ]
+                tasks = [group.create_task(self.run_node(call, run, step_exits)) for call in calls]
         except ExceptionGroup as failures:
             if len(failures.exceptions) == 1:
                 raise failures.exceptions[0] from None
             raise
         return [task.result() for task in tasks]
 
-    async def run_node(
-        self,
-        node: CompiledNode,
-        node_input: object,
-        run_values: Mapping[Depends, object],
-        step_exits: AsyncExitStack,
-    ) -> Outcome:
-        node_values = ChainMap[Depends, object]({}, dict(run_values))
+    async def run_node(self, call: NodeCall, run: Run, step_exits: AsyncExitStack) -> Outcome:
+        match call.node.action:
+            case CallPlan() as plan:
+                return await self.call_function(plan, call, run, step_exits)
+            case CompiledGraph() as child:
+                result = await child.run_steps(call.node_input, run)
+                return read_outcome(result, call.node.targets, self.nodes.keys())
+            case _:
+                assert_never(call.node.action)
+
+    async def call_function(self, plan: CallPlan, call: NodeCall, run: Run, step_exits: AsyncExitStack) -> Outcome:
+        async with run.lock:
+            await open_providers(plan.run_providers, run.values, run.exits)
+        node_values = ChainMap[Depends, object]({}, dict(run.values))
         outcome: Outcome | None = None
         async with AsyncExitStack[bool]() as node_exits:
-            result = await execute_plan(node.action, node_input, node_values, node_exits)
-            outcome = read_outcome(result, node.targets, self.nodes.keys())
+            result = await execute_plan(plan, call.node_input, node_values, node_exits)
+            outcome = read_outcome(result, call.node.targets, self.nodes.keys())
             step_exits.push_async_callback(node_exits.pop_all().aclose)
         if outcome is None:
-            raise RuntimeError(f"a dependency of {node.action.function!r} suppressed the exception of its node")
+            raise RuntimeError(f"a dependency of {plan.function!r} suppressed the exception of its node")
         return outcome
 
 
@@ -129,20 +146,33 @@ class StateGraph[StateT, InputT, OutputT]:
         self.output_schema: type[OutputT] = state_schema if output_schema is None else output_schema
         self.nodes: dict[str, Callable[..., object]] = {}
         self.node_input_schemas: dict[str, Callable[..., object]] = {}
+        self.child_graphs: dict[str, GraphBuilder] = {}
         self.edges: set[Edge] = set()
 
     @overload
     def add_node(self, name: str, node: Node[StateT]) -> None: ...
     @overload
     def add_node[NodeInputT](self, name: str, node: Node[NodeInputT], *, input_schema: type[NodeInputT]) -> None: ...
+    @overload
+    def add_node[ChildStateT, ChildInputT, ChildOutputT](
+        self, name: str, node: "StateGraph[ChildStateT, ChildInputT, ChildOutputT]"
+    ) -> None: ...
     def add_node(
-        self, name: str, node: Callable[..., object], *, input_schema: Callable[..., object] | None = None
+        self,
+        name: str,
+        node: Callable[..., object] | GraphBuilder,
+        *,
+        input_schema: Callable[..., object] | None = None,
     ) -> None:
-        if name in self.nodes:
+        if name in self.nodes or name in self.child_graphs:
             raise ValueError(f"node {name!r} is already in this graph")
-        self.nodes[name] = node
-        if input_schema is not None:
-            self.node_input_schemas[name] = input_schema
+        match node:
+            case GraphBuilder():
+                self.child_graphs[name] = node
+            case _:
+                self.nodes[name] = node
+                if input_schema is not None:
+                    self.node_input_schemas[name] = input_schema
 
     def add_edge(self, source: str | Literal[Endpoint.start], target: str | Literal[Endpoint.end]) -> None:
         self.edges.add(Edge(source, target))
@@ -152,7 +182,7 @@ class StateGraph[StateT, InputT, OutputT]:
         plans = [plan_call(node, {}) for node in self.nodes.values()]
         return frozenset(
             item.request.dependency for plan in plans for item in (*plan.run_providers, *plan.node_providers)
-        )
+        ).union(*(child.dependencies for child in self.child_graphs.values()))
 
     def compile[ProviderT: Callable[..., object]](
         self, dependency_overrides: Mapping[ProviderT, Callable[..., object]] | None = None
@@ -164,31 +194,38 @@ class StateGraph[StateT, InputT, OutputT]:
             endpoint for edge in self.edges for endpoint in (edge.source, edge.target) if isinstance(endpoint, str)
         }
         declared = {target for node in self.nodes.values() for target in read_declared_targets(node)}
-        unknown = sorted((endpoints | declared) - self.nodes.keys())
+        unknown = sorted((endpoints | declared) - self.nodes.keys() - self.child_graphs.keys())
         if unknown:
             raise ValueError(f"edges or declared targets refer to {unknown!r}, which are not nodes of this graph")
-        input_schemas = {name: self.node_input_schemas.get(name, self.state_schema) for name in self.nodes}
         entry_nodes = frozenset(
             edge.target for edge in self.edges if edge.source is Endpoint.start and isinstance(edge.target, str)
         )
         if not entry_nodes:
             raise ValueError("the graph has no edge from Endpoint.start to a node")
+        input_schemas: dict[str, Callable[..., object]] = {
+            **{name: self.node_input_schemas.get(name, self.state_schema) for name in self.nodes},
+            **{name: child.input_schema for name, child in self.child_graphs.items()},
+        }
+        actions: dict[str, CallPlan | CompiledGraph[object, Never, object]] = {
+            **{name: plan_call(node, overrides) for name, node in self.nodes.items()},
+            **{name: child.compile(overrides) for name, child in self.child_graphs.items()},
+        }
         return CompiledGraph(
             output_schema=self.output_schema,
             channels=merge_channels(
-                [self.state_schema, self.input_schema, self.output_schema, *self.node_input_schemas.values()]
+                [self.state_schema, self.input_schema, self.output_schema, *input_schemas.values()]
             ),
             output_fields=frozenset(build_channels(self.output_schema)),
             nodes={
                 name: CompiledNode(
-                    action=plan_call(node, overrides),
+                    action=action,
                     input_schema=input_schemas[name],
                     input_fields=frozenset(build_channels(input_schemas[name])),
                     targets=frozenset(
                         edge.target for edge in self.edges if edge.source == name and isinstance(edge.target, str)
                     ),
                 )
-                for name, node in self.nodes.items()
+                for name, action in actions.items()
             },
             entry_nodes=entry_nodes,
         )
