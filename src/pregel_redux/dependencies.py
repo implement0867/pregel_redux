@@ -18,7 +18,7 @@ class Depends:
 
 
 def read_state() -> object:
-    """Marker that requests the state of the current node call, and the library never calls it."""
+    """Marker that requests the state of the current node call."""
     raise RuntimeError("read_state supplies a value only as a node-scoped dependency of a graph")
 
 
