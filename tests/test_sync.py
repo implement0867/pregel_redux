@@ -94,16 +94,9 @@ def test_sync_nodes_of_one_step_run_at_the_same_time(count: int) -> None:
 
 
 @pytest.mark.parametrize("released", [[], [True], [True, False]], ids=repr)
-@pytest.mark.parametrize("is_async", [False, True], ids=["sync-node", "async-node"])
-def test_invoke_gives_the_output_of_ainvoke(released: list[bool], *, is_async: bool) -> None:
-    def write_sync(state: State) -> State:
-        return {"released": [True]}
-
-    async def write_async(state: State) -> State:
-        return {"released": [True]}
-
+def test_invoke_gives_the_output_of_ainvoke(released: list[bool]) -> None:
     builder = StateGraph(State)
-    builder.add_node("write", write_async if is_async else write_sync)
+    builder.add_node("write", lambda state: {"released": [True]})
     builder.add_edge(Endpoint.start, "write")
     graph = builder.compile()
     expected = asyncio.run(graph.ainvoke({"released": released}))
@@ -111,6 +104,30 @@ def test_invoke_gives_the_output_of_ainvoke(released: list[bool], *, is_async: b
     actual = graph.invoke({"released": released})
 
     assert actual == expected, f"Expected {expected}, got {actual}. invoke must give the output of ainvoke."
+
+
+@pytest.mark.parametrize("depth", [0, 1, 2], ids=["node-of-the-graph", "node-of-a-child", "node-of-a-grandchild"])
+@pytest.mark.parametrize("sync_nodes", [0, 2])
+def test_invoke_rejects_a_graph_that_has_an_async_node(journal: Journal, depth: int, sync_nodes: int) -> None:
+    async def write_async(state: State) -> None:
+        journal.events.append("async node")
+
+    graph = StateGraph(State)
+    graph.add_node("write", write_async)
+    graph.add_edge(Endpoint.start, "write")
+    for _ in range(depth):
+        parent = StateGraph(State)
+        parent.add_node("child", graph)
+        parent.add_edge(Endpoint.start, "child")
+        graph = parent
+    for index in range(sync_nodes):
+        graph.add_node(f"sync-{index}", lambda state: journal.events.append("sync node"))
+        graph.add_edge(Endpoint.start, f"sync-{index}")
+
+    with pytest.raises(TypeError):
+        graph.compile().invoke({})
+
+    assert journal.events == [], f"Expected no node to run, got {journal.events}."
 
 
 @pytest.mark.parametrize("step_limit", [1, 2])

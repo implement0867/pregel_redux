@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from collections import ChainMap
 from collections.abc import Callable, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -77,7 +78,23 @@ class CompiledGraph[StateT, InputT, OutputT]:
         async with AsyncExitStack() as run_exits:
             return await self.run_steps(input, Run({}, run_exits, asyncio.Lock(), step_limit))
 
+    def find_async_nodes(self) -> list[str]:
+        names: list[str] = []
+        for name, node in self.nodes.items():
+            match node.action:
+                case CallPlan() as plan:
+                    if inspect.iscoroutinefunction(plan.function):
+                        names.append(name)
+                case CompiledGraph() as child:
+                    names.extend(f"{name}.{child_name}" for child_name in child.find_async_nodes())
+                case _:
+                    assert_never(node.action)
+        return sorted(names)
+
     def invoke(self, input: InputT, *, step_limit: int = 25) -> OutputT:
+        async_nodes = self.find_async_nodes()
+        if async_nodes:
+            raise TypeError(f"nodes {async_nodes!r} have only an async function, so call ainvoke")
         try:
             asyncio.get_running_loop()
         except RuntimeError:
