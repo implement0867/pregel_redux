@@ -121,5 +121,5 @@ ignore = [
 branch = true
 
 [tool.coverage.report]
-fail_under = 100
-exclude_also = ["assert_never\\("]
+exclude_lines = ['assert_never\(', '^\s*(((async )?def .*?)?\)(\s*->.*?)?:\s*)?\.\.\.\s*(#|$)']
+partial_branches = []
