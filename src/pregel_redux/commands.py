@@ -28,13 +28,18 @@ class Command[NameT: str]:
 
 
 @dataclass(frozen=True)
-class Outcome:
-    writes: Mapping[str, object]
+class Routes:
     targets: frozenset[str]
     sends: tuple[Send, ...]
 
 
-def resolve_goto(goto: object, node_names: Collection[str]) -> tuple[frozenset[str], tuple[Send, ...]]:
+@dataclass(frozen=True)
+class Outcome:
+    writes: Mapping[str, object]
+    routes: Routes
+
+
+def resolve_goto(goto: object, node_names: Collection[str]) -> Routes:
     selections: Sequence[object]
     match goto:
         case str() | Endpoint() | Send():
@@ -58,16 +63,16 @@ def resolve_goto(goto: object, node_names: Collection[str]) -> tuple[frozenset[s
     unknown = sorted({*names, *(send.node for send in sends)} - set(node_names))
     if unknown:
         raise ValueError(f"goto refers to {unknown!r}, which are not nodes of this graph")
-    return frozenset(names), tuple(sends)
+    return Routes(frozenset(names), tuple(sends))
 
 
 def read_outcome(result: object, static_targets: frozenset[str], node_names: Collection[str]) -> Outcome:
     match result:
         case Command():
-            names, sends = resolve_goto(result.goto, node_names)
-            return Outcome(extract_writes(result.update), static_targets | names, sends)
+            routes = resolve_goto(result.goto, node_names)
+            return Outcome(extract_writes(result.update), Routes(static_targets | routes.targets, routes.sends))
         case _:
-            return Outcome(extract_writes(result), static_targets, ())
+            return Outcome(extract_writes(result), Routes(static_targets, ()))
 
 
 def collect_literal_names(hint: object, *, inside_command: bool) -> frozenset[str]:

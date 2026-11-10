@@ -33,6 +33,18 @@ class CompiledNode:
 
 
 @dataclass(frozen=True)
+class NodeCall:
+    node: CompiledNode
+    node_input: object
+
+
+@dataclass(frozen=True)
+class Edge:
+    source: str | Literal[Endpoint.start]
+    target: str | Literal[Endpoint.end]
+
+
+@dataclass(frozen=True)
 class CompiledGraph[StateT, InputT, OutputT]:
     output_schema: Callable[..., OutputT]
     channels: Mapping[str, Channel]
@@ -52,29 +64,29 @@ class CompiledGraph[StateT, InputT, OutputT]:
                     raise RuntimeError(f"the graph did not finish within {step_limit} steps")
                 steps += 1
                 calls = [
-                    *((self.nodes[name], self.nodes[name].build_input(values)) for name in sorted(names)),
-                    *((self.nodes[send.node], self.nodes[send.node].build_send_input(send)) for send in sends),
+                    *(NodeCall(self.nodes[name], self.nodes[name].build_input(values)) for name in sorted(names)),
+                    *(NodeCall(self.nodes[send.node], self.nodes[send.node].build_send_input(send)) for send in sends),
                 ]
-                for node, _ in calls:
-                    await open_providers(node.action.run_providers, run_values, run_exits)
+                for call in calls:
+                    await open_providers(call.node.action.run_providers, run_values, run_exits)
                 async with AsyncExitStack() as step_exits:
                     outcomes = await self.run_step(calls, run_values, step_exits)
                     values = apply_writes(self.channels, values, [outcome.writes for outcome in outcomes])
-                names = frozenset[str]().union(*(outcome.targets for outcome in outcomes))
-                sends = tuple(send for outcome in outcomes for send in outcome.sends)
+                names = frozenset[str]().union(*(outcome.routes.targets for outcome in outcomes))
+                sends = tuple(send for outcome in outcomes for send in outcome.routes.sends)
         return self.output_schema(**{name: values[name] for name in self.output_fields if name in values})
 
     async def run_step(
         self,
-        calls: Sequence[tuple[CompiledNode, object]],
+        calls: Sequence[NodeCall],
         run_values: Mapping[Depends, object],
         step_exits: AsyncExitStack,
     ) -> list[Outcome]:
         try:
             async with asyncio.TaskGroup() as group:
                 tasks = [
-                    group.create_task(self.run_node(node, node_input, run_values, step_exits))
-                    for node, node_input in calls
+                    group.create_task(self.run_node(call.node, call.node_input, run_values, step_exits))
+                    for call in calls
                 ]
         except ExceptionGroup as failures:
             if len(failures.exceptions) == 1:
@@ -117,7 +129,7 @@ class StateGraph[StateT, InputT, OutputT]:
         self.output_schema: type[OutputT] = state_schema if output_schema is None else output_schema
         self.nodes: dict[str, Callable[..., object]] = {}
         self.node_input_schemas: dict[str, Callable[..., object]] = {}
-        self.edges: set[tuple[str | Endpoint, str | Endpoint]] = set()
+        self.edges: set[Edge] = set()
 
     @overload
     def add_node(self, name: str, node: Node[StateT]) -> None: ...
@@ -133,7 +145,7 @@ class StateGraph[StateT, InputT, OutputT]:
             self.node_input_schemas[name] = input_schema
 
     def add_edge(self, source: str | Literal[Endpoint.start], target: str | Literal[Endpoint.end]) -> None:
-        self.edges.add((source, target))
+        self.edges.add(Edge(source, target))
 
     @property
     def dependencies(self) -> frozenset[Callable[..., object]]:
@@ -148,14 +160,16 @@ class StateGraph[StateT, InputT, OutputT]:
         overrides: dict[Callable[..., object], Callable[..., object]] = (
             {} if dependency_overrides is None else dict(dependency_overrides.items())
         )
-        endpoints = {endpoint for edge in self.edges for endpoint in edge if isinstance(endpoint, str)}
+        endpoints = {
+            endpoint for edge in self.edges for endpoint in (edge.source, edge.target) if isinstance(endpoint, str)
+        }
         declared = {target for node in self.nodes.values() for target in read_declared_targets(node)}
         unknown = sorted((endpoints | declared) - self.nodes.keys())
         if unknown:
             raise ValueError(f"edges or declared targets refer to {unknown!r}, which are not nodes of this graph")
         input_schemas = {name: self.node_input_schemas.get(name, self.state_schema) for name in self.nodes}
         entry_nodes = frozenset(
-            target for source, target in self.edges if source is Endpoint.start and isinstance(target, str)
+            edge.target for edge in self.edges if edge.source is Endpoint.start and isinstance(edge.target, str)
         )
         if not entry_nodes:
             raise ValueError("the graph has no edge from Endpoint.start to a node")
@@ -171,7 +185,7 @@ class StateGraph[StateT, InputT, OutputT]:
                     input_schema=input_schemas[name],
                     input_fields=frozenset(build_channels(input_schemas[name])),
                     targets=frozenset(
-                        target for source, target in self.edges if source == name and isinstance(target, str)
+                        edge.target for edge in self.edges if edge.source == name and isinstance(edge.target, str)
                     ),
                 )
                 for name, node in self.nodes.items()
