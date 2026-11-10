@@ -75,6 +75,18 @@ def build_routed_graph(results: list[bool]) -> StateGraph[State[str], State[str]
     return builder
 
 
+def add_edge_to_unknown_target(builder: StateGraph[State[int], State[int], State[int]]) -> None:
+    builder.add_edge("first", "missing")
+
+
+def add_edge_from_unknown_source(builder: StateGraph[State[int], State[int], State[int]]) -> None:
+    builder.add_edge("missing", "first")
+
+
+def add_router_to_unknown_source(builder: StateGraph[State[int], State[int], State[int]]) -> None:
+    builder.add_conditional_edges("missing", lambda state: Endpoint.end)
+
+
 @pytest.fixture
 def parallel_builder() -> StateGraph[State[int], State[int], State[int]]:
     return build_parallel_graph(lambda: 1)
@@ -159,7 +171,7 @@ def test_router_receives_the_writes_of_its_own_node() -> None:
         return ["record"] if state.get("latest") == 5 else [Endpoint.end]
 
     def record_latest(state: State[int]) -> State[int]:
-        return {"items": [state["latest"]]}
+        return {"items": [state.get("latest", 0)]}
 
     builder = StateGraph(State[int])
     builder.add_node("write", write_latest)
@@ -220,28 +232,27 @@ def test_exceptions_of_two_nodes_leave_the_run_as_a_group(
     assert actual == {LookupError, ValueError}, f"Expected the two node exceptions, got {actual}."
 
 
-@pytest.mark.parametrize(
-    ("route", "error"),
-    [("missing", ValueError), (["first", "missing"], ValueError), (3, TypeError), (None, TypeError)],
-    ids=["unknown-name", "sequence-with-unknown-name", "int", "none"],
-)
-def test_router_that_returns_an_invalid_route_raises(
-    parallel_builder: StateGraph[State[int], State[int], State[int]], route: object, error: type[Exception]
+@pytest.mark.parametrize("route", ["missing", ["first", "missing"]], ids=["name", "sequence"])
+def test_router_that_returns_an_unknown_node_raises(
+    parallel_builder: StateGraph[State[int], State[int], State[int]], route: str | list[str]
 ) -> None:
     parallel_builder.add_conditional_edges("first", lambda state: route)
 
-    with pytest.raises(error):
+    with pytest.raises(ValueError):
         asyncio.run(parallel_builder.compile().ainvoke({}))
+
+
+@pytest.mark.parametrize("route", [3, None, 1.5], ids=repr)
+def test_route_of_an_unsupported_type_is_rejected(
+    parallel_builder: StateGraph[State[int], State[int], State[int]], route: object
+) -> None:
+    with pytest.raises(TypeError):
+        parallel_builder.compile().resolve_targets(route)
 
 
 @pytest.mark.parametrize(
     "add_invalid_edge",
-    [
-        lambda builder: builder.add_edge("first", "missing"),
-        lambda builder: builder.add_edge("missing", "first"),
-        lambda builder: builder.add_conditional_edges("missing", lambda state: Endpoint.end),
-    ],
-    ids=["unknown-target", "unknown-source", "unknown-router-source"],
+    [add_edge_to_unknown_target, add_edge_from_unknown_source, add_router_to_unknown_source],
 )
 def test_edge_of_an_unknown_node_is_rejected_by_compile(
     parallel_builder: StateGraph[State[int], State[int], State[int]],

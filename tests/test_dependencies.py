@@ -6,6 +6,8 @@ from typing import Annotated, Literal, TypedDict
 import pytest
 
 from pregel_redux import Depends, Endpoint, Scope, StateGraph
+from pregel_redux.dependencies import read_dependency_parameters
+from pregel_redux.graph import Node
 from tests.conftest import Journal
 
 
@@ -13,14 +15,14 @@ class State(TypedDict, total=False):
     seen: Annotated[list[int], add]
 
 
-def build_one_node_graph(node: object) -> StateGraph[State, State, State]:
+def build_one_node_graph(node: Node[State]) -> StateGraph[State, State, State]:
     builder = StateGraph(State)
     builder.add_node("use", node)
     builder.add_edge(Endpoint.start, "use")
     return builder
 
 
-def build_two_node_graph(first: object, second: object, *, parallel: bool) -> StateGraph[State, State, State]:
+def build_two_node_graph(first: Node[State], second: Node[State], *, parallel: bool) -> StateGraph[State, State, State]:
     builder = StateGraph(State)
     builder.add_node("first", first)
     builder.add_node("second", second)
@@ -84,10 +86,6 @@ def build_graph_with_variadic_parameter() -> StateGraph[State, State, State]:
         return None
 
     return build_one_node_graph(use_value)
-
-
-def build_graph_without_state_parameter() -> StateGraph[State, State, State]:
-    return build_one_node_graph(lambda: None)
 
 
 def build_graph_with_dependency_cycle() -> StateGraph[State, State, State]:
@@ -274,7 +272,6 @@ def test_override_replaces_a_provider_for_every_node(
         (build_graph_with_plain_provider_parameter, TypeError),
         (build_graph_with_two_markers, TypeError),
         (build_graph_with_variadic_parameter, TypeError),
-        (build_graph_without_state_parameter, TypeError),
     ],
 )
 def test_invalid_dependency_is_rejected_by_compile(
@@ -301,4 +298,10 @@ def test_one_provider_requested_with_two_scopes_gives_two_values(journal: Journa
 
     actual = asyncio.run(graph.ainvoke({}))
 
-    assert sorted(actual["seen"]) == [1, 2], f"Expected two separate values, got {actual}."
+    assert sorted(actual.get("seen", [])) == [1, 2], f"Expected two separate values, got {actual}."
+
+
+@pytest.mark.parametrize("state_parameters", [1, 2])
+def test_function_with_too_few_parameters_for_the_state_is_rejected(state_parameters: int) -> None:
+    with pytest.raises(TypeError):
+        read_dependency_parameters(lambda: None, state_parameters=state_parameters)
