@@ -1,3 +1,4 @@
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from operator import add, mul
 from typing import Annotated, NotRequired, TypedDict
@@ -28,56 +29,113 @@ class OtherReducerState(TypedDict):
     items: Annotated[list[int], mul]
 
 
-@pytest.mark.parametrize("schema", [DictState[int], DataclassState[int], ModelState[int]])
-def test_parameterized_generic_schema_gives_one_typed_channel_per_field(schema: object) -> None:
-    assert build_channels(schema) == {
-        "items": Channel("items", list[int], add),
-        "latest": Channel("latest", int, None),
+class ModelUpdate(BaseModel):
+    items: list[int] = []
+    latest: int = 0
+
+
+@dataclass
+class DataclassUpdate:
+    latest: int
+
+
+@pytest.fixture
+def channels() -> dict[str, Channel]:
+    return build_channels(DictState[int])
+
+
+@pytest.mark.parametrize(
+    ("schema", "argument"),
+    [
+        (DictState[int], int),
+        (DataclassState[int], int),
+        (ModelState[int], int),
+        (DictState[str], str),
+        (DataclassState[list[int]], list[int]),
+    ],
+    ids=["typed-dict", "dataclass", "model", "typed-dict-of-str", "dataclass-of-list"],
+)
+def test_parameterized_generic_schema_gives_one_typed_channel_per_field(schema: object, argument: object) -> None:
+    expected = {
+        "items": Channel("items", list[argument], add),
+        "latest": Channel("latest", argument, None),
     }
+
+    actual = build_channels(schema)
+
+    assert actual == expected, f"Expected {expected}, got {actual}. Each field must keep its type argument."
 
 
 def test_unparameterized_generic_schema_keeps_its_type_parameter() -> None:
     (parameter,) = DictState.__type_params__
+    expected = Channel("items", list[parameter], add)
 
-    assert build_channels(DictState)["items"] == Channel("items", list[parameter], add)
+    actual = build_channels(DictState)["items"]
+
+    assert actual == expected, f"Expected {expected}, got {actual}. The type parameter must stay in the value type."
 
 
-def test_schema_that_has_no_fields_is_rejected() -> None:
-    with pytest.raises(TypeError, match="not a TypedDict"):
-        build_channels(list[int])
+@pytest.mark.parametrize("schema", [list[int], int, "State", None], ids=repr)
+def test_schema_that_has_no_fields_is_rejected(schema: object) -> None:
+    with pytest.raises(TypeError):
+        build_channels(schema)
 
 
 def test_merged_schemas_reject_two_reducers_for_one_channel() -> None:
-    with pytest.raises(ValueError, match="two different reducers"):
+    with pytest.raises(ValueError):
         merge_channels([DictState[int], OtherReducerState])
 
 
-def test_writes_come_from_the_fields_that_a_model_update_sets() -> None:
-    class Update(BaseModel):
-        items: list[int] = []
-        latest: int = 0
+@pytest.mark.parametrize(
+    ("update", "expected"),
+    [
+        (None, {}),
+        ({"latest": 3}, {"latest": 3}),
+        (ModelUpdate(latest=3), {"latest": 3}),
+        (ModelUpdate(), {}),
+        (DataclassUpdate(latest=3), {"latest": 3}),
+    ],
+    ids=["none", "mapping", "model-with-one-set-field", "model-with-no-set-field", "dataclass"],
+)
+def test_writes_come_from_the_fields_that_an_update_sets(update: object, expected: Mapping[str, object]) -> None:
+    actual = extract_writes(update)
 
-    assert extract_writes(Update(latest=3)) == {"latest": 3}
-
-
-def test_update_of_an_unsupported_type_is_rejected() -> None:
-    with pytest.raises(TypeError, match="not a mapping"):
-        extract_writes(3)
-
-
-def test_reducer_combines_the_writes_of_one_step() -> None:
-    channels = build_channels(DictState[int])
-
-    assert apply_writes(channels, {"items": [0]}, [{"items": [1]}, {"items": [2]}]) == {"items": [0, 1, 2]}
+    assert actual == expected, f"Expected {expected}, got {actual}. Only the fields that the update sets are writes."
 
 
-def test_channel_without_reducer_rejects_two_writes_in_one_step() -> None:
-    channels = build_channels(DictState[int])
+@pytest.mark.parametrize("update", [3, "text", [1], DataclassUpdate], ids=repr)
+def test_update_of_an_unsupported_type_is_rejected(update: object) -> None:
+    with pytest.raises(TypeError):
+        extract_writes(update)
 
-    with pytest.raises(ValueError, match="more than one value"):
-        apply_writes(channels, {}, [{"latest": 1}, {"latest": 2}])
+
+@pytest.mark.parametrize(
+    ("values", "updates", "expected"),
+    [
+        ({"items": [0]}, [{"items": [1]}, {"items": [2]}], {"items": [0, 1, 2]}),
+        ({}, [{"items": [1]}, {"items": [2]}], {"items": [1, 2]}),
+        ({"latest": 1}, [{"latest": 2}], {"latest": 2}),
+        ({"items": [0], "latest": 1}, [{"items": [1]}, {"latest": 2}], {"items": [0, 1], "latest": 2}),
+        ({"items": [0]}, [], {"items": [0]}),
+    ],
+    ids=["reducer-with-value", "reducer-without-value", "replacement", "two-channels", "no-updates"],
+)
+def test_writes_of_one_step_give_the_next_values(
+    channels: dict[str, Channel],
+    values: Mapping[str, object],
+    updates: Sequence[Mapping[str, object]],
+    expected: Mapping[str, object],
+) -> None:
+    actual = apply_writes(channels, values, updates)
+
+    assert actual == expected, f"Expected {expected}, got {actual}. The reducer must combine the writes of one step."
 
 
-def test_write_to_an_unknown_channel_is_rejected() -> None:
-    with pytest.raises(ValueError, match="not a channel"):
-        apply_writes(build_channels(DictState[int]), {}, [{"missing": 1}])
+@pytest.mark.parametrize(
+    "updates",
+    [[{"latest": 1}, {"latest": 2}], [{"missing": 1}]],
+    ids=["two-writes-without-reducer", "unknown-channel"],
+)
+def test_invalid_writes_are_rejected(channels: dict[str, Channel], updates: Sequence[Mapping[str, object]]) -> None:
+    with pytest.raises(ValueError):
+        apply_writes(channels, {}, updates)

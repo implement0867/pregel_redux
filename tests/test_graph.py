@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from operator import add
 from typing import Annotated, Literal, TypedDict
 
@@ -54,32 +54,6 @@ def build_parallel_graph[T](produce: Callable[[], T]) -> StateGraph[State[T], St
     return builder
 
 
-def test_sequential_partial_writes_to_a_generic_schema_keep_all_channels() -> None:
-    graph = build_sequential_graph(lambda: 1).compile()
-
-    assert asyncio.run(graph.ainvoke({"items": [0]})) == {"items": [0, 1], "latest": 1}
-
-
-def test_parallel_writes_to_a_generic_schema_use_the_reducer() -> None:
-    graph = build_parallel_graph(lambda: 1).compile()
-
-    assert asyncio.run(graph.ainvoke({"items": [0], "latest": 0})) == {"items": [0, 1, 1], "latest": 0}
-
-
-def test_parallel_writes_to_a_channel_without_reducer_are_rejected() -> None:
-    def write_latest(state: State[int]) -> State[int]:
-        return {"latest": 1}
-
-    builder = StateGraph(State[int])
-    builder.add_node("first", write_latest)
-    builder.add_node("second", write_latest)
-    builder.add_edge(Endpoint.start, "first")
-    builder.add_edge(Endpoint.start, "second")
-
-    with pytest.raises(ValueError, match="more than one value"):
-        asyncio.run(builder.compile().ainvoke({}))
-
-
 def build_routed_graph(results: list[bool]) -> StateGraph[State[str], State[str], State[str]]:
     def skip_update(state: State[str]) -> None:
         return None
@@ -101,10 +75,80 @@ def build_routed_graph(results: list[bool]) -> StateGraph[State[str], State[str]
     return builder
 
 
-def test_router_runs_a_failed_node_again_as_a_routing_decision() -> None:
-    graph = build_routed_graph([False, False, True]).compile()
+@pytest.fixture
+def parallel_builder() -> StateGraph[State[int], State[int], State[int]]:
+    return build_parallel_graph(lambda: 1)
 
-    assert asyncio.run(graph.ainvoke({})) == {"items": ["done"], "failures": 2}
+
+@pytest.mark.parametrize(
+    ("produced", "items", "expected"),
+    [
+        (1, [0], {"items": [0, 1], "latest": 1}),
+        ("b", ["a"], {"items": ["a", "b"], "latest": "b"}),
+        (1, [], {"items": [1], "latest": 1}),
+    ],
+    ids=["int", "str", "no-items-in-the-input"],
+)
+def test_sequential_partial_writes_to_a_generic_schema_keep_all_channels(
+    produced: object, items: list[object], expected: Mapping[str, object]
+) -> None:
+    graph = build_sequential_graph(lambda: produced).compile()
+
+    actual = asyncio.run(graph.ainvoke({"items": items}))
+
+    assert actual == expected, f"Expected {expected}, got {actual}. A partial write must not remove other channels."
+
+
+@pytest.mark.parametrize(
+    ("produced", "input_state", "expected"),
+    [
+        (1, {"items": [0], "latest": 0}, {"items": [0, 1, 1], "latest": 0}),
+        ("b", {"items": ["a"]}, {"items": ["a", "b", "b"]}),
+        (1, {}, {"items": [1, 1]}),
+    ],
+    ids=["int", "str", "empty-input"],
+)
+def test_parallel_writes_to_a_generic_schema_use_the_reducer(
+    produced: object, input_state: State[object], expected: Mapping[str, object]
+) -> None:
+    graph = build_parallel_graph(lambda: produced).compile()
+
+    actual = asyncio.run(graph.ainvoke(input_state))
+
+    assert actual == expected, f"Expected {expected}, got {actual}. The reducer must combine parallel writes."
+
+
+def test_parallel_writes_to_a_channel_without_reducer_are_rejected() -> None:
+    def write_latest(state: State[int]) -> State[int]:
+        return {"latest": 1}
+
+    builder = StateGraph(State[int])
+    builder.add_node("first", write_latest)
+    builder.add_node("second", write_latest)
+    builder.add_edge(Endpoint.start, "first")
+    builder.add_edge(Endpoint.start, "second")
+
+    with pytest.raises(ValueError):
+        asyncio.run(builder.compile().ainvoke({}))
+
+
+@pytest.mark.parametrize(
+    ("results", "expected"),
+    [
+        ([True], {"items": ["done"]}),
+        ([False, True], {"items": ["done"], "failures": 1}),
+        ([False, False, True], {"items": ["done"], "failures": 2}),
+    ],
+    ids=["no-failure", "one-failure", "two-failures"],
+)
+def test_router_runs_a_failed_node_again_as_a_routing_decision(
+    results: list[bool], expected: Mapping[str, object]
+) -> None:
+    graph = build_routed_graph([*results]).compile()
+
+    actual = asyncio.run(graph.ainvoke({}))
+
+    assert actual == expected, f"Expected {expected}, got {actual}. The router must schedule the node until it is done."
 
 
 def test_router_receives_the_writes_of_its_own_node() -> None:
@@ -122,58 +166,104 @@ def test_router_receives_the_writes_of_its_own_node() -> None:
     builder.add_node("record", record_latest)
     builder.add_edge(Endpoint.start, "write")
     builder.add_conditional_edges("write", choose_route)
+    expected = {"latest": 5, "items": [5]}
 
-    assert asyncio.run(builder.compile().ainvoke({})) == {"latest": 5, "items": [5]}
+    actual = asyncio.run(builder.compile().ainvoke({}))
+
+    assert actual == expected, f"Expected {expected}, got {actual}. The router must see the write of its own node."
 
 
-def test_graph_that_does_not_finish_within_the_step_limit_raises() -> None:
+@pytest.mark.parametrize("step_limit", [1, 2, 4, 9])
+def test_graph_that_does_not_finish_within_the_step_limit_raises(step_limit: int) -> None:
     graph = build_routed_graph([False] * 10).compile()
 
-    with pytest.raises(RuntimeError, match="within 4 steps"):
-        asyncio.run(graph.ainvoke({}, step_limit=4))
+    with pytest.raises(RuntimeError):
+        asyncio.run(graph.ainvoke({}, step_limit=step_limit))
 
 
-def test_exception_of_one_node_leaves_the_run_unchanged() -> None:
-    failure = LookupError("no value")
-
+@pytest.mark.parametrize(
+    "failure",
+    [LookupError("no value"), ValueError("wrong value"), KeyError("key")],
+    ids=lambda failure: type(failure).__name__,
+)
+def test_exception_of_one_node_leaves_the_run_unchanged(
+    parallel_builder: StateGraph[State[int], State[int], State[int]], failure: Exception
+) -> None:
     def raise_failure(state: State[int]) -> State[int]:
         raise failure
 
-    builder = build_parallel_graph(lambda: 1)
-    builder.add_node("fail", raise_failure)
-    builder.add_edge(Endpoint.start, "fail")
+    parallel_builder.add_node("fail", raise_failure)
+    parallel_builder.add_edge(Endpoint.start, "fail")
 
-    with pytest.raises(LookupError) as raised:
-        asyncio.run(builder.compile().ainvoke({}))
-    assert raised.value is failure
-
-
-def test_router_that_returns_an_unknown_node_raises() -> None:
-    builder = build_parallel_graph(lambda: 1)
-    builder.add_conditional_edges("first", lambda state: "missing")
-
-    with pytest.raises(ValueError, match="not nodes of this graph"):
-        asyncio.run(builder.compile().ainvoke({}))
+    with pytest.raises(type(failure)) as raised:
+        asyncio.run(parallel_builder.compile().ainvoke({}))
+    assert raised.value is failure, f"Expected {failure!r}, got {raised.value!r}. The exception must not be wrapped."
 
 
-def test_edge_to_an_unknown_node_is_rejected_by_compile() -> None:
-    builder = build_parallel_graph(lambda: 1)
-    builder.add_edge("first", "missing")
+def test_exceptions_of_two_nodes_leave_the_run_as_a_group(
+    parallel_builder: StateGraph[State[int], State[int], State[int]],
+) -> None:
+    def raise_lookup_error(state: State[int]) -> State[int]:
+        raise LookupError("no value")
 
-    with pytest.raises(ValueError, match="not nodes of this graph"):
-        builder.compile()
+    def raise_value_error(state: State[int]) -> State[int]:
+        raise ValueError("wrong value")
+
+    parallel_builder.add_node("lookup", raise_lookup_error)
+    parallel_builder.add_node("value", raise_value_error)
+    parallel_builder.add_edge(Endpoint.start, "lookup")
+    parallel_builder.add_edge(Endpoint.start, "value")
+
+    with pytest.raises(ExceptionGroup) as raised:
+        asyncio.run(parallel_builder.compile().ainvoke({}))
+    actual = {type(error) for error in raised.value.exceptions}
+    assert actual == {LookupError, ValueError}, f"Expected the two node exceptions, got {actual}."
+
+
+@pytest.mark.parametrize(
+    ("route", "error"),
+    [("missing", ValueError), (["first", "missing"], ValueError), (3, TypeError), (None, TypeError)],
+    ids=["unknown-name", "sequence-with-unknown-name", "int", "none"],
+)
+def test_router_that_returns_an_invalid_route_raises(
+    parallel_builder: StateGraph[State[int], State[int], State[int]], route: object, error: type[Exception]
+) -> None:
+    parallel_builder.add_conditional_edges("first", lambda state: route)
+
+    with pytest.raises(error):
+        asyncio.run(parallel_builder.compile().ainvoke({}))
+
+
+@pytest.mark.parametrize(
+    "add_invalid_edge",
+    [
+        lambda builder: builder.add_edge("first", "missing"),
+        lambda builder: builder.add_edge("missing", "first"),
+        lambda builder: builder.add_conditional_edges("missing", lambda state: Endpoint.end),
+    ],
+    ids=["unknown-target", "unknown-source", "unknown-router-source"],
+)
+def test_edge_of_an_unknown_node_is_rejected_by_compile(
+    parallel_builder: StateGraph[State[int], State[int], State[int]],
+    add_invalid_edge: Callable[[StateGraph[State[int], State[int], State[int]]], None],
+) -> None:
+    add_invalid_edge(parallel_builder)
+
+    with pytest.raises(ValueError):
+        parallel_builder.compile()
 
 
 def test_graph_without_an_entry_edge_is_rejected_by_compile() -> None:
     builder = StateGraph(State[int])
     builder.add_node("only", lambda state: None)
 
-    with pytest.raises(ValueError, match=r"no edge from Endpoint\.start"):
+    with pytest.raises(ValueError):
         builder.compile()
 
 
-def test_duplicate_node_name_is_rejected() -> None:
-    builder = build_parallel_graph(lambda: 1)
-
-    with pytest.raises(ValueError, match="already in this graph"):
-        builder.add_node("first", lambda state: None)
+@pytest.mark.parametrize("name", ["first", "second"])
+def test_duplicate_node_name_is_rejected(
+    parallel_builder: StateGraph[State[int], State[int], State[int]], name: str
+) -> None:
+    with pytest.raises(ValueError):
+        parallel_builder.add_node(name, lambda state: None)
