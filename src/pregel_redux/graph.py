@@ -1,7 +1,9 @@
 import asyncio
 from collections import ChainMap
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Concatenate, Literal, Never, Protocol, assert_never, overload, runtime_checkable
 
@@ -80,7 +82,9 @@ class CompiledGraph[StateT, InputT, OutputT]:
             asyncio.get_running_loop()
         except RuntimeError:
             return asyncio.run(self.ainvoke(input, step_limit=step_limit))
-        raise RuntimeError("invoke cannot run inside a running event loop, so await ainvoke there")
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            run = executor.submit(copy_context().run, asyncio.run, self.ainvoke(input, step_limit=step_limit))
+            return run.result()
 
     async def run_steps(self, input: object, run: Run) -> OutputT:
         values = apply_writes(self.channels, {}, [extract_writes(input)])

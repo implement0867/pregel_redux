@@ -81,7 +81,7 @@ def read_dependency_parameters(function: Callable[..., object], *, state_paramet
 
 
 async def run_in_thread(function: Callable[..., object], *arguments: object, **named_arguments: object) -> object:
-    await asyncio.sleep(0)
+    await asyncio.sleep(0)  # deliver a pending cancellation
     call = asyncio.ensure_future(asyncio.to_thread(function, *arguments, **named_arguments))
     cancelled = False
     while not call.done():

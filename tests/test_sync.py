@@ -124,17 +124,20 @@ def test_invoke_applies_the_step_limit(step_limit: int) -> None:
         builder.compile().invoke({}, step_limit=step_limit)
 
 
-def test_invoke_inside_a_running_event_loop_is_rejected() -> None:
+@pytest.mark.parametrize("released", [[], [True], [True, False]], ids=repr)
+def test_invoke_inside_a_running_event_loop_gives_the_output(released: list[bool]) -> None:
     builder = StateGraph(State)
-    builder.add_node("write", lambda state: None)
+    builder.add_node("write", lambda state: {"released": [True]})
     builder.add_edge(Endpoint.start, "write")
     graph = builder.compile()
+    expected: State = {"released": [*released, True]}
 
     async def call_invoke() -> State:
-        return graph.invoke({})
+        return graph.invoke({"released": released})
 
-    with pytest.raises(RuntimeError):
-        asyncio.run(call_invoke())
+    actual = asyncio.run(call_invoke())
+
+    assert actual == expected, f"Expected {expected}, got {actual}. invoke must work inside a running event loop."
 
 
 @pytest.mark.parametrize("scope", list(Scope), ids=lambda scope: scope.name)
