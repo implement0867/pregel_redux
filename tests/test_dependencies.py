@@ -6,8 +6,8 @@ from typing import Annotated, Literal, TypedDict
 
 import pytest
 
-from pregel_redux import Depends, Endpoint, Scope, StateGraph
-from pregel_redux.dependencies import read_dependency_parameters
+from pregel_redux import Depends, Endpoint, Scope, StateDep, StateGraph
+from pregel_redux.dependencies import read_dependency_parameters, read_state
 from pregel_redux.graph import Node
 from tests.conftest import Journal
 
@@ -48,6 +48,9 @@ async def yield_awaited_value() -> AsyncIterator[int]:
     yield 7
 
 
+type NumberDep = Annotated[int, Depends(return_value)]
+
+
 def build_graph_with_scope_conflict() -> StateGraph[State, State, State]:
     def provide_long_value(value: Annotated[int, Depends(return_value)]) -> int:
         return value
@@ -84,6 +87,23 @@ def build_graph_with_two_markers() -> StateGraph[State, State, State]:
 
 def build_graph_with_variadic_parameter() -> StateGraph[State, State, State]:
     def use_value(state: State, *values: Annotated[int, Depends(return_value)]) -> None:
+        return None
+
+    return build_one_node_graph(use_value)
+
+
+def build_graph_with_state_in_run_scope() -> StateGraph[State, State, State]:
+    def count_values(state: StateDep[State]) -> int:
+        return len(state.get("seen", []))
+
+    def use_value(state: State, value: Annotated[int, Depends(count_values, scope=Scope.run)]) -> None:
+        return None
+
+    return build_one_node_graph(use_value)
+
+
+def build_graph_with_run_scoped_state() -> StateGraph[State, State, State]:
+    def use_value(state: State, copy: Annotated[State, Depends(read_state, scope=Scope.run)]) -> None:
         return None
 
     return build_one_node_graph(use_value)
@@ -270,6 +290,8 @@ def test_override_replaces_a_provider_for_every_node(
     [
         (build_graph_with_scope_conflict, ValueError),
         (build_graph_with_dependency_cycle, ValueError),
+        (build_graph_with_state_in_run_scope, ValueError),
+        (build_graph_with_run_scoped_state, ValueError),
         (build_graph_with_plain_parameter, TypeError),
         (build_graph_with_plain_provider_parameter, TypeError),
         (build_graph_with_two_markers, TypeError),
@@ -387,3 +409,67 @@ def test_provider_that_suppresses_the_exception_of_its_node_is_rejected(error_ty
 
     with pytest.raises(RuntimeError):
         asyncio.run(build_one_node_graph(raise_error).compile().ainvoke({}))
+
+
+@pytest.mark.parametrize(
+    ("parallel", "expected"),
+    [(False, [0, 1]), (True, [0, 0])],
+    ids=["sequential-sees-the-earlier-write", "parallel-sees-the-same-state"],
+)
+def test_provider_receives_the_state_of_its_node(*, parallel: bool, expected: list[int]) -> None:
+    def count_values(state: StateDep[State]) -> int:
+        return len(state.get("seen", []))
+
+    def use_value(state: State, count: Annotated[int, Depends(count_values)]) -> State:
+        return {"seen": [count]}
+
+    graph = build_two_node_graph(use_value, use_value, parallel=parallel).compile()
+
+    actual = asyncio.run(graph.ainvoke({}))
+
+    assert actual == {"seen": expected}, f"Expected {expected}, got {actual}. A provider must receive the node state."
+
+
+@pytest.mark.parametrize("seen", [[], [4], [4, 5]], ids=repr)
+def test_node_receives_the_state_through_the_state_dependency(seen: list[int]) -> None:
+    def use_value(state: State, copy: StateDep[State]) -> State:
+        return {"seen": [len(copy.get("seen", []))]} if copy == state else {}
+
+    actual = asyncio.run(build_one_node_graph(use_value).compile().ainvoke({"seen": seen}))
+
+    assert actual == {"seen": [*seen, len(seen)]}, f"Expected the state dependency to equal the state, got {actual}."
+
+
+def test_provider_of_a_router_receives_the_writes_of_its_node() -> None:
+    counts: list[int] = []
+
+    def count_values(state: StateDep[State]) -> int:
+        return len(state.get("seen", []))
+
+    def use_value(state: State) -> State:
+        return {"seen": [1]}
+
+    def choose_route(state: State, count: Annotated[int, Depends(count_values)]) -> Literal[Endpoint.end]:
+        counts.append(count)
+        return Endpoint.end
+
+    builder = build_one_node_graph(use_value)
+    builder.add_conditional_edges("use", choose_route)
+
+    asyncio.run(builder.compile().ainvoke({}))
+
+    assert counts == [1], f"Expected the router provider to see one value, got {counts}."
+
+
+def test_type_alias_with_depends_supplies_its_value() -> None:
+    def use_value(state: State, value: NumberDep) -> State:
+        return {"seen": [value]}
+
+    actual = asyncio.run(build_one_node_graph(use_value).compile().ainvoke({}))
+
+    assert actual == {"seen": [7]}, f"Expected the alias to supply 7, got {actual}."
+
+
+def test_read_state_called_outside_a_graph_raises() -> None:
+    with pytest.raises(RuntimeError):
+        read_state()

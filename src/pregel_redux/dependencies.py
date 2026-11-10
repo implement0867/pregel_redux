@@ -3,7 +3,7 @@ from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, Mutable
 from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager, contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
-from typing import Annotated, get_args, get_origin
+from typing import Annotated, TypeAliasType, get_args, get_origin
 
 
 class Scope(Enum):
@@ -15,6 +15,22 @@ class Scope(Enum):
 class Depends:
     dependency: Callable[..., object]
     scope: Scope = field(default=Scope.node, kw_only=True)
+
+
+def read_state() -> object:
+    raise RuntimeError("read_state supplies a value only as a node-scoped dependency of a graph")
+
+
+type StateDep[StateT] = Annotated[StateT, Depends(read_state)]
+
+
+def expand_alias(annotation: object) -> object:
+    match annotation:
+        case TypeAliasType():
+            return expand_alias(annotation.__value__)
+        case _:
+            origin = get_origin(annotation)
+            return expand_alias(origin) if isinstance(origin, TypeAliasType) else annotation
 
 
 @dataclass(frozen=True)
@@ -36,7 +52,8 @@ class CallPlan:
 def read_request(function: Callable[..., object], parameter: inspect.Parameter) -> Depends:
     if parameter.kind not in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
         raise TypeError(f"parameter {parameter.name!r} of {function!r} cannot receive a dependency by keyword")
-    metadata = get_args(parameter.annotation)[1:] if get_origin(parameter.annotation) is Annotated else ()
+    annotation = expand_alias(parameter.annotation)
+    metadata = get_args(annotation)[1:] if get_origin(annotation) is Annotated else ()
     markers = [item for item in metadata if isinstance(item, Depends)]
     match markers:
         case [Depends() as request]:
@@ -85,6 +102,8 @@ def resolve_provider(
         return resolved[request]
     if request in path:
         raise ValueError(f"dependency cycle through {request.dependency!r}")
+    if request.dependency is read_state and request.scope is Scope.run:
+        raise ValueError("the state changes at each step, so a run-scoped dependency cannot request it")
     function = overrides.get(request.dependency, request.dependency)
     parameters = read_dependency_parameters(function, state_parameters=0)
     for name, child in parameters.items():
@@ -126,6 +145,7 @@ async def open_providers(
 async def execute_plan(
     plan: CallPlan, state: object, values: MutableMapping[Depends, object], exits: AsyncExitStack
 ) -> object:
+    values[Depends(read_state)] = state
     await open_providers(plan.node_providers, values, exits)
     result = plan.function(state, **{name: values[request] for name, request in plan.parameters.items()})
     return await result if inspect.isawaitable(result) else result

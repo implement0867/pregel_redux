@@ -1,5 +1,5 @@
 from pregel_redux.channels import Channel
-from pregel_redux.dependencies import Depends, Scope
+from pregel_redux.dependencies import Depends, Scope, StateDep
 from pregel_redux.graph import CompiledGraph, Endpoint, StateGraph
 
 __all__ = [
@@ -8,5 +8,6 @@ __all__ = [
     "Depends",
     "Endpoint",
     "Scope",
+    "StateDep",
     "StateGraph",
 ]
