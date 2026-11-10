@@ -104,6 +104,11 @@ def test_unparameterized_generic_schema_keeps_its_type_parameter() -> None:
 def test_reducer_marker_at_any_position_gives_the_reducer_of_the_channel(
     build_schema: Callable[[object], object], metadata: tuple[object, ...]
 ) -> None:
+    """
+    Arrange: a schema of each kind with a field that has one Reducer marker among other annotations.
+    Act: build the channels of the schema.
+    Assert: the channel has the function of the marker as its reducer.
+    """
     schema = build_schema(Annotated[list[int], *metadata])
     expected = Channel("items", list[int], add)
 
@@ -120,6 +125,11 @@ def test_reducer_marker_at_any_position_gives_the_reducer_of_the_channel(
 def test_annotation_without_a_reducer_marker_gives_a_channel_without_a_reducer(
     build_schema: Callable[[object], object], metadata: tuple[object, ...]
 ) -> None:
+    """
+    Arrange: a schema of each kind with a field that has annotations but no Reducer marker.
+    Act: build the channels of the schema.
+    Assert: the channel has no reducer.
+    """
     schema = build_schema(Annotated[list[int], *metadata])
     expected = Channel("items", list[int], None)
 
@@ -136,6 +146,11 @@ def test_annotation_without_a_reducer_marker_gives_a_channel_without_a_reducer(
 def test_field_with_more_than_one_reducer_marker_is_rejected(
     build_schema: Callable[[object], object], metadata: tuple[object, ...]
 ) -> None:
+    """
+    Arrange: a schema of each kind with a field that has two Reducer markers.
+    Act: build the channels of the schema.
+    Assert: a TypeError is raised.
+    """
     schema = build_schema(Annotated[list[int], *metadata])
 
     with pytest.raises(TypeError):

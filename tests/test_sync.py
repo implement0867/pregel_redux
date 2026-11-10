@@ -55,6 +55,11 @@ def build_node_with_blocked_generator_provider(
 def test_sync_function_that_blocks_lets_an_async_node_of_the_same_step_run(
     build_blocked: Callable[[Callable[[], bool]], Callable[..., object]],
 ) -> None:
+    """
+    Arrange: a step with a sync node or sync provider that waits for an event, and an async node that sets the event.
+    Act: run the graph with ainvoke.
+    Assert: the sync function received the event before its timeout.
+    """
     release = threading.Event()
 
     async def release_blocked(state: State) -> None:
@@ -76,6 +81,11 @@ def test_sync_function_that_blocks_lets_an_async_node_of_the_same_step_run(
 
 @pytest.mark.parametrize("count", [2, 3, 5])
 def test_sync_nodes_of_one_step_run_at_the_same_time(count: int) -> None:
+    """
+    Arrange: a graph with several sync entry nodes that wait for each other at a barrier.
+    Act: run the graph with ainvoke.
+    Assert: each node passed the barrier.
+    """
     barrier = threading.Barrier(count, timeout=1)
 
     def meet_other_nodes(state: State) -> State:
@@ -95,6 +105,11 @@ def test_sync_nodes_of_one_step_run_at_the_same_time(count: int) -> None:
 
 @pytest.mark.parametrize("released", [[], [True], [True, False]], ids=repr)
 def test_invoke_gives_the_output_of_ainvoke(released: list[bool]) -> None:
+    """
+    Arrange: a compiled graph with one sync node, and the output of ainvoke for an input.
+    Act: call invoke with the same input.
+    Assert: the output equals the output of ainvoke.
+    """
     builder = StateGraph(State)
     builder.add_node("write", lambda state: {"released": [True]})
     builder.add_edge(Endpoint.start, "write")
@@ -109,6 +124,12 @@ def test_invoke_gives_the_output_of_ainvoke(released: list[bool]) -> None:
 @pytest.mark.parametrize("depth", [0, 1, 2], ids=["node-of-the-graph", "node-of-a-child", "node-of-a-grandchild"])
 @pytest.mark.parametrize("sync_nodes", [0, 2])
 def test_invoke_rejects_a_graph_that_has_an_async_node(journal: Journal, depth: int, sync_nodes: int) -> None:
+    """
+    Arrange: a graph with an async node at a given depth of child graphs, with or without sync nodes.
+    Act: call invoke.
+    Assert: a TypeError is raised and no node ran.
+    """
+
     async def write_async(state: State) -> None:
         journal.events.append("async node")
 
@@ -132,6 +153,11 @@ def test_invoke_rejects_a_graph_that_has_an_async_node(journal: Journal, depth: 
 
 @pytest.mark.parametrize("step_limit", [1, 2])
 def test_invoke_applies_the_step_limit(step_limit: int) -> None:
+    """
+    Arrange: a chain of nodes that is one step longer than the step limit.
+    Act: call invoke with the step limit.
+    Assert: a RuntimeError is raised.
+    """
     builder = StateGraph(State)
     for index in range(step_limit + 1):
         builder.add_node(f"node-{index}", lambda state: None)
@@ -143,6 +169,11 @@ def test_invoke_applies_the_step_limit(step_limit: int) -> None:
 
 @pytest.mark.parametrize("released", [[], [True], [True, False]], ids=repr)
 def test_invoke_inside_a_running_event_loop_gives_the_output(released: list[bool]) -> None:
+    """
+    Arrange: a compiled graph with one sync node, and a coroutine that calls invoke.
+    Act: run the coroutine on an event loop.
+    Assert: invoke returned the output of the graph.
+    """
     builder = StateGraph(State)
     builder.add_node("write", lambda state: {"released": [True]})
     builder.add_edge(Endpoint.start, "write")
@@ -162,6 +193,11 @@ def test_invoke_inside_a_running_event_loop_gives_the_output(released: list[bool
 def test_sync_provider_that_opens_while_another_node_fails_is_closed(
     journal: Journal, error_type: type[Exception], scope: Scope
 ) -> None:
+    """
+    Arrange: a sync generator provider that is in its open step while another node of the step fails.
+    Act: run the graph with ainvoke.
+    Assert: the failure is raised, the provider closed, and the node of the provider did not run.
+    """
     opened = threading.Event()
     release = threading.Event()
 

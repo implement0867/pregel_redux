@@ -147,6 +147,12 @@ def test_provider_of_each_kind_supplies_its_value(provider: Callable[..., object
 def test_node_scoped_provider_opens_and_closes_for_each_node_call(
     journal: Journal, *, parallel: bool, expected_events: list[str]
 ) -> None:
+    """
+    Arrange: two async nodes that request one node-scoped generator provider, in one step or in two.
+    Act: run the graph.
+    Assert: the provider opened for each node call and closed after the writes of its step.
+    """
+
     async def open_connection() -> AsyncIterator[int]:
         number = journal.open_resource("link")
         yield number
@@ -355,6 +361,12 @@ def test_node_scoped_cleanup_runs_after_the_writes_of_the_step_are_applied(
 def test_cleanup_of_a_finished_node_runs_when_another_node_of_the_step_fails(
     journal: Journal, error_type: type[Exception]
 ) -> None:
+    """
+    Arrange: a step with a node that uses a generator provider, and a node that fails after the first node ran.
+    Act: run the graph.
+    Assert: the failure is raised and the provider of the finished node closed.
+    """
+
     def open_connection() -> Iterator[int]:
         number = journal.open_resource("link")
         yield number

@@ -269,6 +269,12 @@ def test_edge_gives_a_node_the_fields_of_its_input_type(input_state: State, expe
 
 @pytest.mark.parametrize("count", [1, 2, 3])
 def test_each_send_opens_its_own_node_scoped_dependencies(journal: Journal, count: int) -> None:
+    """
+    Arrange: a node with a node-scoped provider that receives several sends in one step.
+    Act: run the graph.
+    Assert: each send received its own value of the provider.
+    """
+
     def provide_number() -> int:
         return journal.open_resource("number")
 
