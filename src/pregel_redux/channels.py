@@ -43,7 +43,7 @@ def substitute_type_arguments(hint: object, arguments: Mapping[object, object]) 
             return hint
 
 
-def reducer_from_metadata(metadata: tuple[object, ...]) -> Callable[..., object] | None:
+def find_reducer(metadata: tuple[object, ...]) -> Callable[..., object] | None:
     candidate = metadata[-1] if metadata else None
     if not callable(candidate):
         return None
@@ -55,15 +55,15 @@ def reducer_from_metadata(metadata: tuple[object, ...]) -> Callable[..., object]
     return candidate if len(positional) == 2 else None
 
 
-def channel_from_hint(name: str, hint: object) -> Channel:
+def build_channel(name: str, hint: object) -> Channel:
     unwrapped = get_args(hint)[0] if get_origin(hint) in (Required, NotRequired) else hint
     if get_origin(unwrapped) is Annotated:
         value_type, *metadata = get_args(unwrapped)
-        return Channel(name, value_type, reducer_from_metadata(tuple(metadata)))
+        return Channel(name, value_type, find_reducer(tuple(metadata)))
     return Channel(name, unwrapped, None)
 
 
-def field_hints(schema_class: object) -> dict[str, object]:
+def read_field_hints(schema_class: object) -> dict[str, object]:
     if is_typeddict(schema_class):
         return get_type_hints(schema_class, include_extras=True)
     if dataclasses.is_dataclass(schema_class):
@@ -72,29 +72,28 @@ def field_hints(schema_class: object) -> dict[str, object]:
     raise TypeError(f"{schema_class!r} is not a TypedDict, a dataclass or a Pydantic model")
 
 
-def channels_from_schema(schema: object) -> dict[str, Channel]:
+def build_channels(schema: object) -> dict[str, Channel]:
     match schema:
         case type() if issubclass(schema, BaseModel):
             return {
-                name: Channel(name, field.annotation, reducer_from_metadata(tuple(field.metadata)))
+                name: Channel(name, field.annotation, find_reducer(tuple(field.metadata)))
                 for name, field in schema.model_fields.items()
             }
         case _:
             origin = get_origin(schema)
-            hints = field_hints(schema if origin is None else origin)
+            hints = read_field_hints(schema if origin is None else origin)
             arguments: dict[object, object] = (
                 {} if origin is None else dict(zip(origin.__parameters__, get_args(schema), strict=True))
             )
             return {
-                name: channel_from_hint(name, substitute_type_arguments(hint, arguments))
-                for name, hint in hints.items()
+                name: build_channel(name, substitute_type_arguments(hint, arguments)) for name, hint in hints.items()
             }
 
 
 def merge_channels(schemas: Iterable[object]) -> dict[str, Channel]:
     merged: dict[str, Channel] = {}
     for schema in schemas:
-        for name, channel in channels_from_schema(schema).items():
+        for name, channel in build_channels(schema).items():
             existing = merged.get(name)
             if existing is None or existing.reducer is None:
                 merged[name] = channel
@@ -103,7 +102,7 @@ def merge_channels(schemas: Iterable[object]) -> dict[str, Channel]:
     return merged
 
 
-def writes_from_update(update: object) -> dict[str, object]:
+def extract_writes(update: object) -> dict[str, object]:
     match update:
         case None:
             return {}

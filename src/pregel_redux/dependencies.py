@@ -33,7 +33,7 @@ class CallPlan:
     node_providers: tuple[ResolvedProvider, ...]
 
 
-def request_from_parameter(function: Callable[..., object], parameter: inspect.Parameter) -> Depends:
+def read_request(function: Callable[..., object], parameter: inspect.Parameter) -> Depends:
     if parameter.kind not in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
         raise TypeError(f"parameter {parameter.name!r} of {function!r} cannot receive a dependency by keyword")
     metadata = get_args(parameter.annotation)[1:] if get_origin(parameter.annotation) is Annotated else ()
@@ -47,14 +47,14 @@ def request_from_parameter(function: Callable[..., object], parameter: inspect.P
             raise TypeError(f"parameter {parameter.name!r} of {function!r} has more than one Depends annotation")
 
 
-def dependency_parameters(function: Callable[..., object], *, state_parameters: int) -> dict[str, Depends]:
+def read_dependency_parameters(function: Callable[..., object], *, state_parameters: int) -> dict[str, Depends]:
     parameters = list(inspect.signature(function, eval_str=True).parameters.values())
     if len(parameters) < state_parameters:
         raise TypeError(f"{function!r} must accept the state as its first parameter")
-    return {parameter.name: request_from_parameter(function, parameter) for parameter in parameters[state_parameters:]}
+    return {parameter.name: read_request(function, parameter) for parameter in parameters[state_parameters:]}
 
 
-def value_opener(function: Callable[..., object]) -> Callable[..., AbstractAsyncContextManager[object]]:
+def build_value_opener(function: Callable[..., object]) -> Callable[..., AbstractAsyncContextManager[object]]:
     if inspect.isasyncgenfunction(function):
         return asynccontextmanager(function)
     if inspect.isgeneratorfunction(function):
@@ -86,7 +86,7 @@ def resolve_provider(
     if request in path:
         raise ValueError(f"dependency cycle through {request.dependency!r}")
     function = overrides.get(request.dependency, request.dependency)
-    parameters = dependency_parameters(function, state_parameters=0)
+    parameters = read_dependency_parameters(function, state_parameters=0)
     for name, child in parameters.items():
         if request.scope is Scope.run and child.scope is Scope.node:
             raise ValueError(
@@ -94,14 +94,14 @@ def resolve_provider(
                 f"through parameter {name!r}"
             )
         resolve_provider(child, overrides, resolved, (*path, request))
-    resolved[request] = ResolvedProvider(request, function, value_opener(function), parameters)
+    resolved[request] = ResolvedProvider(request, function, build_value_opener(function), parameters)
     return resolved[request]
 
 
 def plan_call(
     function: Callable[..., object], overrides: Mapping[Callable[..., object], Callable[..., object]]
 ) -> CallPlan:
-    parameters = dependency_parameters(function, state_parameters=1)
+    parameters = read_dependency_parameters(function, state_parameters=1)
     resolved: dict[Depends, ResolvedProvider] = {}
     for request in parameters.values():
         resolve_provider(request, overrides, resolved, ())
@@ -123,7 +123,7 @@ async def open_providers(
         values[item.request] = await exits.enter_async_context(item.open_value(**arguments))
 
 
-async def call_with_dependencies(
+async def execute_plan(
     plan: CallPlan, state: object, values: MutableMapping[Depends, object], exits: AsyncExitStack
 ) -> object:
     await open_providers(plan.node_providers, values, exits)

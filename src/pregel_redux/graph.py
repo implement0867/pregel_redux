@@ -6,8 +6,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Any, Concatenate, Literal, overload
 
-from pregel_redux.channels import Channel, apply_writes, channels_from_schema, merge_channels, writes_from_update
-from pregel_redux.dependencies import CallPlan, Depends, call_with_dependencies, open_providers, plan_call
+from pregel_redux.channels import Channel, apply_writes, build_channels, extract_writes, merge_channels
+from pregel_redux.dependencies import CallPlan, Depends, execute_plan, open_providers, plan_call
 
 
 class Endpoint(Enum):
@@ -44,7 +44,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
     entry_nodes: frozenset[str]
 
     async def ainvoke(self, input: InputT, *, step_limit: int = 25) -> OutputT:
-        values = apply_writes(self.channels, {}, [writes_from_update(input)])
+        values = apply_writes(self.channels, {}, [extract_writes(input)])
         scheduled = self.entry_nodes
         run_values: dict[Depends, object] = {}
         steps = 0
@@ -79,19 +79,19 @@ class CompiledGraph[StateT, InputT, OutputT]:
     ) -> NodeResult:
         node_values = ChainMap[Depends, object]({}, dict(run_values))
         async with AsyncExitStack() as node_exits:
-            update = await call_with_dependencies(node.action, self.state_from(values), node_values, node_exits)
-            writes = writes_from_update(update)
+            update = await execute_plan(node.action, self.build_state(values), node_values, node_exits)
+            writes = extract_writes(update)
             written = apply_writes(self.channels, values, [writes])
             routes = [
-                await call_with_dependencies(router, self.state_from(written), node_values, node_exits)
+                await execute_plan(router, self.build_state(written), node_values, node_exits)
                 for router in node.routers
             ]
-        return NodeResult(writes, node.targets.union(*(self.targets_from_route(route) for route in routes)))
+        return NodeResult(writes, node.targets.union(*(self.resolve_targets(route) for route in routes)))
 
-    def state_from(self, values: Mapping[str, object]) -> StateT:
+    def build_state(self, values: Mapping[str, object]) -> StateT:
         return self.state_schema(**{name: values[name] for name in self.state_fields if name in values})
 
-    def targets_from_route(self, route: object) -> frozenset[str]:
+    def resolve_targets(self, route: object) -> frozenset[str]:
         selections: Sequence[object]
         match route:
             case str() | Endpoint.end:
@@ -164,8 +164,8 @@ class StateGraph[StateT, InputT, OutputT]:
             state_schema=self.state_schema,
             output_schema=self.output_schema,
             channels=merge_channels([self.state_schema, self.input_schema, self.output_schema]),
-            state_fields=frozenset(channels_from_schema(self.state_schema)),
-            output_fields=frozenset(channels_from_schema(self.output_schema)),
+            state_fields=frozenset(build_channels(self.state_schema)),
+            output_fields=frozenset(build_channels(self.output_schema)),
             nodes={
                 name: CompiledNode(
                     action=plan_call(node, overrides),
