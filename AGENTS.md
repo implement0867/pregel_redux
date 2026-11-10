@@ -15,6 +15,7 @@
 - Names reveal intent. A reader shouldn't need to read the body to know what a function does.
 - Prefer deep modules over shallow ones (Ousterhout): a function earns its place only when its interface is simpler than the body it hides. Don't write macros, functions whose body is a single expression or stdlib call and whose name restates it; write the expression inline.
 - When you find a code smell, look for the structural cause one layer deeper. The fix usually lives there, not where the smell shows up.
+- Never change production code or add a concept to it only to serve a test or a coverage number. Write code that is testable through its real interface.
 
 ## Python
 

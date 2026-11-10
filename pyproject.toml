@@ -27,7 +27,7 @@ filterwarnings = ["error"]
 
 [tool.basedpyright]
 pythonVersion = "3.12"
-include = ["src"]
+include = ["src", "tests"]
 typeCheckingMode = "recommended"
 enableTypeIgnoreComments = false
 reportAny = "hint"

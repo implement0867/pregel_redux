@@ -1,11 +1,14 @@
 import asyncio
 from collections.abc import AsyncIterator, Callable, Iterator
+from contextlib import nullcontext as does_not_raise
 from operator import add
-from typing import Annotated, Literal, TypedDict
+from typing import Annotated, TypedDict
 
 import pytest
 
-from pregel_redux import Depends, Endpoint, Scope, StateGraph
+from pregel_redux import Depends, Endpoint, Scope, StateDep, StateGraph
+from pregel_redux.dependencies import read_dependency_parameters, read_state
+from pregel_redux.graph import Node
 from tests.conftest import Journal
 
 
@@ -13,14 +16,14 @@ class State(TypedDict, total=False):
     seen: Annotated[list[int], add]
 
 
-def build_one_node_graph(node: object) -> StateGraph[State, State, State]:
+def build_one_node_graph(node: Node[State]) -> StateGraph[State, State, State]:
     builder = StateGraph(State)
     builder.add_node("use", node)
     builder.add_edge(Endpoint.start, "use")
     return builder
 
 
-def build_two_node_graph(first: object, second: object, *, parallel: bool) -> StateGraph[State, State, State]:
+def build_two_node_graph(first: Node[State], second: Node[State], *, parallel: bool) -> StateGraph[State, State, State]:
     builder = StateGraph(State)
     builder.add_node("first", first)
     builder.add_node("second", second)
@@ -43,6 +46,9 @@ def yield_value() -> Iterator[int]:
 
 async def yield_awaited_value() -> AsyncIterator[int]:
     yield 7
+
+
+type NumberDep = Annotated[int, Depends(return_value)]
 
 
 def build_graph_with_scope_conflict() -> StateGraph[State, State, State]:
@@ -86,8 +92,21 @@ def build_graph_with_variadic_parameter() -> StateGraph[State, State, State]:
     return build_one_node_graph(use_value)
 
 
-def build_graph_without_state_parameter() -> StateGraph[State, State, State]:
-    return build_one_node_graph(lambda: None)
+def build_graph_with_state_in_run_scope() -> StateGraph[State, State, State]:
+    def count_values(state: StateDep[State]) -> int:
+        return len(state.get("seen", []))
+
+    def use_value(state: State, value: Annotated[int, Depends(count_values, scope=Scope.run)]) -> None:
+        return None
+
+    return build_one_node_graph(use_value)
+
+
+def build_graph_with_run_scoped_state() -> StateGraph[State, State, State]:
+    def use_value(state: State, copy: Annotated[State, Depends(read_state, scope=Scope.run)]) -> None:
+        return None
+
+    return build_one_node_graph(use_value)
 
 
 def build_graph_with_dependency_cycle() -> StateGraph[State, State, State]:
@@ -116,26 +135,27 @@ def test_provider_of_each_kind_supplies_its_value(provider: Callable[..., object
     assert actual == {"seen": [7]}, f"Expected the node to receive 7 from {provider.__name__}, got {actual}."
 
 
-@pytest.mark.parametrize("parallel", [True, False], ids=["parallel", "sequential"])
-def test_node_scoped_provider_opens_and_closes_for_each_node_call(journal: Journal, *, parallel: bool) -> None:
+@pytest.mark.parametrize(
+    ("parallel", "expected_events"),
+    [
+        (False, ["open link 1", "node 1", "close 1", "open link 2", "node 2", "close 2"]),
+        (True, ["open link 1", "node 1", "open link 2", "node 2", "close 2", "close 1"]),
+    ],
+    ids=["sequential-closes-after-each-step", "parallel-closes-after-the-step"],
+)
+def test_node_scoped_provider_opens_and_closes_for_each_node_call(
+    journal: Journal, *, parallel: bool, expected_events: list[str]
+) -> None:
     async def open_connection() -> AsyncIterator[int]:
-        number = journal.open_resource("connection")
+        number = journal.open_resource("link")
         yield number
-        journal.events.append(f"close connection {number}")
+        journal.events.append(f"close {number}")
 
     def use_value(state: State, number: Annotated[int, Depends(open_connection)]) -> State:
         journal.events.append(f"node {number}")
         return {"seen": [number]}
 
     graph = build_two_node_graph(use_value, use_value, parallel=parallel).compile()
-    expected_events = [
-        "open connection 1",
-        "node 1",
-        "close connection 1",
-        "open connection 2",
-        "node 2",
-        "close connection 2",
-    ]
 
     actual = asyncio.run(graph.ainvoke({}))
 
@@ -207,26 +227,6 @@ def test_provider_requested_two_times_in_one_node_call_runs_one_time(journal: Jo
     )
 
 
-def test_router_receives_dependencies_of_the_same_node_call(journal: Journal) -> None:
-    def provide_number() -> int:
-        return journal.open_resource("number")
-
-    def use_value(state: State, value: Annotated[int, Depends(provide_number)]) -> State:
-        return {"seen": [value]}
-
-    def choose_route(state: State, value: Annotated[int, Depends(provide_number)]) -> Literal[Endpoint.end]:
-        journal.events.append(f"route {value}")
-        return Endpoint.end
-
-    builder = build_one_node_graph(use_value)
-    builder.add_conditional_edges("use", choose_route)
-    expected_events = ["open number 1", "route 1"]
-
-    asyncio.run(builder.compile().ainvoke({}))
-
-    assert journal.events == expected_events, f"Expected {expected_events}, got {journal.events}."
-
-
 @pytest.mark.parametrize("error_type", [LookupError, ValueError, RuntimeError])
 def test_provider_cleanup_receives_the_exception_of_the_node(error_type: type[Exception]) -> None:
     caught: list[BaseException] = []
@@ -270,11 +270,12 @@ def test_override_replaces_a_provider_for_every_node(
     [
         (build_graph_with_scope_conflict, ValueError),
         (build_graph_with_dependency_cycle, ValueError),
+        (build_graph_with_state_in_run_scope, ValueError),
+        (build_graph_with_run_scoped_state, ValueError),
         (build_graph_with_plain_parameter, TypeError),
         (build_graph_with_plain_provider_parameter, TypeError),
         (build_graph_with_two_markers, TypeError),
         (build_graph_with_variadic_parameter, TypeError),
-        (build_graph_without_state_parameter, TypeError),
     ],
 )
 def test_invalid_dependency_is_rejected_by_compile(
@@ -301,4 +302,128 @@ def test_one_provider_requested_with_two_scopes_gives_two_values(journal: Journa
 
     actual = asyncio.run(graph.ainvoke({}))
 
-    assert sorted(actual["seen"]) == [1, 2], f"Expected two separate values, got {actual}."
+    assert sorted(actual.get("seen", [])) == [1, 2], f"Expected two separate values, got {actual}."
+
+
+@pytest.mark.parametrize("state_parameters", [1, 2])
+def test_function_with_too_few_parameters_for_the_state_is_rejected(state_parameters: int) -> None:
+    with pytest.raises(TypeError):
+        read_dependency_parameters(lambda: None, state_parameters=state_parameters)
+
+
+@pytest.mark.parametrize(
+    "cleanup_error",
+    [None, LookupError("cleanup failed"), ValueError("cleanup failed")],
+    ids=["cleanup-succeeds", "cleanup-raises-lookup-error", "cleanup-raises-value-error"],
+)
+def test_node_scoped_cleanup_runs_after_the_writes_of_the_step_are_applied(
+    journal: Journal, cleanup_error: Exception | None
+) -> None:
+    def combine_values(current: list[int], update: list[int]) -> list[int]:
+        journal.events.append("reduce")
+        return current + update
+
+    class ReducedState(TypedDict, total=False):
+        seen: Annotated[list[int], combine_values]
+
+    def open_connection() -> Iterator[int]:
+        yield 1
+        journal.events.append("cleanup")
+        if cleanup_error is not None:
+            raise cleanup_error
+
+    def use_value(state: ReducedState, value: Annotated[int, Depends(open_connection)]) -> ReducedState:
+        return {"seen": [value]}
+
+    builder = StateGraph(ReducedState)
+    builder.add_node("use", use_value)
+    builder.add_edge(Endpoint.start, "use")
+
+    expectation = does_not_raise() if cleanup_error is None else pytest.raises(type(cleanup_error))
+
+    with expectation:
+        asyncio.run(builder.compile().ainvoke({"seen": [0]}))
+
+    assert journal.events == ["reduce", "cleanup"], (
+        f"Expected the reducer call before the cleanup, got {journal.events}. "
+        "The update of a node must stand before its dependencies close."
+    )
+
+
+@pytest.mark.parametrize("error_type", [LookupError, ValueError])
+def test_cleanup_of_a_finished_node_runs_when_another_node_of_the_step_fails(
+    journal: Journal, error_type: type[Exception]
+) -> None:
+    def open_connection() -> Iterator[int]:
+        number = journal.open_resource("link")
+        yield number
+        journal.events.append(f"close {number}")
+
+    def use_value(state: State, number: Annotated[int, Depends(open_connection)]) -> State:
+        return {"seen": [number]}
+
+    def raise_error(state: State) -> State:
+        raise error_type("no value")
+
+    graph = build_two_node_graph(use_value, raise_error, parallel=True).compile()
+    expected_events = ["open link 1", "close 1"]
+
+    with pytest.raises(error_type):
+        asyncio.run(graph.ainvoke({}))
+
+    assert journal.events == expected_events, (
+        f"Expected {expected_events}, got {journal.events}. A finished node must not keep its dependency open."
+    )
+
+
+@pytest.mark.parametrize("error_type", [LookupError, ValueError])
+def test_provider_that_suppresses_the_exception_of_its_node_is_rejected(error_type: type[Exception]) -> None:
+    def open_test_resource() -> Iterator[int]:
+        try:
+            yield 1
+        except error_type:
+            return
+
+    def raise_error(state: State, value: Annotated[int, Depends(open_test_resource)]) -> State:
+        raise error_type("no value")
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(build_one_node_graph(raise_error).compile().ainvoke({}))
+
+
+@pytest.mark.parametrize(
+    ("parallel", "expected"),
+    [(False, [0, 1]), (True, [0, 0])],
+    ids=["sequential-sees-the-earlier-write", "parallel-sees-the-same-state"],
+)
+def test_provider_receives_the_state_of_its_node(*, parallel: bool, expected: list[int]) -> None:
+    def count_values(state: StateDep[State]) -> int:
+        return len(state.get("seen", []))
+
+    def use_value(state: State, count: Annotated[int, Depends(count_values)]) -> State:
+        return {"seen": [count]}
+
+    graph = build_two_node_graph(use_value, use_value, parallel=parallel).compile()
+
+    actual = asyncio.run(graph.ainvoke({}))
+
+    assert actual == {"seen": expected}, f"Expected {expected}, got {actual}. A provider must receive the node state."
+
+
+@pytest.mark.parametrize("seen", [[], [4], [4, 5]], ids=repr)
+def test_node_receives_the_state_through_the_state_dependency(seen: list[int]) -> None:
+    def use_value(state: State, copy: StateDep[State]) -> State:
+        return {"seen": [len(copy.get("seen", []))]} if copy == state else {}
+
+    actual = asyncio.run(build_one_node_graph(use_value).compile().ainvoke({"seen": seen}))
+
+    assert actual == {"seen": [*seen, len(seen)]}, f"Expected the state dependency to equal the state, got {actual}."
+
+
+def test_type_alias_with_depends_supplies_its_value() -> None:
+    def use_value(state: State, value: NumberDep) -> State:
+        return {"seen": [value]}
+
+    actual = asyncio.run(build_one_node_graph(use_value).compile().ainvoke({}))
+
+    assert actual == {"seen": [7]}, f"Expected the alias to supply 7, got {actual}."
