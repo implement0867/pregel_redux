@@ -1,0 +1,41 @@
+# Bump the package version when a merged pull request changes it, in a commit to main.
+name: Bump version
+
+on:
+  pull_request:
+    types: [closed]
+    branches: [main]
+    paths: ['src/**', 'pyproject.toml']
+
+permissions:
+  contents: write
+
+concurrency:
+  group: bump-version
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    if: github.event.pull_request.merged
+    runs-on: ubuntu-latest
+    timeout-minutes: 3
+    steps:
+      - uses: actions/checkout@v5
+        with:
+          ref: main
+      - uses: astral-sh/setup-uv@v6
+        with:
+          enable-cache: false
+      - name: Bump the version
+        env:
+          PR: ${{ github.event.pull_request.number }}
+          LEVEL: ${{ contains(github.event.pull_request.labels.*.name, 'major') && 'major' || contains(github.event.pull_request.labels.*.name, 'minor') && 'minor' || 'patch' }}
+        run: |
+          uv version --bump "$LEVEL" --no-sync
+          version=$(uv version --short)
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git commit -am "Bump the version to $version for #$PR"
+          git pull --rebase origin main
+          git tag "v$version"
+          git push --atomic origin main "v$version"
