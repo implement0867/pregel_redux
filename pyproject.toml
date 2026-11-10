@@ -22,7 +22,7 @@ dev = [
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
-addopts = ["-ra", "--strict-markers", "--strict-config", "--cov=pregel_redux", "--cov-report=term-missing"]
+addopts = ["-ra", "--strict-markers", "--strict-config", "--cov", "--cov-report=term-missing"]
 filterwarnings = ["error"]
 
 [tool.basedpyright]
@@ -119,6 +119,7 @@ ignore = [
 
 [tool.coverage.run]
 branch = true
+source = ["pregel_redux"]
 
 [tool.coverage.report]
 exclude_lines = ['assert_never\(', '^\s*(((async )?def .*?)?\)(\s*->.*?)?:\s*)?\.\.\.\s*(#|$)']
