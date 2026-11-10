@@ -1,9 +1,9 @@
 import dataclasses
-import inspect
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass
 from typing import (
     Annotated,
+    Never,
     NotRequired,
     Protocol,
     Required,
@@ -25,6 +25,11 @@ class Channel:
     reducer: Callable[..., object] | None
 
 
+@dataclass(frozen=True)
+class Reducer[ValueT, UpdateT]:
+    function: Callable[[ValueT, UpdateT], ValueT]
+
+
 @runtime_checkable
 class SubscriptableHint(Protocol):
     def __getitem__(self, arguments: tuple[object, ...]) -> object: ...
@@ -43,23 +48,22 @@ def substitute_type_arguments(hint: object, arguments: Mapping[object, object]) 
             return hint
 
 
-def find_reducer(metadata: tuple[object, ...]) -> Callable[..., object] | None:
-    candidate = metadata[-1] if metadata else None
-    if not callable(candidate):
-        return None
-    positional = [
-        parameter
-        for parameter in inspect.signature(candidate).parameters.values()
-        if parameter.kind in (inspect.Parameter.POSITIONAL_ONLY, inspect.Parameter.POSITIONAL_OR_KEYWORD)
-    ]
-    return candidate if len(positional) == 2 else None
+def find_reducer(name: str, metadata: tuple[object, ...]) -> Callable[..., object] | None:
+    markers: list[Reducer[Never, Never]] = [item for item in metadata if isinstance(item, Reducer)]
+    match markers:
+        case []:
+            return None
+        case [marker]:
+            return marker.function
+        case _:
+            raise TypeError(f"field {name!r} has more than one Reducer annotation")
 
 
 def build_channel(name: str, hint: object) -> Channel:
     unwrapped = get_args(hint)[0] if get_origin(hint) in (Required, NotRequired) else hint
     if get_origin(unwrapped) is Annotated:
         value_type, *metadata = get_args(unwrapped)
-        return Channel(name, value_type, find_reducer(tuple(metadata)))
+        return Channel(name, value_type, find_reducer(name, tuple(metadata)))
     return Channel(name, unwrapped, None)
 
 
@@ -76,7 +80,7 @@ def build_channels(schema: object) -> dict[str, Channel]:
     match schema:
         case type() if issubclass(schema, BaseModel):
             return {
-                name: Channel(name, field.annotation, find_reducer(tuple(field.metadata)))
+                name: Channel(name, field.annotation, find_reducer(name, tuple(field.metadata)))
                 for name, field in schema.model_fields.items()
             }
         case _:

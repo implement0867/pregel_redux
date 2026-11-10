@@ -5,22 +5,26 @@ from typing import Annotated, Literal, TypedDict
 
 import pytest
 
-from pregel_redux import Command, Endpoint, StateGraph
+from pregel_redux import Command, Endpoint, Reducer, StateGraph
 
 
 class State[T](TypedDict, total=False):
-    items: Annotated[list[T], add]
+    items: Annotated[list[T], Reducer(add)]
     latest: T
     failures: int
 
 
 class Input[T](TypedDict):
-    items: Annotated[list[T], add]
+    items: Annotated[list[T], Reducer(add)]
 
 
 class Output[T](TypedDict):
-    items: Annotated[list[T], add]
+    items: Annotated[list[T], Reducer(add)]
     latest: T
+
+
+class BareCallableState(TypedDict, total=False):
+    items: Annotated[list[int], add]
 
 
 def build_sequential_graph[T](produce: Callable[[], T]) -> StateGraph[State[T], Input[T], Output[T]]:
@@ -122,13 +126,17 @@ def test_parallel_writes_to_a_generic_schema_use_the_reducer(
     assert actual == expected, f"Expected {expected}, got {actual}. The reducer must combine parallel writes."
 
 
-def test_parallel_writes_to_a_channel_without_reducer_are_rejected() -> None:
-    def write_latest(state: State[int]) -> State[int]:
-        return {"latest": 1}
-
-    builder = StateGraph(State[int])
-    builder.add_node("first", write_latest)
-    builder.add_node("second", write_latest)
+@pytest.mark.parametrize(
+    ("schema", "update"),
+    [(State[int], {"latest": 1}), (BareCallableState, {"items": [1]})],
+    ids=["plain-field", "field-with-a-bare-callable"],
+)
+def test_parallel_writes_to_a_channel_without_reducer_are_rejected(
+    schema: type[State[int] | BareCallableState], update: Mapping[str, object]
+) -> None:
+    builder = StateGraph(schema)
+    builder.add_node("first", lambda state: update)
+    builder.add_node("second", lambda state: update)
     builder.add_edge(Endpoint.start, "first")
     builder.add_edge(Endpoint.start, "second")
 
