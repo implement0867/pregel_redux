@@ -1,7 +1,10 @@
+import secrets
+import time
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
+from datetime import UTC, datetime
 from typing import Never, assert_never
-from uuid import UUID, uuid4, uuid5
+from uuid import UUID, uuid5
 
 from pydantic import JsonValue
 
@@ -154,14 +157,30 @@ def load_join(channel: JoinChannel, saved: SavedJoin) -> JoinChannel:
             assert_never(channel)
 
 
+@dataclass(frozen=True)
+class CheckpointStamp:
+    checkpoint_id: UUID
+    parent_id: UUID | None
+    created_at: datetime
+
+
+def make_checkpoint_id(parent_id: UUID | None) -> UUID:
+    milliseconds = time.time_ns() // 1_000_000
+    layout = (milliseconds << 80) | (7 << 76) | (secrets.randbits(12) << 64) | (2 << 62) | secrets.randbits(62)
+    candidate = UUID(int=layout)
+    return candidate if parent_id is None or candidate > parent_id else UUID(int=parent_id.int + 1)
+
+
 def dump_position(
-    graph: AnyGraph, position: Position, checkpoint_id: UUID, checkpoint_ns: str, step: int, source: CheckpointSource
+    graph: AnyGraph, position: Position, stamp: CheckpointStamp, checkpoint_ns: str, step: int, source: CheckpointSource
 ) -> Checkpoint:
     channels = position.channels
     versions = position.versions
     branches = (dump_branch(node, channel) for node, channel in channels.branches.items())
     return Checkpoint(
-        id=checkpoint_id,
+        id=stamp.checkpoint_id,
+        parent_id=stamp.parent_id,
+        ts=stamp.created_at,
         checkpoint_ns=checkpoint_ns,
         step=step,
         source=source,
@@ -244,10 +263,15 @@ class ThreadScope:
     thread_id: str
     checkpoint_ns: str
 
-    async def begin(self, position: Position, step: int) -> "tuple[Position, ThreadJournal]":
-        journal = ThreadJournal(self, uuid4(), step, ())
-        await journal.save(position, CheckpointSource.input)
-        return position, journal
+    async def put(self, position: Position, step: int, source: CheckpointSource, parent_id: UUID | None) -> UUID:
+        stamp = CheckpointStamp(make_checkpoint_id(parent_id), parent_id, datetime.now(UTC))
+        checkpoint = dump_position(self.graph, position, stamp, self.checkpoint_ns, step, source)
+        await self.checkpointer.aput(self.thread_id, checkpoint)
+        return stamp.checkpoint_id
+
+    async def begin(self, position: Position, step: int, parent_id: UUID | None) -> "tuple[Position, ThreadJournal]":
+        checkpoint_id = await self.put(position, step, CheckpointSource.input, parent_id)
+        return position, ThreadJournal(self, checkpoint_id, step + 1, ())
 
     async def load(self) -> "tuple[Position, ThreadJournal] | None":
         saved = await self.checkpointer.aget_tuple(self.thread_id, self.checkpoint_ns)
@@ -268,11 +292,7 @@ class ThreadJournal:
         return str(uuid5(self.checkpoint_id, f"{self.scope.checkpoint_ns}|{self.step}|{name_task(task)}"))
 
     async def save(self, position: Position, source: CheckpointSource) -> None:
-        scope = self.scope
-        checkpoint_id = uuid4()
-        checkpoint = dump_position(scope.graph, position, checkpoint_id, scope.checkpoint_ns, self.step, source)
-        await scope.checkpointer.aput(scope.thread_id, checkpoint)
-        self.checkpoint_id = checkpoint_id
+        self.checkpoint_id = await self.scope.put(position, self.step, source, self.checkpoint_id)
         self.step += 1
         self.pending = ()
 
@@ -330,7 +350,9 @@ class ThreadJournal:
 
     async def enter_child(self, child: AnyGraph, call: NodeCall) -> tuple[Position, Journal]:
         scope = ThreadScope(child, self.scope.checkpointer, self.scope.thread_id, self.make_task_ns(call.task))
-        return await scope.load() or await scope.begin(child.feed(child.open(extract_writes(call.node_input)), {}), -1)
+        return await scope.load() or await scope.begin(
+            child.feed(child.open(extract_writes(call.node_input)), {}), -1, None
+        )
 
 
 @dataclass(frozen=True)
@@ -351,11 +373,11 @@ class PersistentGraph[StateT, InputT, OutputT]:
                 resume = await journal.read_resume(input)
             case _ if loaded is None:
                 start = self.graph.feed(self.graph.open({}), extract_writes(input))
-                position, journal = await scope.begin(start, -1)
+                position, journal = await scope.begin(start, -1, None)
                 resume = ResumeInput([], {})
             case _:
                 start = self.graph.feed(loaded[0], extract_writes(input))
-                position, journal = await scope.begin(start, loaded[1].step)
+                position, journal = await scope.begin(start, loaded[1].step, loaded[1].checkpoint_id)
                 resume = ResumeInput([], {})
         return await self.graph.run(position, step_limit, journal, resume)
 

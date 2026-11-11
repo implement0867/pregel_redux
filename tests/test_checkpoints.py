@@ -5,7 +5,7 @@ from typing import Annotated, TypedDict
 from uuid import UUID
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ValidationError
 
 from pregel_redux import (
     Checkpoint,
@@ -529,3 +529,64 @@ def test_resume_keeps_the_state_of_a_deferred_node(failing: str, *, with_join: b
     expected_calls = ["last", "target"] if failing == "last" else ["target"]
     assert actual == expected, f"Expected {expected}, got {actual}."
     assert calls == expected_calls, f"Expected the calls {expected_calls}, got {calls}."
+
+
+@pytest.mark.parametrize("runs", [1, 2, 3])
+def test_checkpoints_of_a_thread_form_a_chain_in_the_order_of_their_ids(runs: int) -> None:
+    """
+    Arrange: a graph with a checkpointer.
+    Act: run the graph on one thread a number of times.
+    Assert: each checkpoint has format version 1, a greater id than the one before it, and that one as its parent.
+    """
+    checkpointer = InMemoryCheckpointer()
+    graph = build_joke_graph(checkpointer, [], [])
+
+    for _ in range(runs):
+        asyncio.run(graph.ainvoke({"topics": ["cats"]}, thread_id="thread"))
+
+    stored = [CheckpointTuple.model_validate_json(record).checkpoint for record in checkpointer.threads["thread"][""]]
+    ids = [checkpoint.id for checkpoint in stored]
+    parents = [checkpoint.parent_id for checkpoint in stored]
+    versions = {checkpoint.v for checkpoint in stored}
+    assert ids == sorted(set(ids)), f"Expected ids that increase, got {ids}."
+    assert parents == [None, *ids[:-1]], f"Expected each parent to be the checkpoint before, got {parents}."
+    assert versions == {1}, f"Expected format version 1, got {versions}."
+
+
+def test_latest_checkpoint_is_the_one_with_the_greatest_id() -> None:
+    """
+    Arrange: a thread of a run that failed, whose records the storage holds in the reverse order.
+    Act: run the thread again without an input.
+    Assert: the run continues from the checkpoint with the greatest id, so only the node that failed runs.
+    """
+    expected = asyncio.run(
+        build_joke_graph(InMemoryCheckpointer(), [], []).ainvoke({"topics": ["cats"]}, thread_id="thread")
+    )
+    checkpointer = InMemoryCheckpointer()
+    calls: list[str] = []
+    graph = build_joke_graph(checkpointer, [ConnectionError("no network")], calls)
+    with pytest.raises(ConnectionError):
+        asyncio.run(graph.ainvoke({"topics": ["cats"]}, thread_id="thread"))
+    checkpointer.threads["thread"][""].reverse()
+    calls.clear()
+
+    actual = asyncio.run(graph.ainvoke(None, thread_id="thread"))
+
+    assert actual == expected, f"Expected {expected}, got {actual}."
+    assert calls == ["review"], f"Expected the calls ['review'], got {calls}."
+
+
+def test_checkpoint_of_another_format_version_is_rejected() -> None:
+    """
+    Arrange: a thread whose stored records have format version 2.
+    Act: run the thread again without an input.
+    Assert: the run raises the ValidationError of Pydantic.
+    """
+    checkpointer = InMemoryCheckpointer()
+    graph = build_joke_graph(checkpointer, [], [])
+    asyncio.run(graph.ainvoke({"topics": ["cats"]}, thread_id="thread"))
+    records = checkpointer.threads["thread"][""]
+    checkpointer.threads["thread"][""] = [record.replace('"v":1', '"v":2') for record in records]
+
+    with pytest.raises(ValidationError):
+        asyncio.run(graph.ainvoke(None, thread_id="thread"))

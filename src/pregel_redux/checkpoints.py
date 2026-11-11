@@ -3,7 +3,7 @@ from enum import Enum, StrEnum
 from typing import Annotated, Literal, Protocol
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, Field, JsonValue
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue
 
 from pregel_redux.interrupts import Interrupt
 
@@ -102,7 +102,10 @@ class ChannelVersions(Record):
 
 
 class Checkpoint(Record):
+    v: Literal[1] = 1
     id: UUID
+    parent_id: UUID | None
+    ts: AwareDatetime
     checkpoint_ns: str
     step: int
     source: CheckpointSource
@@ -145,5 +148,6 @@ class InMemoryCheckpointer:
         ).model_dump_json()
 
     async def aget_tuple(self, thread_id: str, checkpoint_ns: str) -> CheckpointTuple | None:
-        records = self.threads.get(thread_id, {}).get(checkpoint_ns)
-        return CheckpointTuple.model_validate_json(records[-1]) if records else None
+        records = self.threads.get(thread_id, {}).get(checkpoint_ns, [])
+        saved = [CheckpointTuple.model_validate_json(record) for record in records]
+        return max(saved, key=lambda item: item.checkpoint.id, default=None)
