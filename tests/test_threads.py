@@ -274,6 +274,25 @@ def test_interrupt_gives_the_answer_of_the_resume_as_its_answer_type(
     assert received == [expected], f"Expected the node to receive {expected!r}, got {received}."
 
 
+def test_interrupt_in_an_async_node_resumes_with_the_answer() -> None:
+    async def ask(state: State) -> State:
+        await asyncio.sleep(0)
+        return {"items": [interrupt("topic?", str)]}
+
+    builder = StateGraph(State)
+    builder.add_node("ask", ask)
+    builder.add_edge(Endpoint.start, "ask")
+    thread = build_thread(builder)
+
+    async def ask_and_answer() -> RunResult[State]:
+        interrupted = read_interrupted(await thread.ainvoke({}))
+        return await thread.aresume(Answer(interrupt_id=interrupted.interrupts[0].interrupt_id, value="cats"))
+
+    output = run_until_done(asyncio.run(ask_and_answer()))
+
+    assert output == {"items": ["cats"]}, f"Expected the answer in the output, got {output}."
+
+
 def test_saved_interrupt_can_be_answered_by_another_thread_object(journal: Journal) -> None:
     builder = StateGraph(State)
     builder.add_node("ask", build_asker(journal, "ask", 1))
