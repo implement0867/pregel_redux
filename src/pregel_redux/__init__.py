@@ -4,6 +4,7 @@ from pregel_redux.commands import Command, Endpoint, Send
 from pregel_redux.dependencies import Depends, Scope, StateDep
 from pregel_redux.graph import CompiledGraph, PersistentGraph, StateGraph, StateSnapshot
 from pregel_redux.interrupts import Finished, Interrupt, Interrupted, interrupt
+from pregel_redux.retries import RetryPolicy
 from pregel_redux.streams import StreamMode, get_stream_writer
 
 __all__ = [
@@ -20,6 +21,7 @@ __all__ = [
     "Interrupted",
     "PersistentGraph",
     "Reducer",
+    "RetryPolicy",
     "Scope",
     "Send",
     "StateDep",
