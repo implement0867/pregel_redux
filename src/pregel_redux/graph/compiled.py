@@ -1,12 +1,15 @@
 import asyncio
 import inspect
 from collections import ChainMap
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
 from contextvars import copy_context
 from dataclasses import dataclass
-from typing import Never, assert_never
+from functools import cached_property
+from typing import Never, Protocol, assert_never
+
+from pydantic import TypeAdapter
 
 from pregel_redux.channels import Channel, extract_writes, reject_unknown_channels
 from pregel_redux.commands import Send, read_outcome
@@ -38,11 +41,15 @@ class Run:
 @dataclass(frozen=True)
 class CompiledNode:
     action: "CallPlan | CompiledGraph[object, Never, object]"
-    input_schema: Callable[..., object]
+    input_schema: type[object]
     input_fields: frozenset[str]
     targets: frozenset[str]
     joins: frozenset[JoinKey]
     triggers: tuple[TriggerKey, ...]
+
+    @cached_property
+    def input_adapter(self) -> TypeAdapter[object]:
+        return TypeAdapter(self.input_schema)
 
     def build_input(self, values: Mapping[str, object]) -> object:
         return self.input_schema(**{name: values[name] for name in self.input_fields if name in values})
@@ -63,6 +70,15 @@ class NodeCall:
     node_input: object
 
 
+class Journal(Protocol):
+    async def save(self, position: Position) -> None: ...
+
+
+class NoJournal:
+    async def save(self, position: Position) -> None:
+        pass
+
+
 @dataclass(frozen=True)
 class CompiledGraph[StateT, InputT, OutputT]:
     output_schema: Callable[..., OutputT]
@@ -72,9 +88,12 @@ class CompiledGraph[StateT, InputT, OutputT]:
     entry_nodes: frozenset[str]
 
     async def ainvoke(self, input: InputT, *, step_limit: int | None = None) -> OutputT:
+        return await self.run(self.start({}, extract_writes(input)), step_limit, NoJournal())
+
+    async def run(self, position: Position, step_limit: int | None, journal: Journal) -> OutputT:
         limit = RunSettings().step_limit if step_limit is None else step_limit
         async with AsyncExitStack() as run_exits:
-            return await self.run_steps({}, extract_writes(input), Run({}, run_exits, asyncio.Lock(), limit))
+            return await self.run_steps(position, Run({}, run_exits, asyncio.Lock(), limit), journal)
 
     def find_async_nodes(self) -> list[str]:
         names: list[str] = []
@@ -89,17 +108,21 @@ class CompiledGraph[StateT, InputT, OutputT]:
                     assert_never(node.action)
         return sorted(names)
 
-    def invoke(self, input: InputT, *, step_limit: int | None = None) -> OutputT:
+    def run_in_new_loop[ResultT](
+        self, start_run: Callable[[], Coroutine[object, object, ResultT]], async_method: str
+    ) -> ResultT:
         async_nodes = self.find_async_nodes()
         if async_nodes:
-            raise TypeError(f"nodes {async_nodes!r} have only an async function, so call ainvoke")
+            raise TypeError(f"nodes {async_nodes!r} have only an async function, so call {async_method}")
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.ainvoke(input, step_limit=step_limit))
+            return asyncio.run(start_run())
         with ThreadPoolExecutor(max_workers=1) as executor:
-            run = executor.submit(copy_context().run, asyncio.run, self.ainvoke(input, step_limit=step_limit))
-            return run.result()
+            return executor.submit(copy_context().run, asyncio.run, start_run()).result()
+
+    def invoke(self, input: InputT, *, step_limit: int | None = None) -> OutputT:
+        return self.run_in_new_loop(lambda: self.ainvoke(input, step_limit=step_limit), "ainvoke")
 
     def start(self, given: Mapping[str, object], update: Mapping[str, object]) -> Position:
         reject_unknown_channels(self.channels, given)
@@ -122,8 +145,8 @@ class CompiledGraph[StateT, InputT, OutputT]:
             case _:
                 assert_never(task)
 
-    async def run_steps(self, given: Mapping[str, object], update: Mapping[str, object], run: Run) -> OutputT:
-        position = self.start(given, update)
+    async def run_steps(self, start: Position, run: Run, journal: Journal) -> OutputT:
+        position = start
         triggers = {name: node.triggers for name, node in self.nodes.items()}
         steps = 0
         while tasks := plan_tasks(position, triggers):
@@ -134,6 +157,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
             async with AsyncExitStack() as step_exits:
                 writes = await self.run_step(calls, run, step_exits)
                 position = advance(self.channels, position, tasks, writes)
+                await journal.save(position)
         values = position.channels.values
         return self.output_schema(**{name: values[name] for name in self.output_fields if name in values})
 
@@ -153,7 +177,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
             case CallPlan() as plan:
                 return await self.call_function(plan, call, run, step_exits)
             case CompiledGraph() as child:
-                result = await child.run_steps(extract_writes(call.node_input), {}, run)
+                result = await child.run_steps(child.start(extract_writes(call.node_input), {}), run, NoJournal())
                 return self.read_writes(call.name, result)
             case _:
                 assert_never(node.action)

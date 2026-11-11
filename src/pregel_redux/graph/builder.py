@@ -3,9 +3,11 @@ from dataclasses import dataclass
 from typing import Any, Concatenate, Literal, Never, Protocol, overload, runtime_checkable
 
 from pregel_redux.channels import build_channels, merge_channels
+from pregel_redux.checkpoints import Checkpointer
 from pregel_redux.commands import Endpoint, read_declared_targets
 from pregel_redux.dependencies import CallPlan, plan_call
 from pregel_redux.graph.compiled import CompiledGraph, CompiledNode
+from pregel_redux.graph.persistent import PersistentGraph
 from pregel_redux.pregel import BranchKey, JoinKey
 
 type Node[InputT] = Callable[Concatenate[InputT, ...], object]
@@ -14,7 +16,7 @@ type Node[InputT] = Callable[Concatenate[InputT, ...], object]
 @runtime_checkable
 class GraphBuilder(Protocol):
     @property
-    def input_schema(self) -> Callable[..., object]: ...
+    def input_schema(self) -> type[object]: ...
     @property
     def dependencies(self) -> frozenset[Callable[..., object]]: ...
     def compile(
@@ -50,7 +52,7 @@ class StateGraph[StateT, InputT, OutputT]:
         self.input_schema: type[InputT] = state_schema if input_schema is None else input_schema
         self.output_schema: type[OutputT] = state_schema if output_schema is None else output_schema
         self.nodes: dict[str, Callable[..., object]] = {}
-        self.node_input_schemas: dict[str, Callable[..., object]] = {}
+        self.node_input_schemas: dict[str, type[object]] = {}
         self.child_graphs: dict[str, GraphBuilder] = {}
         self.edges: set[Edge] = set()
         self.joins: set[Join] = set()
@@ -68,7 +70,7 @@ class StateGraph[StateT, InputT, OutputT]:
         name: str,
         node: Callable[..., object] | GraphBuilder,
         *,
-        input_schema: Callable[..., object] | None = None,
+        input_schema: type[object] | None = None,
     ) -> None:
         if name in self.nodes or name in self.child_graphs:
             raise ValueError(f"node {name!r} is already in this graph")
@@ -98,8 +100,28 @@ class StateGraph[StateT, InputT, OutputT]:
             item.request.dependency for plan in plans for item in (*plan.run_providers, *plan.node_providers)
         ).union(*(child.dependencies for child in self.child_graphs.values()))
 
+    @overload
     def compile[ProviderT: Callable[..., object]](
         self, dependency_overrides: Mapping[ProviderT, Callable[..., object]] | None = None
+    ) -> CompiledGraph[StateT, InputT, OutputT]: ...
+    @overload
+    def compile[ProviderT: Callable[..., object]](
+        self,
+        dependency_overrides: Mapping[ProviderT, Callable[..., object]] | None = None,
+        *,
+        checkpointer: Checkpointer,
+    ) -> PersistentGraph[StateT, InputT, OutputT]: ...
+    def compile[ProviderT: Callable[..., object]](
+        self,
+        dependency_overrides: Mapping[ProviderT, Callable[..., object]] | None = None,
+        *,
+        checkpointer: Checkpointer | None = None,
+    ) -> CompiledGraph[StateT, InputT, OutputT] | PersistentGraph[StateT, InputT, OutputT]:
+        graph = self.compile_graph(dependency_overrides)
+        return graph if checkpointer is None else PersistentGraph(graph, checkpointer)
+
+    def compile_graph[ProviderT: Callable[..., object]](
+        self, dependency_overrides: Mapping[ProviderT, Callable[..., object]] | None
     ) -> CompiledGraph[StateT, InputT, OutputT]:
         overrides: dict[Callable[..., object], Callable[..., object]] = (
             {} if dependency_overrides is None else dict(dependency_overrides.items())
@@ -122,7 +144,7 @@ class StateGraph[StateT, InputT, OutputT]:
         )
         if not entry_nodes:
             raise ValueError("the graph has no edge from Endpoint.start to a node")
-        input_schemas: dict[str, Callable[..., object]] = {
+        input_schemas: dict[str, type[object]] = {
             **{name: self.node_input_schemas.get(name, self.state_schema) for name in self.nodes},
             **{name: child.input_schema for name, child in self.child_graphs.items()},
         }
