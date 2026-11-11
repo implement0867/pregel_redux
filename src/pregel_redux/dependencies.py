@@ -1,8 +1,16 @@
+import asyncio
 import inspect
 from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, MutableMapping
-from contextlib import AbstractAsyncContextManager, AsyncExitStack, asynccontextmanager, contextmanager
+from contextlib import (
+    AbstractAsyncContextManager,
+    AbstractContextManager,
+    AsyncExitStack,
+    asynccontextmanager,
+    contextmanager,
+)
 from dataclasses import dataclass, field
 from enum import Enum
+from types import TracebackType
 from typing import Annotated, TypeAliasType, get_args, get_origin
 
 
@@ -72,23 +80,59 @@ def read_dependency_parameters(function: Callable[..., object], *, state_paramet
     return {parameter.name: read_request(function, parameter) for parameter in parameters[state_parameters:]}
 
 
+async def run_in_thread(function: Callable[..., object], *arguments: object, **named_arguments: object) -> object:
+    await asyncio.sleep(0)  # deliver a pending cancellation
+    call = asyncio.ensure_future(asyncio.to_thread(function, *arguments, **named_arguments))
+    cancelled = False
+    while not call.done():
+        try:
+            await asyncio.wait([call])
+        except asyncio.CancelledError:
+            cancelled = True
+    result = call.result()
+    task = asyncio.current_task()
+    if cancelled and task is not None:
+        task.cancel()
+    return result
+
+
+@dataclass(frozen=True)
+class ThreadedContext(AbstractAsyncContextManager[object]):
+    manager: AbstractContextManager[object]
+
+    async def __aenter__(self) -> object:
+        return await run_in_thread(self.manager.__enter__)
+
+    async def __aexit__(
+        self, error_type: type[BaseException] | None, error: BaseException | None, traceback: TracebackType | None
+    ) -> bool | None:
+        return bool(await run_in_thread(self.manager.__exit__, error_type, error, traceback))
+
+
+async def call_without_blocking(
+    function: Callable[..., object], *arguments: object, **named_arguments: object
+) -> object:
+    if inspect.iscoroutinefunction(function):
+        result = function(*arguments, **named_arguments)
+    else:
+        result = await run_in_thread(function, *arguments, **named_arguments)
+    return await result if inspect.isawaitable(result) else result
+
+
 def build_value_opener(function: Callable[..., object]) -> Callable[..., AbstractAsyncContextManager[object]]:
     if inspect.isasyncgenfunction(function):
         return asynccontextmanager(function)
     if inspect.isgeneratorfunction(function):
         open_in_context = contextmanager(function)
 
-        @asynccontextmanager
-        async def open_generator_value(**arguments: object) -> AsyncGenerator[object]:
-            with open_in_context(**arguments) as value:
-                yield value
+        def open_generator_value(**arguments: object) -> ThreadedContext:
+            return ThreadedContext(open_in_context(**arguments))
 
         return open_generator_value
 
     @asynccontextmanager
     async def open_returned_value(**arguments: object) -> AsyncGenerator[object]:
-        result = function(**arguments)
-        yield await result if inspect.isawaitable(result) else result
+        yield await call_without_blocking(function, **arguments)
 
     return open_returned_value
 
@@ -148,5 +192,6 @@ async def execute_plan(
 ) -> object:
     values[Depends(read_state)] = state
     await open_providers(plan.node_providers, values, exits)
-    result = plan.function(state, **{name: values[request] for name, request in plan.parameters.items()})
-    return await result if inspect.isawaitable(result) else result
+    return await call_without_blocking(
+        plan.function, state, **{name: values[request] for name, request in plan.parameters.items()}
+    )

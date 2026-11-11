@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import nullcontext as does_not_raise
 from operator import add
@@ -146,12 +147,18 @@ def test_provider_of_each_kind_supplies_its_value(provider: Callable[..., object
 def test_node_scoped_provider_opens_and_closes_for_each_node_call(
     journal: Journal, *, parallel: bool, expected_events: list[str]
 ) -> None:
+    """
+    Arrange: two async nodes that request one node-scoped generator provider, in one step or in two.
+    Act: run the graph.
+    Assert: the provider opened for each node call and closed after the writes of its step.
+    """
+
     async def open_connection() -> AsyncIterator[int]:
         number = journal.open_resource("link")
         yield number
         journal.events.append(f"close {number}")
 
-    def use_value(state: State, number: Annotated[int, Depends(open_connection)]) -> State:
+    async def use_value(state: State, number: Annotated[int, Depends(open_connection)]) -> State:
         journal.events.append(f"node {number}")
         return {"seen": [number]}
 
@@ -354,15 +361,25 @@ def test_node_scoped_cleanup_runs_after_the_writes_of_the_step_are_applied(
 def test_cleanup_of_a_finished_node_runs_when_another_node_of_the_step_fails(
     journal: Journal, error_type: type[Exception]
 ) -> None:
+    """
+    Arrange: a step with a node that uses a generator provider, and a node that fails after the first node ran.
+    Act: run the graph.
+    Assert: the failure is raised and the provider of the finished node closed.
+    """
+
     def open_connection() -> Iterator[int]:
         number = journal.open_resource("link")
         yield number
         journal.events.append(f"close {number}")
 
+    used = threading.Event()
+
     def use_value(state: State, number: Annotated[int, Depends(open_connection)]) -> State:
+        used.set()
         return {"seen": [number]}
 
     def raise_error(state: State) -> State:
+        used.wait(timeout=1)
         raise error_type("no value")
 
     graph = build_two_node_graph(use_value, raise_error, parallel=True).compile()

@@ -1,7 +1,10 @@
 import asyncio
+import inspect
 from collections import ChainMap
 from collections.abc import Callable, Mapping, Sequence
+from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
+from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Concatenate, Literal, Never, Protocol, assert_never, overload, runtime_checkable
 
@@ -75,6 +78,31 @@ class CompiledGraph[StateT, InputT, OutputT]:
         async with AsyncExitStack() as run_exits:
             return await self.run_steps(input, Run({}, run_exits, asyncio.Lock(), step_limit))
 
+    def find_async_nodes(self) -> list[str]:
+        names: list[str] = []
+        for name, node in self.nodes.items():
+            match node.action:
+                case CallPlan() as plan:
+                    if inspect.iscoroutinefunction(plan.function):
+                        names.append(name)
+                case CompiledGraph() as child:
+                    names.extend(f"{name}.{child_name}" for child_name in child.find_async_nodes())
+                case _:
+                    assert_never(node.action)
+        return sorted(names)
+
+    def invoke(self, input: InputT, *, step_limit: int = 25) -> OutputT:
+        async_nodes = self.find_async_nodes()
+        if async_nodes:
+            raise TypeError(f"nodes {async_nodes!r} have only an async function, so call ainvoke")
+        try:
+            asyncio.get_running_loop()
+        except RuntimeError:
+            return asyncio.run(self.ainvoke(input, step_limit=step_limit))
+        with ThreadPoolExecutor(max_workers=1) as executor:
+            run = executor.submit(copy_context().run, asyncio.run, self.ainvoke(input, step_limit=step_limit))
+            return run.result()
+
     async def run_steps(self, input: object, run: Run) -> OutputT:
         values = apply_writes(self.channels, {}, [extract_writes(input)])
         names = self.entry_nodes
@@ -116,8 +144,9 @@ class CompiledGraph[StateT, InputT, OutputT]:
                 assert_never(call.node.action)
 
     async def call_function(self, plan: CallPlan, call: NodeCall, run: Run, step_exits: AsyncExitStack) -> Outcome:
-        async with run.lock:
-            await open_providers(plan.run_providers, run.values, run.exits)
+        if plan.run_providers:
+            async with run.lock:
+                await open_providers(plan.run_providers, run.values, run.exits)
         node_values = ChainMap[Depends, object]({}, dict(run.values))
         outcome: Outcome | None = None
         async with AsyncExitStack[bool]() as node_exits:

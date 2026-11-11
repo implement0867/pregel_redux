@@ -65,6 +65,11 @@ def nest_graph(
     ids=["one-node", "two-nodes", "three-nodes", "three-levels"],
 )
 def test_child_graph_runs_as_a_node_of_its_parent(names: list[str], depth: int) -> None:
+    """
+    Arrange: a parent graph with a node before and a node after a child graph of a given depth.
+    Act: run the parent graph.
+    Assert: the jokes of the child nodes are between the jokes of the parent nodes.
+    """
     builder = StateGraph(State)
     builder.add_node("before", lambda state: {"jokes": ["before"]})
     builder.add_node("child", nest_graph(build_chain_graph(names), depth - 1))
@@ -89,6 +94,11 @@ def test_child_graph_runs_as_a_node_of_its_parent(names: list[str], depth: int) 
     ids=["field-with-a-value", "field-without-a-value", "empty-state"],
 )
 def test_child_graph_receives_the_fields_of_its_input_type(input_state: State, expected: State) -> None:
+    """
+    Arrange: a child graph with an input type that has one field of the parent state.
+    Act: run the parent graph with an input state.
+    Assert: the child received only the fields of its input type.
+    """
     received: list[State] = []
     child = StateGraph(State, input_schema=TopicsInput)
     child.add_node("receive", received.append)
@@ -104,6 +114,11 @@ def test_child_graph_receives_the_fields_of_its_input_type(input_state: State, e
 
 @pytest.mark.parametrize("visits", [[], ["input"], ["input", "other"]], ids=repr)
 def test_child_graph_writes_the_fields_of_its_output_type(visits: list[str]) -> None:
+    """
+    Arrange: a child graph whose node writes two channels and whose output type has one of them.
+    Act: run the parent graph.
+    Assert: the parent state has only the write for the output field.
+    """
     child = StateGraph(State, output_schema=JokesOutput)
     child.add_node("write", lambda state: {"jokes": ["joke"], "visits": ["child"]})
     child.add_edge(Endpoint.start, "write")
@@ -125,6 +140,11 @@ def test_child_graph_writes_the_fields_of_its_output_type(visits: list[str]) -> 
 def test_parent_reduces_the_output_of_a_child_graph_that_also_received_the_channel(
     jokes: list[str], expected: list[str]
 ) -> None:
+    """
+    Arrange: a child graph that receives and returns a channel that has a reducer.
+    Act: run the parent graph with a value for the channel.
+    Assert: the parent reduced the complete output of the child into the channel.
+    """
     child = StateGraph(State)
     child.add_node("write", lambda state: {"jokes": ["joke"]})
     child.add_edge(Endpoint.start, "write")
@@ -145,6 +165,11 @@ def test_parent_reduces_the_output_of_a_child_graph_that_also_received_the_chann
     ids=["no-send", "one-send", "two-sends"],
 )
 def test_each_send_starts_the_child_graph_with_its_payload(topics: list[str], expected: list[str]) -> None:
+    """
+    Arrange: a parent node that sends one payload for each topic to a child graph.
+    Act: run the parent graph with the topics.
+    Assert: the child wrote one joke for each payload.
+    """
     child = StateGraph(State, input_schema=TopicsInput, output_schema=JokesOutput)
     child.add_node("write", lambda state: {"jokes": state.get("topics", [])})
     child.add_edge(Endpoint.start, "write")
@@ -175,6 +200,12 @@ def test_each_send_starts_the_child_graph_with_its_payload(topics: list[str], ex
 def test_child_graph_shares_the_run_scoped_values_of_its_parent(
     journal: Journal, first_depth: int, second_depth: int, *, same_step: bool
 ) -> None:
+    """
+    Arrange: two nodes at given depths of child graphs that request one run-scoped provider, in one step or in two.
+    Act: run the parent graph.
+    Assert: the provider opened one time and closed one time.
+    """
+
     async def provide_resource() -> AsyncGenerator[int]:
         await asyncio.sleep(0)
         yield journal.open_resource("resource")
@@ -203,6 +234,12 @@ def test_child_graph_shares_the_run_scoped_values_of_its_parent(
 @pytest.mark.parametrize("depth", [1, 2, 3])
 @pytest.mark.parametrize("replacement", ["fake", "other"])
 def test_overrides_of_the_parent_apply_to_a_child_graph(depth: int, replacement: str) -> None:
+    """
+    Arrange: a node at a given depth of child graphs that requests a provider.
+    Act: compile the parent with an override of the provider and run it.
+    Assert: the node received the value of the override.
+    """
+
     def provide_name() -> str:
         return "real"
 
@@ -218,6 +255,12 @@ def test_overrides_of_the_parent_apply_to_a_child_graph(depth: int, replacement:
 
 @pytest.mark.parametrize("depth", [0, 1, 2, 3])
 def test_dependencies_of_a_graph_include_those_of_its_child_graphs(depth: int) -> None:
+    """
+    Arrange: a node at a given depth of child graphs that requests a provider.
+    Act: read the dependencies of the parent graph.
+    Assert: the dependencies contain the provider.
+    """
+
     def provide_name() -> str:
         return "real"
 
@@ -245,6 +288,11 @@ def test_dependencies_of_a_graph_include_those_of_its_child_graphs(depth: int) -
 def test_child_graph_counts_its_own_steps_against_the_step_limit_of_the_run(
     child_steps: int, step_limit: int, depth: int, expectation: AbstractContextManager[object]
 ) -> None:
+    """
+    Arrange: a child graph with a given number of steps at a given depth.
+    Act: run the parent graph with a step limit.
+    Assert: the run finishes at the limit and raises a RuntimeError above it.
+    """
     names = [f"node-{index}" for index in range(child_steps)]
     graph = nest_graph(build_chain_graph(names), depth).compile()
 
@@ -254,6 +302,11 @@ def test_child_graph_counts_its_own_steps_against_the_step_limit_of_the_run(
 
 @pytest.mark.parametrize("name", ["child", "other"])
 def test_child_graph_with_the_name_of_a_node_is_rejected(name: str) -> None:
+    """
+    Arrange: a graph that has a node with a name.
+    Act: add a child graph with the same name.
+    Assert: a ValueError is raised.
+    """
     builder = StateGraph(State)
     builder.add_node(name, lambda state: None)
 

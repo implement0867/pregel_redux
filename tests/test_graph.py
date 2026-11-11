@@ -134,6 +134,11 @@ def test_parallel_writes_to_a_generic_schema_use_the_reducer(
 def test_parallel_writes_to_a_channel_without_reducer_are_rejected(
     schema: type[State[int] | BareCallableState], update: Mapping[str, object]
 ) -> None:
+    """
+    Arrange: two nodes of one step that write the same channel, which has no Reducer marker.
+    Act: run the graph.
+    Assert: a ValueError is raised.
+    """
     builder = StateGraph(schema)
     builder.add_node("first", lambda state: update)
     builder.add_node("second", lambda state: update)
