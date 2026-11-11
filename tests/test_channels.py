@@ -4,10 +4,11 @@ from contextlib import nullcontext as does_not_raise
 from dataclasses import dataclass, field, make_dataclass
 from operator import add, mul
 from types import new_class
-from typing import Annotated, NotRequired, TypedDict
+from typing import Annotated, NotRequired, TypedDict, TypeVar
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, PydanticSchemaGenerationError
+from typing_extensions import TypeForm
 
 from pregel_redux import Depends
 from pregel_redux.channels import (
@@ -17,6 +18,7 @@ from pregel_redux.channels import (
     build_channels,
     extract_writes,
     merge_channels,
+    read_update_type,
     reject_unknown_channels,
 )
 from tests.conftest import append_item, join_lists
@@ -497,3 +499,69 @@ def test_field_of_a_type_that_pydantic_cannot_validate_is_rejected(schema: objec
     """
     with pytest.raises(PydanticSchemaGenerationError):
         build_channels(schema)
+
+
+def count_words(current: int, update: str) -> int:
+    return current + len(update.split())
+
+
+def merge_counts[K, V](current: dict[K, list[V]], update: tuple[K, V]) -> dict[K, list[V]]:
+    key, value = update
+    return {**current, key: [*current.get(key, []), value]}
+
+
+def take_first[T](current: Sequence[T], update: T) -> Sequence[T]:
+    return [update, *current]
+
+
+def keep_pair[T](current: tuple[T, T], update: T) -> tuple[T, T]:
+    return (current[1], update)
+
+
+@pytest.mark.parametrize(
+    ("reducer", "value_type", "expected"),
+    [
+        (build_marker(), list[int], list[int]),
+        (build_append_marker(), list[int], int),
+        (Reducer(count_words, initial=0), int, str),
+        (
+            Reducer[dict[str, list[int]], tuple[str, int]](merge_counts, initial_factory=dict),
+            dict[str, list[int]],
+            tuple[str, int],
+        ),
+        (Reducer(max, initial=0), int, int),
+        (Reducer(add, initial=0), int, int),
+        (Reducer[tuple[int, int], int](keep_pair, initial=(0, 0)), tuple[int, ...], int),
+    ],
+    ids=[
+        "same-type-variable",
+        "item-of-a-list",
+        "concrete-types",
+        "two-type-variables",
+        "builtin",
+        "no-annotations",
+        "variadic-tuple",
+    ],
+)
+def test_update_type_of_a_reducer_is_the_type_of_its_update_parameter(
+    reducer: Reducer[object, object], value_type: TypeForm[object], expected: object
+) -> None:
+    actual = read_update_type(reducer, value_type)
+
+    assert actual == expected, f"Expected the update type {expected}, got {actual}."
+
+
+@pytest.mark.parametrize(
+    ("reducer", "value_type"),
+    [
+        (Reducer[Sequence[int], int](take_first, initial_factory=list), list[int]),
+        (Reducer[tuple[int, int], int](keep_pair, initial=(0, 0)), tuple[int, int, int]),
+    ],
+    ids=["other-origin", "longer-tuple"],
+)
+def test_type_variable_that_the_channel_type_does_not_bind_stays_in_the_update_type(
+    reducer: Reducer[object, object], value_type: TypeForm[object]
+) -> None:
+    actual = read_update_type(reducer, value_type)
+
+    assert isinstance(actual, TypeVar), f"Expected the unbound type variable, got {actual}."

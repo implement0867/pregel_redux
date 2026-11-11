@@ -1,7 +1,9 @@
 import dataclasses
+import inspect
 from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import cached_property
 from typing import (
     Annotated,
     NotRequired,
@@ -60,7 +62,7 @@ class Reducer[ValueT, UpdateT]:
 @dataclass(frozen=True)
 class Channel:
     name: str
-    value_type: object
+    value_type: TypeForm[object]
     reducer: Reducer[object, object] | None
     adapter: TypeAdapter[object] = field(compare=False, repr=False)
 
@@ -69,6 +71,12 @@ class Channel:
             return self.adapter.validate_python(value)
         except ValidationError as error:
             raise ValueError(f"channel {self.name!r} cannot hold {value!r}, its type is {self.value_type!r}") from error
+
+    @cached_property
+    def update_adapter(self) -> TypeAdapter[object]:
+        if self.reducer is None:
+            return self.adapter
+        return TypeAdapter(read_update_type(self.reducer, self.value_type))
 
 
 @runtime_checkable
@@ -87,6 +95,35 @@ def substitute_type_arguments[HintT](hint: HintT, arguments: Mapping[object, Hin
             return hint[tuple(arguments.get(parameter, parameter) for parameter in parameters)]
         case _:
             return hint
+
+
+def bind_type_variables(pattern: object, concrete: object) -> dict[object, object]:
+    match pattern:
+        case TypeVar() if concrete is not Ellipsis:
+            return {pattern: concrete}
+        case _ if get_origin(pattern) is not None and get_origin(pattern) == get_origin(concrete):
+            pattern_arguments, concrete_arguments = get_args(pattern), get_args(concrete)
+            if len(pattern_arguments) != len(concrete_arguments):
+                return {}
+            return {
+                variable: bound
+                for pattern_argument, concrete_argument in zip(pattern_arguments, concrete_arguments, strict=True)
+                for variable, bound in bind_type_variables(pattern_argument, concrete_argument).items()
+            }
+        case _:
+            return {}
+
+
+def read_update_type(reducer: Reducer[object, object], value_type: TypeForm[object]) -> TypeForm[object]:
+    try:
+        parameters = list(inspect.signature(reducer.function, eval_str=True).parameters.values())
+    except ValueError:
+        return value_type
+    match parameters:
+        case [current, update, *_] if update.annotation is not inspect.Parameter.empty:
+            return substitute_type_arguments(update.annotation, bind_type_variables(current.annotation, value_type))
+        case _:
+            return value_type
 
 
 def find_reducer(name: str, metadata: tuple[object, ...]) -> Reducer[object, object] | None:
@@ -120,15 +157,7 @@ def read_field_hints(schema_class: object) -> dict[str, TypeForm[object]]:
 def build_channels(schema: object) -> dict[str, Channel]:
     match schema:
         case type() if issubclass(schema, BaseModel):
-            return {
-                name: Channel(
-                    name,
-                    info.annotation,
-                    find_reducer(name, tuple(info.metadata)),
-                    TypeAdapter(info.rebuild_annotation()),
-                )
-                for name, info in schema.model_fields.items()
-            }
+            return {name: build_channel(name, info.rebuild_annotation()) for name, info in schema.model_fields.items()}
         case _:
             origin = get_origin(schema)
             hints = read_field_hints(schema if origin is None else origin)

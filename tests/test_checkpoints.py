@@ -1,0 +1,223 @@
+import asyncio
+from collections.abc import AsyncIterator
+from dataclasses import dataclass, field
+from datetime import UTC, datetime, timedelta
+from decimal import Decimal
+from enum import Enum
+from typing import Annotated, Literal, TypedDict
+from uuid import UUID, uuid4
+
+import pytest
+from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from typing_extensions import TypeForm
+
+from pregel_redux import CheckpointSource, InMemoryCheckpointer
+from pregel_redux.checkpoints import (
+    Checkpoint,
+    CompletedTask,
+    EdgeTask,
+    InterruptedTask,
+    SavedCheckpoint,
+    SendTask,
+    TaskAddress,
+    dump_value,
+    load_value,
+)
+
+
+class Color(Enum):
+    red = "red"
+    blue = "blue"
+
+
+class Point(BaseModel):
+    x: int
+    y: int
+
+
+class Alias(BaseModel):
+    model_config = ConfigDict(populate_by_name=True)
+    name: str = Field(alias="title")
+
+
+class Shape(BaseModel):
+    kind: str
+
+
+class Circle(Shape):
+    radius: int
+
+
+@dataclass
+class Counter:
+    name: str
+    count: int = field(init=False, default=0)
+
+
+class Request(TypedDict):
+    topic: str
+    tags: tuple[str, ...]
+
+
+class Circles(BaseModel):
+    kind: Literal["circle"]
+    radius: int
+
+
+class Squares(BaseModel):
+    kind: Literal["square"]
+    side: int
+
+
+def build_checkpoint(thread_id: str, caller: TaskAddress | None = None) -> Checkpoint:
+    return Checkpoint(
+        thread_id=thread_id,
+        caller=caller,
+        id=uuid4(),
+        parent_id=None,
+        created_at=datetime.now(UTC),
+        step=0,
+        source=CheckpointSource.input,
+        values={"count": float("inf"), "items": ["a", {"b": None}]},
+        tasks=(EdgeTask(node="first"), SendTask(node="second", node_input={"topic": "cats"})),
+    )
+
+
+async def collect(checkpoints: AsyncIterator[SavedCheckpoint]) -> list[UUID]:
+    return [saved.checkpoint.id async for saved in checkpoints]
+
+
+def build_counter() -> Counter:
+    counter = Counter(name="clicks")
+    counter.count = 3
+    return counter
+
+
+@pytest.mark.parametrize(
+    ("value_type", "value"),
+    [
+        (datetime, datetime(2026, 1, 2, 3, 4, 5, tzinfo=UTC)),
+        (timedelta, timedelta(hours=1, microseconds=5)),
+        (tuple[int, str], (1, "a")),
+        (set[int], {1, 2}),
+        (frozenset[str], frozenset({"a"})),
+        (Decimal, Decimal("1.50")),
+        (bytes, b"data"),
+        (UUID, UUID(int=7)),
+        (Color, Color.blue),
+        (float, float("inf")),
+        (Point, Point(x=1, y=2)),
+        (Alias, Alias(title="cats")),
+        (Counter, Counter(name="clicks")),
+        (Request, {"topic": "cats", "tags": ("a",)}),
+        (Annotated[Circles | Squares, Field(discriminator="kind")], Squares(kind="square", side=2)),
+        (dict[str, list[Point]], {"points": [Point(x=1, y=2)]}),
+        (int | str, "1"),
+        (int | None, None),
+    ],
+    ids=lambda item: getattr(item, "__name__", None),
+)
+def test_value_of_its_declared_type_is_restored_equal(value_type: TypeForm[object], value: object) -> None:
+    adapter = TypeAdapter[object](value_type)
+
+    record = SendTask(node="node", node_input=dump_value(adapter, value, "the value"))
+    restored = load_value(adapter, SendTask.model_validate_json(record.model_dump_json()).node_input)
+
+    assert restored == value, f"Expected {value!r} after a round trip through JSON, got {restored!r}."
+
+
+@pytest.mark.parametrize(
+    ("value_type", "value"),
+    [
+        (Shape, Circle(kind="circle", radius=1)),
+        (list[Shape], [Circle(kind="circle", radius=1)]),
+        (Counter, build_counter()),
+        (list[int] | tuple[int, ...], (1, 2)),
+        (float, float("nan")),
+        (object, Point(x=1, y=2)),
+        (object, object()),
+    ],
+    ids=[
+        "subclass",
+        "subclass-in-a-list",
+        "field-without-init",
+        "later-union-member",
+        "nan",
+        "model-as-object",
+        "plain-object",
+    ],
+)
+def test_value_that_would_not_be_restored_equal_is_rejected(value_type: TypeForm[object], value: object) -> None:
+    adapter = TypeAdapter[object](value_type)
+
+    with pytest.raises(ValueError):
+        dump_value(adapter, value, "the value")
+
+
+def test_saved_checkpoint_is_read_back_equal() -> None:
+    checkpointer = InMemoryCheckpointer()
+    checkpoint = build_checkpoint("thread")
+    address = TaskAddress(checkpoint_id=checkpoint.id, index=1)
+    completed = CompletedTask(writes={"items": [1.5]}, targets=("third",), sends=())
+    interrupted = InterruptedTask(answers=(True, None), payload={"question": [1, "two"]})
+
+    async def save_and_read() -> SavedCheckpoint | None:
+        await checkpointer.put_checkpoint(checkpoint)
+        await checkpointer.put_task_state("thread", address, interrupted)
+        await checkpointer.put_task_state("thread", address.model_copy(update={"index": 0}), completed)
+        return await checkpointer.read_checkpoint("thread", checkpoint.id)
+
+    actual = asyncio.run(save_and_read())
+
+    expected = SavedCheckpoint(checkpoint=checkpoint, task_states={0: completed, 1: interrupted})
+    assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+def test_checkpoints_are_listed_newest_first_for_one_caller_of_one_thread() -> None:
+    checkpointer = InMemoryCheckpointer()
+    root = [build_checkpoint("thread") for _ in range(3)]
+    caller = TaskAddress(checkpoint_id=root[0].id, index=0)
+    child = [build_checkpoint("thread", caller) for _ in range(2)]
+    other = build_checkpoint("other")
+
+    async def save_and_list() -> tuple[list[UUID], list[UUID]]:
+        for checkpoint in [root[0], *child[:1], root[1], *child[1:], other, root[2]]:
+            await checkpointer.put_checkpoint(checkpoint)
+        return (
+            await collect(checkpointer.list_checkpoints("thread", None)),
+            await collect(checkpointer.list_checkpoints("thread", caller)),
+        )
+
+    actual = asyncio.run(save_and_list())
+
+    expected = ([item.id for item in reversed(root)], [item.id for item in reversed(child)])
+    assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+def test_task_state_of_an_unknown_checkpoint_is_rejected() -> None:
+    checkpointer = InMemoryCheckpointer()
+    state = InterruptedTask(answers=(), payload=None)
+
+    with pytest.raises(LookupError):
+        asyncio.run(checkpointer.put_task_state("thread", TaskAddress(checkpoint_id=uuid4(), index=0), state))
+
+
+def test_delete_thread_removes_only_the_checkpoints_of_that_thread() -> None:
+    checkpointer = InMemoryCheckpointer()
+    kept = build_checkpoint("kept")
+    removed = build_checkpoint("removed")
+
+    async def save_and_delete() -> tuple[SavedCheckpoint | None, SavedCheckpoint | None]:
+        await checkpointer.put_checkpoint(kept)
+        await checkpointer.put_checkpoint(removed)
+        await checkpointer.delete_thread("removed")
+        await checkpointer.delete_thread("missing")
+        return (
+            await checkpointer.read_checkpoint("kept", kept.id),
+            await checkpointer.read_checkpoint("removed", removed.id),
+        )
+
+    kept_saved, removed_saved = asyncio.run(save_and_delete())
+
+    assert kept_saved is not None, "Expected the other thread to keep its checkpoint."
+    assert removed_saved is None, "Expected the deleted thread to have no checkpoint."
