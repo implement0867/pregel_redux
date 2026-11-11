@@ -15,12 +15,12 @@ from pregel_redux import (
     CompiledGraph,
     Depends,
     Endpoint,
-    PendingSend,
     Reducer,
     Scope,
     Send,
     StateGraph,
 )
+from pregel_redux.checkpoints import PendingSend
 from tests.conftest import Journal, join_lists
 
 
