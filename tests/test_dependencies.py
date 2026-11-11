@@ -2,7 +2,6 @@ import asyncio
 import threading
 from collections.abc import AsyncIterator, Callable, Iterator
 from contextlib import nullcontext as does_not_raise
-from operator import add
 from typing import Annotated, TypedDict
 
 import pytest
@@ -10,11 +9,11 @@ import pytest
 from pregel_redux import Depends, Endpoint, Reducer, Scope, StateDep, StateGraph
 from pregel_redux.dependencies import read_dependency_parameters, read_state
 from pregel_redux.graph import Node
-from tests.conftest import Journal
+from tests.conftest import Journal, join_lists
 
 
 class State(TypedDict, total=False):
-    seen: Annotated[list[int], Reducer(add)]
+    seen: Annotated[list[int], Reducer(join_lists, initial_factory=list)]
 
 
 def build_one_node_graph(node: Node[State]) -> StateGraph[State, State, State]:
@@ -195,6 +194,12 @@ def test_run_scoped_provider_opens_one_time_and_closes_when_the_run_ends(journal
 
 
 def test_run_scoped_provider_of_a_node_that_never_runs_is_not_opened(journal: Journal) -> None:
+    """
+    Arrange: a graph with a node that has a run-scoped provider and that no edge reaches.
+    Act: run the graph.
+    Assert: the output holds only the initial value, and the provider was not opened.
+    """
+
     def open_client() -> int:
         return journal.open_resource("client")
 
@@ -208,7 +213,7 @@ def test_run_scoped_provider_of_a_node_that_never_runs_is_not_opened(journal: Jo
 
     actual = asyncio.run(builder.compile().ainvoke({}))
 
-    assert actual == {}, f"Expected no writes, got {actual}."
+    assert actual == {"seen": []}, f"Expected only the initial value, got {actual}."
     assert journal.events == [], f"Expected no opened provider, got {journal.events}."
 
 
@@ -326,12 +331,18 @@ def test_function_with_too_few_parameters_for_the_state_is_rejected(state_parame
 def test_node_scoped_cleanup_runs_after_the_writes_of_the_step_are_applied(
     journal: Journal, cleanup_error: Exception | None
 ) -> None:
+    """
+    Arrange: a node with a node-scoped generator provider and a reducer that records its calls.
+    Act: run the graph.
+    Assert: the reducer call for the write of the node is before the cleanup of the provider.
+    """
+
     def combine_values(current: list[int], update: list[int]) -> list[int]:
         journal.events.append("reduce")
         return current + update
 
     class ReducedState(TypedDict, total=False):
-        seen: Annotated[list[int], Reducer(combine_values)]
+        seen: Annotated[list[int], Reducer(combine_values, initial_factory=list)]
 
     def open_connection() -> Iterator[int]:
         yield 1
@@ -349,7 +360,7 @@ def test_node_scoped_cleanup_runs_after_the_writes_of_the_step_are_applied(
     expectation = does_not_raise() if cleanup_error is None else pytest.raises(type(cleanup_error))
 
     with expectation:
-        asyncio.run(builder.compile().ainvoke({"seen": [0]}))
+        asyncio.run(builder.compile().ainvoke({}))
 
     assert journal.events == ["reduce", "cleanup"], (
         f"Expected the reducer call before the cleanup, got {journal.events}. "

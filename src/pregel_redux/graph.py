@@ -8,7 +8,14 @@ from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Concatenate, Literal, Never, Protocol, assert_never, overload, runtime_checkable
 
-from pregel_redux.channels import Channel, apply_writes, build_channels, extract_writes, merge_channels
+from pregel_redux.channels import (
+    Channel,
+    apply_writes,
+    build_channels,
+    extract_writes,
+    merge_channels,
+    reject_unknown_channels,
+)
 from pregel_redux.commands import Endpoint, Outcome, Send, read_declared_targets, read_outcome
 from pregel_redux.dependencies import CallPlan, Depends, execute_plan, open_providers, plan_call
 
@@ -76,7 +83,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
 
     async def ainvoke(self, input: InputT, *, step_limit: int = 25) -> OutputT:
         async with AsyncExitStack() as run_exits:
-            return await self.run_steps(input, Run({}, run_exits, asyncio.Lock(), step_limit))
+            return await self.run_steps({}, extract_writes(input), Run({}, run_exits, asyncio.Lock(), step_limit))
 
     def find_async_nodes(self) -> list[str]:
         names: list[str] = []
@@ -103,8 +110,14 @@ class CompiledGraph[StateT, InputT, OutputT]:
             run = executor.submit(copy_context().run, asyncio.run, self.ainvoke(input, step_limit=step_limit))
             return run.result()
 
-    async def run_steps(self, input: object, run: Run) -> OutputT:
-        values = apply_writes(self.channels, {}, [extract_writes(input)])
+    async def run_steps(self, given: Mapping[str, object], update: Mapping[str, object], run: Run) -> OutputT:
+        reject_unknown_channels(self.channels, given)
+        initial = {
+            name: channel.reducer.make_initial()
+            for name, channel in self.channels.items()
+            if channel.reducer is not None
+        }
+        values = apply_writes(self.channels, {**initial, **given}, [update])
         names = self.entry_nodes
         sends: tuple[Send, ...] = ()
         steps = 0
@@ -138,7 +151,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
             case CallPlan() as plan:
                 return await self.call_function(plan, call, run, step_exits)
             case CompiledGraph() as child:
-                result = await child.run_steps(call.node_input, run)
+                result = await child.run_steps(extract_writes(call.node_input), {}, run)
                 return read_outcome(result, call.node.targets, self.nodes.keys())
             case _:
                 assert_never(call.node.action)

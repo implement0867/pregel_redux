@@ -1,9 +1,9 @@
 import dataclasses
 from collections.abc import Callable, Iterable, Mapping
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import (
     Annotated,
-    Never,
     NotRequired,
     Protocol,
     Required,
@@ -12,22 +12,54 @@ from typing import (
     get_origin,
     get_type_hints,
     is_typeddict,
+    overload,
     runtime_checkable,
 )
 
 from pydantic import BaseModel
 
 
+class Missing:
+    pass
+
+
+MISSING = Missing()
+
+
+@dataclass(init=False)
+class Reducer[ValueT, UpdateT]:
+    function: Callable[..., object]
+    initial: object
+    initial_factory: Callable[[], object] | None
+
+    @overload
+    def __init__(self, function: Callable[[ValueT, UpdateT], ValueT], *, initial: ValueT) -> None: ...
+    @overload
+    def __init__(
+        self, function: Callable[[ValueT, UpdateT], ValueT], *, initial_factory: Callable[[], ValueT]
+    ) -> None: ...
+    def __init__(
+        self,
+        function: Callable[[ValueT, UpdateT], ValueT],
+        *,
+        initial: ValueT | Missing = MISSING,
+        initial_factory: Callable[[], ValueT] | None = None,
+    ) -> None:
+        if (initial is MISSING) == (initial_factory is None):
+            raise TypeError("a Reducer needs exactly one of initial and initial_factory")
+        self.function = function
+        self.initial = initial
+        self.initial_factory = initial_factory
+
+    def make_initial(self) -> object:
+        return deepcopy(self.initial) if self.initial_factory is None else self.initial_factory()
+
+
 @dataclass(frozen=True)
 class Channel:
     name: str
     value_type: object
-    reducer: Callable[..., object] | None
-
-
-@dataclass(frozen=True)
-class Reducer[ValueT, UpdateT]:
-    function: Callable[[ValueT, UpdateT], ValueT]
+    reducer: Reducer[object, object] | None
 
 
 @runtime_checkable
@@ -48,13 +80,13 @@ def substitute_type_arguments(hint: object, arguments: Mapping[object, object]) 
             return hint
 
 
-def find_reducer(name: str, metadata: tuple[object, ...]) -> Callable[..., object] | None:
-    markers: list[Reducer[Never, Never]] = [item for item in metadata if isinstance(item, Reducer)]
+def find_reducer(name: str, metadata: tuple[object, ...]) -> Reducer[object, object] | None:
+    markers: list[Reducer[object, object]] = [item for item in metadata if isinstance(item, Reducer)]
     match markers:
         case []:
             return None
         case [marker]:
-            return marker.function
+            return marker
         case _:
             raise TypeError(f"field {name!r} has more than one Reducer annotation")
 
@@ -115,9 +147,19 @@ def extract_writes(update: object) -> dict[str, object]:
         case BaseModel():
             return {name: getattr(update, name) for name in update.model_fields_set}
         case _ if dataclasses.is_dataclass(update) and not isinstance(update, type):
-            return {field.name: getattr(update, field.name) for field in dataclasses.fields(update)}
+            defaults = {
+                field.name: field.default if field.default_factory is dataclasses.MISSING else field.default_factory()
+                for field in dataclasses.fields(update)
+            }
+            return {name: value for name, default in defaults.items() if (value := getattr(update, name)) != default}
         case _:
             raise TypeError(f"{update!r} is not a mapping, a dataclass instance, a Pydantic model or None")
+
+
+def reject_unknown_channels(channels: Mapping[str, Channel], names: Iterable[str]) -> None:
+    unknown = sorted(set(names) - channels.keys())
+    if unknown:
+        raise ValueError(f"{unknown!r} are not channels of this graph")
 
 
 def apply_writes(
@@ -126,16 +168,13 @@ def apply_writes(
     result = dict(values)
     written: set[str] = set()
     for update in updates:
+        reject_unknown_channels(channels, update)
         for name, value in update.items():
-            if name not in channels:
-                raise ValueError(f"{name!r} is not a channel of this graph")
             reducer = channels[name].reducer
-            if reducer is None:
-                if name in written:
-                    raise ValueError(f"channel {name!r} received more than one value in one step and it has no reducer")
-                result[name] = value
-            elif name in result:
-                result[name] = reducer(result[name], value)
+            if reducer is not None:
+                result[name] = reducer.function(result[name], value)
+            elif name in written:
+                raise ValueError(f"channel {name!r} received more than one value in one step and it has no reducer")
             else:
                 result[name] = value
             written.add(name)

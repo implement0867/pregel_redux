@@ -1,7 +1,6 @@
 import asyncio
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
-from operator import add
 from typing import Annotated, Literal, TypedDict
 
 import pytest
@@ -9,15 +8,15 @@ from pydantic import BaseModel, ValidationError
 
 from pregel_redux import Command, Depends, Endpoint, Reducer, Send, StateDep, StateGraph
 from pregel_redux.commands import resolve_goto
-from tests.conftest import Journal
+from tests.conftest import Journal, join_lists
 
 type Goto = str | Literal[Endpoint.end] | Send | list[str | Literal[Endpoint.end] | Send]
 
 
 class State(TypedDict, total=False):
     topics: list[str]
-    jokes: Annotated[list[str], Reducer(add)]
-    visits: Annotated[list[str], Reducer(add)]
+    jokes: Annotated[list[str], Reducer(join_lists, initial_factory=list)]
+    visits: Annotated[list[str], Reducer(join_lists, initial_factory=list)]
 
 
 class TopicsInput(TypedDict, total=False):

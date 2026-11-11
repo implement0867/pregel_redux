@@ -1,30 +1,49 @@
 import asyncio
 from collections.abc import Callable, Mapping
+from dataclasses import dataclass, field
 from operator import add
 from typing import Annotated, Literal, TypedDict
 
 import pytest
+from pydantic import BaseModel
 
 from pregel_redux import Command, Endpoint, Reducer, StateGraph
+from tests.conftest import append_item, join_lists
 
 
 class State[T](TypedDict, total=False):
-    items: Annotated[list[T], Reducer(add)]
+    items: Annotated[list[T], Reducer(join_lists, initial_factory=list)]
     latest: T
     failures: int
 
 
 class Input[T](TypedDict):
-    items: Annotated[list[T], Reducer(add)]
+    items: Annotated[list[T], Reducer(join_lists, initial_factory=list)]
 
 
 class Output[T](TypedDict):
-    items: Annotated[list[T], Reducer(add)]
+    items: Annotated[list[T], Reducer(join_lists, initial_factory=list)]
     latest: T
 
 
 class BareCallableState(TypedDict, total=False):
     items: Annotated[list[int], add]
+
+
+class AppendDict(TypedDict, total=False):
+    items: Annotated[list[str], Reducer(append_item, initial_factory=list)]
+
+
+@dataclass
+class AppendDataclass:
+    items: Annotated[list[str], Reducer(append_item, initial_factory=list)] = field(default_factory=list)
+
+
+class AppendModel(BaseModel):
+    items: Annotated[list[str], Reducer(append_item, initial_factory=list)] = []
+
+
+type AppendSchema = AppendDict | AppendDataclass | AppendModel
 
 
 def build_sequential_graph[T](produce: Callable[[], T]) -> StateGraph[State[T], Input[T], Output[T]]:
@@ -147,6 +166,60 @@ def test_parallel_writes_to_a_channel_without_reducer_are_rejected(
 
     with pytest.raises(ValueError):
         asyncio.run(builder.compile().ainvoke({}))
+
+
+@pytest.mark.parametrize(
+    ("schema", "input_state", "expected"),
+    [
+        (AppendDict, {}, ["node"]),
+        (AppendDict, {"items": "input"}, ["input", "node"]),
+        (AppendDataclass, AppendDataclass(), ["node"]),
+        (AppendDataclass, {"items": "input"}, ["input", "node"]),
+        (AppendModel, AppendModel(), ["node"]),
+        (AppendModel, {"items": "input"}, ["input", "node"]),
+    ],
+    ids=[
+        "typed-dict-without-input",
+        "typed-dict-with-input",
+        "dataclass-instance-with-defaults",
+        "dataclass-with-input",
+        "model-instance-with-defaults",
+        "model-with-input",
+    ],
+)
+def test_input_and_first_node_write_go_through_the_reducer(
+    schema: type[AppendSchema], input_state: AppendSchema, expected: list[str]
+) -> None:
+    """
+    Arrange: a graph of each schema kind with a reducer whose update type is not its channel type.
+    Act: run the graph with an input that sets the reducer field or leaves it out.
+    Assert: the reducer combined the input and the node write with the initial value.
+    """
+    builder = StateGraph(schema)
+    builder.add_node("write", lambda state: {"items": "node"})
+    builder.add_edge(Endpoint.start, "write")
+
+    actual = asyncio.run(builder.compile().ainvoke(input_state))
+
+    assert actual == schema(items=expected), f"Expected the items {expected}, got {actual}."
+
+
+@pytest.mark.parametrize("schema", [AppendDict, AppendDataclass, AppendModel], ids=["typed-dict", "dataclass", "model"])
+def test_node_reads_the_initial_value_of_a_reducer_channel_before_any_write(schema: type[AppendSchema]) -> None:
+    """
+    Arrange: a graph of each schema kind with a reducer field and a node that writes nothing.
+    Act: run the graph with an input that leaves the reducer field out.
+    Assert: the node read the initial value, and the output contains the initial value.
+    """
+    received: list[AppendSchema] = []
+    builder = StateGraph(schema)
+    builder.add_node("receive", received.append)
+    builder.add_edge(Endpoint.start, "receive")
+
+    output = asyncio.run(builder.compile().ainvoke({}))
+
+    actual = [*received, output]
+    assert actual == [schema(items=[])] * 2, f"Expected the initial value in the node and in the output, got {actual}."
 
 
 @pytest.mark.parametrize(

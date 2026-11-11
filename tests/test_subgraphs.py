@@ -3,19 +3,18 @@ from collections.abc import AsyncGenerator, Callable
 from contextlib import AbstractContextManager
 from contextlib import nullcontext as does_not_raise
 from itertools import pairwise
-from operator import add
 from typing import Annotated, TypedDict
 
 import pytest
 
 from pregel_redux import Command, Depends, Endpoint, Reducer, Scope, Send, StateGraph
-from tests.conftest import Journal
+from tests.conftest import Journal, append_item, join_lists
 
 
 class State(TypedDict, total=False):
     topics: list[str]
-    jokes: Annotated[list[str], Reducer(add)]
-    visits: Annotated[list[str], Reducer(add)]
+    jokes: Annotated[list[str], Reducer(join_lists, initial_factory=list)]
+    visits: Annotated[list[str], Reducer(join_lists, initial_factory=list)]
 
 
 class TopicsInput(TypedDict, total=False):
@@ -23,7 +22,11 @@ class TopicsInput(TypedDict, total=False):
 
 
 class JokesOutput(TypedDict, total=False):
-    jokes: Annotated[list[str], Reducer(add)]
+    jokes: Annotated[list[str], Reducer(join_lists, initial_factory=list)]
+
+
+class AppendState(TypedDict, total=False):
+    items: Annotated[list[str], Reducer(append_item, initial_factory=list)]
 
 
 def build_joke_writer(joke: str) -> Callable[[State], JokesOutput]:
@@ -86,6 +89,32 @@ def test_child_graph_runs_as_a_node_of_its_parent(names: list[str], depth: int) 
 
 @pytest.mark.parametrize(
     ("input_state", "expected"),
+    [({}, ["node"]), ({"items": "input"}, ["input", "node"])],
+    ids=["without-input", "with-input"],
+)
+def test_child_graph_starts_with_the_channel_values_of_its_parent(input_state: object, expected: list[str]) -> None:
+    """
+    Arrange: a parent and a child graph with a reducer whose update type is not its channel type.
+    Act: run the parent graph, which writes to the channel and then calls the child.
+    Assert: the child read the value of the parent, and the reducer of the child did not combine it again.
+    """
+    received: list[AppendState] = []
+    child = StateGraph(AppendState, output_schema=TopicsInput)
+    child.add_node("receive", received.append)
+    child.add_edge(Endpoint.start, "receive")
+    builder = StateGraph[object, object, object](AppendState)
+    builder.add_node("write", lambda state: {"items": "node"})
+    builder.add_node("child", child)
+    builder.add_edge(Endpoint.start, "write")
+    builder.add_edge("write", "child")
+
+    asyncio.run(builder.compile().ainvoke(input_state))
+
+    assert received == [{"items": expected}], f"Expected the child to read {expected}, got {received}."
+
+
+@pytest.mark.parametrize(
+    ("input_state", "expected"),
     [
         ({"topics": ["cats"], "visits": ["input"]}, {"topics": ["cats"]}),
         ({"visits": ["input"]}, {}),
@@ -97,7 +126,7 @@ def test_child_graph_receives_the_fields_of_its_input_type(input_state: State, e
     """
     Arrange: a child graph with an input type that has one field of the parent state.
     Act: run the parent graph with an input state.
-    Assert: the child received only the fields of its input type.
+    Assert: the child received only the fields of its input type and the initial values of its own reducers.
     """
     received: list[State] = []
     child = StateGraph(State, input_schema=TopicsInput)
@@ -109,7 +138,7 @@ def test_child_graph_receives_the_fields_of_its_input_type(input_state: State, e
 
     asyncio.run(builder.compile().ainvoke(input_state))
 
-    assert received == [expected], f"Expected the child to receive {expected}, got {received}."
+    assert received == [{"jokes": [], "visits": [], **expected}], f"Expected {expected}, got {received}."
 
 
 @pytest.mark.parametrize("visits", [[], ["input"], ["input", "other"]], ids=repr)
@@ -184,6 +213,29 @@ def test_each_send_starts_the_child_graph_with_its_payload(topics: list[str], ex
     actual = asyncio.run(builder.compile().ainvoke({"topics": topics}))
 
     assert actual.get("jokes", []) == expected, f"Expected the jokes {expected}, got {actual}."
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"missing": 1}, {"topics": ["cats"], "missing": 1}],
+    ids=["unknown-field", "known-and-unknown-field"],
+)
+def test_send_with_a_field_that_is_not_a_channel_of_the_child_graph_is_rejected(payload: dict[str, object]) -> None:
+    """
+    Arrange: a parent node that sends a payload with a field that the child graph does not have.
+    Act: run the parent graph.
+    Assert: a ValueError is raised.
+    """
+    child = StateGraph(State, input_schema=TopicsInput, output_schema=JokesOutput)
+    child.add_node("write", lambda state: None)
+    child.add_edge(Endpoint.start, "write")
+    builder = StateGraph(State)
+    builder.add_node("plan", lambda state: Command[str](goto=[Send("child", payload)]))
+    builder.add_node("child", child)
+    builder.add_edge(Endpoint.start, "plan")
+
+    with pytest.raises(ValueError):
+        asyncio.run(builder.compile().ainvoke({}))
 
 
 @pytest.mark.parametrize(
