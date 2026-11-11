@@ -22,6 +22,7 @@
 - Follow the Functional Core, Imperative Shell pattern: pure logic at the core, side effects pushed to the boundary.
 - Inject dependencies through the constructor, typing strategies as a `Protocol` and passing configuration as the concrete Pydantic settings class.
 - I'm using `uv`, not `pip`. Run tools with `uv run`.
+- Adding a dependency is forbidden without explicit user approval. This includes declaring a package that another dependency already installs.
 - Target Python 3.12+ and use its syntax: `X | None`, built-in generics, PEP 695 type parameters.
 - No assert statements in production code.
 - Raise built-in exception types unless a custom exception handler needs its own type. No bare or broad `except`, and don't swallow errors silently.
