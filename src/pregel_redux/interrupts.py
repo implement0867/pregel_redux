@@ -2,7 +2,6 @@ from contextvars import ContextVar
 from dataclasses import dataclass
 
 from pydantic import JsonValue, TypeAdapter
-from pydantic_core import to_json
 from typing_extensions import TypeForm
 
 from pregel_redux.checkpoints import Record, TaskAddress
@@ -32,7 +31,7 @@ class NodeInterrupt(BaseException):
 
 @dataclass
 class TaskInterrupts:
-    answers: tuple[JsonValue, ...]
+    answers: tuple[str, ...]
     asked: int = 0
 
 
@@ -48,4 +47,4 @@ def interrupt[AnswerT](payload: JsonValue, answer_type: TypeForm[AnswerT]) -> An
     task.asked += 1
     if index >= len(task.answers):
         raise NodeInterrupt(payload)
-    return TypeAdapter[AnswerT](answer_type).validate_json(to_json(task.answers[index]))
+    return TypeAdapter[AnswerT](answer_type).validate_json(task.answers[index])

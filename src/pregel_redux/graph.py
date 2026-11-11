@@ -10,7 +10,7 @@ from functools import cached_property
 from typing import Any, Concatenate, Literal, Never, Protocol, assert_never, overload, runtime_checkable
 from uuid import UUID, uuid4
 
-from pydantic import JsonValue, TypeAdapter
+from pydantic import TypeAdapter
 
 from pregel_redux.channels import (
     Channel,
@@ -130,7 +130,7 @@ class Run:
     lock: asyncio.Lock
     step_limit: int
     journal: Journal
-    answers: Mapping[TaskAddress, tuple[JsonValue, ...]]
+    answers: Mapping[TaskAddress, tuple[str, ...]]
 
 
 @dataclass(frozen=True)
@@ -256,7 +256,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         *,
         step_limit: int,
         journal: Journal,
-        answers: Mapping[TaskAddress, tuple[JsonValue, ...]],
+        answers: Mapping[TaskAddress, tuple[str, ...]],
     ) -> RunResult[OutputT]:
         async with AsyncExitStack() as run_exits:
             return await self.run_steps(position, Run({}, run_exits, asyncio.Lock(), step_limit, journal, answers))

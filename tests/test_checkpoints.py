@@ -9,7 +9,6 @@ from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
-from pydantic_core import to_json
 from typing_extensions import TypeForm
 
 from pregel_redux import CheckpointSource, InMemoryCheckpointer
@@ -83,8 +82,8 @@ def build_checkpoint(thread_id: str, caller: TaskAddress | None = None) -> Check
         created_at=datetime.now(UTC),
         step=0,
         source=CheckpointSource.input,
-        values={"count": float("inf"), "items": ["a", {"b": None}]},
-        tasks=(EdgeTask(node="first"), SendTask(node="second", node_input={"topic": "cats"})),
+        values={"count": "1.5", "items": '["a", {"b": null}]'},
+        tasks=(EdgeTask(node="first"), SendTask(node="second", node_input='{"topic": "cats"}')),
     )
 
 
@@ -110,7 +109,6 @@ def build_counter() -> Counter:
         (bytes, b"data"),
         (UUID, UUID(int=7)),
         (Color, Color.blue),
-        (float, float("inf")),
         (Point, Point(x=1, y=2)),
         (Alias, Alias(title="cats")),
         (Counter, Counter(name="clicks")),
@@ -126,7 +124,7 @@ def test_value_of_its_declared_type_is_restored_equal(value_type: TypeForm[objec
     adapter = TypeAdapter[object](value_type)
 
     record = SendTask(node="node", node_input=dump_value(adapter, value, "the value"))
-    restored = adapter.validate_json(to_json(SendTask.model_validate_json(record.model_dump_json()).node_input))
+    restored = adapter.validate_json(SendTask.model_validate_json(record.model_dump_json()).node_input)
 
     assert restored == value, f"Expected {value!r} after a round trip through JSON, got {restored!r}."
 
@@ -138,6 +136,7 @@ def test_value_of_its_declared_type_is_restored_equal(value_type: TypeForm[objec
         (list[Shape], [Circle(kind="circle", radius=1)]),
         (Counter, build_counter()),
         (list[int] | tuple[int, ...], (1, 2)),
+        (float, float("inf")),
         (float, float("nan")),
         (object, Point(x=1, y=2)),
         (object, object()),
@@ -147,6 +146,7 @@ def test_value_of_its_declared_type_is_restored_equal(value_type: TypeForm[objec
         "subclass-in-a-list",
         "field-without-init",
         "later-union-member",
+        "infinity",
         "nan",
         "model-as-object",
         "plain-object",
@@ -163,8 +163,8 @@ def test_saved_checkpoint_is_read_back_equal() -> None:
     checkpointer = InMemoryCheckpointer()
     checkpoint = build_checkpoint("thread")
     address = TaskAddress(checkpoint_id=checkpoint.id, index=1)
-    completed = CompletedTask(writes={"items": [1.5]}, targets=("third",), sends=())
-    interrupted = InterruptedTask(answers=(True, None), payload={"question": [1, "two"]})
+    completed = CompletedTask(writes={"items": "[1.5]"}, targets=("third",), sends=())
+    interrupted = InterruptedTask(answers=("true", "null"), payload={"question": [1, "two", float("inf")]})
 
     async def save_and_read() -> SavedCheckpoint | None:
         await checkpointer.put_checkpoint(checkpoint)

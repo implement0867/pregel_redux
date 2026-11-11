@@ -5,7 +5,7 @@ from typing import Annotated, Literal, Protocol
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, TypeAdapter, ValidationError
-from pydantic_core import PydanticSerializationError, to_json
+from pydantic_core import PydanticSerializationError
 
 
 class Record(BaseModel):
@@ -42,7 +42,7 @@ class EdgeTask(Record):
 class SendTask(Record):
     kind: Literal[PlannedTaskKind.send] = PlannedTaskKind.send
     node: str
-    node_input: JsonValue
+    node_input: str
 
 
 type PlannedTask = Annotated[EdgeTask | SendTask, Field(discriminator="kind")]
@@ -56,20 +56,20 @@ class Checkpoint(Record):
     created_at: AwareDatetime
     step: int
     source: CheckpointSource
-    values: dict[str, JsonValue]
+    values: dict[str, str]
     tasks: tuple[PlannedTask, ...]
 
 
 class CompletedTask(Record):
     kind: Literal[TaskStateKind.completed] = TaskStateKind.completed
-    writes: dict[str, JsonValue]
+    writes: dict[str, str]
     targets: tuple[str, ...]
     sends: tuple[SendTask, ...]
 
 
 class InterruptedTask(Record):
     kind: Literal[TaskStateKind.interrupted] = TaskStateKind.interrupted
-    answers: tuple[JsonValue, ...]
+    answers: tuple[str, ...]
     payload: JsonValue
 
 
@@ -118,10 +118,10 @@ class InMemoryCheckpointer:
         self.threads.pop(thread_id, None)
 
 
-def dump_value(adapter: TypeAdapter[object], value: object, owner: str) -> JsonValue:
+def dump_value(adapter: TypeAdapter[object], value: object, owner: str) -> str:
     try:
-        data: JsonValue = adapter.dump_python(value, mode="json", by_alias=True, warnings="error")
-        restored = adapter.validate_json(to_json(data))
+        data = adapter.dump_json(value, by_alias=True, warnings="error").decode()
+        restored = adapter.validate_json(data)
     except (PydanticSerializationError, ValidationError) as error:
         raise ValueError(f"{owner} holds {value!r}, which a checkpoint cannot store") from error
     if restored != value:
