@@ -175,7 +175,7 @@ def extract_fields(payload: object) -> dict[str, object]:
         case Mapping():
             return {**payload}
         case BaseModel():
-            return {name: getattr(payload, name) for name in type(payload).model_fields}
+            return dict(payload)
         case _ if dataclasses.is_dataclass(payload) and not isinstance(payload, type):
             return {field.name: getattr(payload, field.name) for field in dataclasses.fields(payload)}
         case _:
