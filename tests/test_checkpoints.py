@@ -503,3 +503,51 @@ def test_resume_rejects_a_graph_that_has_an_async_node() -> None:
 
     actual = asyncio.run(graph.aresume(checkpoint))
     assert actual.get("jokes") == ["a joke"], f"Expected the async resume to run the node, got {actual}."
+
+
+@dataclass
+class DataclassRequest:
+    topic: str
+
+
+@dataclass
+class DetailedRequest(DataclassRequest):
+    detail: str = "none"
+
+
+class ModelRequest(BaseModel):
+    topic: str
+
+
+@pytest.mark.parametrize(
+    ("input_schema", "payload", "expected"),
+    [
+        (DataclassRequest, DataclassRequest("cats"), DataclassRequest("cats")),
+        (ModelRequest, ModelRequest(topic="cats"), ModelRequest(topic="cats")),
+        (DataclassRequest, DetailedRequest("cats", "long"), DataclassRequest("cats")),
+    ],
+    ids=["dataclass", "model", "subclass"],
+)
+def test_checkpoint_holds_the_declared_fields_of_a_sent_instance(
+    input_schema: type[object], payload: object, expected: object
+) -> None:
+    """
+    Arrange: a node that sends an instance of a dataclass or of a model to a node with that input type.
+    Act: run the graph with a saver, then resume from the checkpoint that has the pending send.
+    Assert: the checkpoint has the fields of the input type, and the resumed node receives an equal instance of it.
+    """
+    received: list[object] = []
+    saved: list[Checkpoint] = []
+    builder = StateGraph(State)
+    builder.add_node("plan", lambda state: Command[str](goto=Send("receive", payload)))
+    builder.add_node("receive", received.append, input_schema=input_schema)
+    builder.add_edge(Endpoint.start, "plan")
+    graph = builder.compile()
+    graph.invoke({}, save_checkpoint=saved.append)
+    received.clear()
+
+    graph.resume(Checkpoint.model_validate_json(saved[1].model_dump_json()))
+
+    expected_sends = (PendingSend(node="receive", values={"topic": "cats"}),)
+    assert saved[1].sends == expected_sends, f"Expected the pending sends {expected_sends}, got {saved[1].sends}."
+    assert received == [expected], f"Expected the resumed node to receive {expected!r}, got {received}."

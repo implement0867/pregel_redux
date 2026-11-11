@@ -15,6 +15,7 @@ from pregel_redux.channels import (
     Reducer,
     apply_writes,
     build_channels,
+    extract_fields,
     extract_writes,
     merge_channels,
     reject_unknown_channels,
@@ -497,3 +498,14 @@ def test_field_of_a_type_that_pydantic_cannot_validate_is_rejected(schema: objec
     """
     with pytest.raises(PydanticSchemaGenerationError):
         build_channels(schema)
+
+
+@pytest.mark.parametrize("payload", ["cats", 3, None, ["cats"], BaseModel], ids=repr)
+def test_extract_fields_rejects_a_payload_without_fields(payload: object) -> None:
+    """
+    Arrange: a payload that is not a mapping, a dataclass instance or a Pydantic model.
+    Act: extract its fields.
+    Assert: a TypeError is raised.
+    """
+    with pytest.raises(TypeError):
+        extract_fields(payload)

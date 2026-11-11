@@ -4,7 +4,7 @@ from dataclasses import dataclass, field
 from typing import Annotated, Literal, TypedDict
 
 import pytest
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 
 from pregel_redux import Command, Depends, Endpoint, Reducer, Send, StateDep, StateGraph
 from pregel_redux.commands import resolve_goto
@@ -33,6 +33,48 @@ class DataclassRequest:
 
 
 class ModelRequest(BaseModel):
+    topic: str
+
+
+@dataclass
+class DetailedRequest(DataclassRequest):
+    detail: str = "none"
+
+
+@dataclass
+class MeasuredRequest:
+    topic: str
+    length: int = field(init=False)
+
+    def __post_init__(self) -> None:
+        self.length = len(self.topic)
+
+
+@dataclass
+class CountedRequest:
+    topic: str
+    builds: list[str] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.builds.append("built")
+
+
+class AliasRequest(BaseModel):
+    topic: str = Field(alias="subject")
+
+
+class DoublingRequest(BaseModel):
+    topic: str
+
+    @field_validator("topic")
+    @classmethod
+    def double_topic(cls, value: str) -> str:
+        return value * 2
+
+
+class OpenRequest(BaseModel):
+    model_config = ConfigDict(extra="allow")
+
     topic: str
 
 
@@ -214,6 +256,47 @@ def test_send_gives_the_payload_as_the_input_type_of_the_node(
     asyncio.run(builder.compile().ainvoke({}))
 
     assert received == [expected], f"Expected the node to receive {expected!r}, got {received}."
+
+
+@pytest.mark.parametrize(
+    ("input_schema", "payload"),
+    [
+        (DataclassRequest, DataclassRequest("cats")),
+        (ModelRequest, ModelRequest(topic="cats")),
+        (DataclassRequest, DetailedRequest("cats", "long")),
+        (MeasuredRequest, MeasuredRequest("cats")),
+        (CountedRequest, CountedRequest("cats")),
+        (AliasRequest, AliasRequest(subject="cats")),
+        (DoublingRequest, DoublingRequest(topic="cats")),
+        (OpenRequest, OpenRequest.model_validate({"topic": "cats", "detail": "long"})),
+    ],
+    ids=[
+        "dataclass",
+        "model",
+        "subclass",
+        "field-without-init",
+        "post-init",
+        "alias",
+        "validator",
+        "extra-field",
+    ],
+)
+def test_send_of_an_instance_gives_the_node_that_instance(input_schema: type[object], payload: object) -> None:
+    """
+    Arrange: a node that sends an instance of a dataclass or of a model to a node with that input type.
+    Act: run the graph.
+    Assert: the node receives the same object, so no field is lost and no validator or initializer runs again.
+    """
+    received: list[object] = []
+    builder = StateGraph(State)
+    builder.add_node("plan", lambda state: Command[str](goto=Send("receive", payload)))
+    builder.add_node("receive", received.append, input_schema=input_schema)
+    builder.add_edge(Endpoint.start, "plan")
+
+    asyncio.run(builder.compile().ainvoke({}))
+
+    assert len(received) == 1, f"Expected one node call, got {received}."
+    assert received[0] is payload, f"Expected the node to receive the object {payload!r}, got {received[0]!r}."
 
 
 def test_send_of_an_instance_keeps_the_fields_that_have_a_default() -> None:

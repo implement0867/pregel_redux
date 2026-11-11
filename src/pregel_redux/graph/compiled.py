@@ -1,4 +1,5 @@
 import asyncio
+import dataclasses
 import inspect
 from collections import ChainMap
 from collections.abc import Callable, Coroutine, Mapping, Sequence
@@ -7,6 +8,8 @@ from contextlib import AsyncExitStack
 from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Never, assert_never
+
+from pydantic import BaseModel
 
 from pregel_redux.channels import Channel, apply_writes, extract_fields, extract_writes, parse_values
 from pregel_redux.checkpoints import Checkpoint, PendingSend, dump_values, load_values
@@ -33,6 +36,17 @@ class CompiledNode:
     def build_input(self, values: Mapping[str, object]) -> object:
         return self.input_schema(**{name: values[name] for name in self.input_fields if name in values})
 
+    def build_send_input(self, channels: Mapping[str, Channel], payload: object) -> object:
+        match payload:
+            case Mapping():
+                return self.input_schema(**parse_values(channels, {**payload}))
+            case BaseModel():
+                return payload
+            case _ if dataclasses.is_dataclass(payload) and not isinstance(payload, type):
+                return payload
+            case _:
+                raise TypeError(f"{payload!r} is not a mapping, a dataclass instance or a Pydantic model")
+
 
 @dataclass(frozen=True)
 class NodeCall:
@@ -43,7 +57,7 @@ class NodeCall:
 @dataclass(frozen=True)
 class ParsedSend:
     node: str
-    values: Mapping[str, object]
+    node_input: object
 
 
 @dataclass(frozen=True)
@@ -88,7 +102,10 @@ class CompiledGraph[StateT, InputT, OutputT]:
         start = Position(
             self.build_start_values(load_values(self.channels, checkpoint.values)),
             frozenset(checkpoint.nodes),
-            tuple(ParsedSend(send.node, load_values(self.channels, send.values)) for send in checkpoint.sends),
+            tuple(
+                ParsedSend(send.node, self.nodes[send.node].input_schema(**load_values(self.channels, send.values)))
+                for send in checkpoint.sends
+            ),
         )
         limit = RunSettings().step_limit if step_limit is None else step_limit
         async with AsyncExitStack() as run_exits:
@@ -153,7 +170,18 @@ class CompiledGraph[StateT, InputT, OutputT]:
             values=dump_values(self.channels, position.values),
             nodes=tuple(sorted(position.nodes)),
             sends=tuple(
-                PendingSend(node=send.node, values=dump_values(self.channels, send.values)) for send in position.sends
+                PendingSend(
+                    node=send.node,
+                    values=dump_values(
+                        self.channels,
+                        {
+                            name: value
+                            for name, value in extract_fields(send.node_input).items()
+                            if name in self.nodes[send.node].input_fields
+                        },
+                    ),
+                )
+                for send in position.sends
             ),
         )
         await call_without_blocking(save_checkpoint, checkpoint)
@@ -172,10 +200,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
                     NodeCall(self.nodes[name], self.nodes[name].build_input(position.values))
                     for name in sorted(position.nodes)
                 ),
-                *(
-                    NodeCall(self.nodes[send.node], self.nodes[send.node].input_schema(**send.values))
-                    for send in position.sends
-                ),
+                *(NodeCall(self.nodes[send.node], send.node_input) for send in position.sends),
             ]
             async with AsyncExitStack() as step_exits:
                 outcomes = await self.run_step(calls, run, step_exits)
@@ -183,7 +208,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
                     apply_writes(self.channels, position.values, [outcome.writes for outcome in outcomes]),
                     frozenset[str]().union(*(outcome.routes.targets for outcome in outcomes)),
                     tuple(
-                        ParsedSend(send.node, parse_values(self.channels, extract_fields(send.arg)))
+                        ParsedSend(send.node, self.nodes[send.node].build_send_input(self.channels, send.arg))
                         for outcome in outcomes
                         for send in outcome.routes.sends
                     ),
