@@ -1,7 +1,7 @@
 import asyncio
 import inspect
 from collections import ChainMap
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Coroutine, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
 from contextvars import copy_context
@@ -16,8 +16,16 @@ from pregel_redux.channels import (
     merge_channels,
     parse_values,
 )
+from pregel_redux.checkpoints import Checkpoint, PendingSend, dump_values
 from pregel_redux.commands import Endpoint, Outcome, read_declared_targets, read_outcome
-from pregel_redux.dependencies import CallPlan, Depends, execute_plan, open_providers, plan_call
+from pregel_redux.dependencies import (
+    CallPlan,
+    Depends,
+    call_without_blocking,
+    execute_plan,
+    open_providers,
+    plan_call,
+)
 
 type Node[InputT] = Callable[Concatenate[InputT, ...], object]
 
@@ -65,6 +73,13 @@ class ParsedSend:
 
 
 @dataclass(frozen=True)
+class Position:
+    values: Mapping[str, object]
+    nodes: frozenset[str]
+    sends: tuple[ParsedSend, ...]
+
+
+@dataclass(frozen=True)
 class Edge:
     source: str | Literal[Endpoint.start]
     target: str | Literal[Endpoint.end]
@@ -78,9 +93,32 @@ class CompiledGraph[StateT, InputT, OutputT]:
     nodes: Mapping[str, CompiledNode]
     entry_nodes: frozenset[str]
 
-    async def ainvoke(self, input: InputT, *, step_limit: int = 25) -> OutputT:
+    async def ainvoke(
+        self, input: InputT, *, step_limit: int = 25, save_checkpoint: Callable[[Checkpoint], object] | None = None
+    ) -> OutputT:
+        values = apply_writes(self.channels, self.build_start_values({}), [extract_writes(input)])
+        start = Position(values, self.entry_nodes, ())
+        await self.save_position(start, save_checkpoint)
         async with AsyncExitStack() as run_exits:
-            return await self.run_steps({}, extract_writes(input), Run({}, run_exits, asyncio.Lock(), step_limit))
+            return await self.run_steps(start, Run({}, run_exits, asyncio.Lock(), step_limit), save_checkpoint)
+
+    async def aresume(
+        self,
+        checkpoint: Checkpoint,
+        *,
+        step_limit: int = 25,
+        save_checkpoint: Callable[[Checkpoint], object] | None = None,
+    ) -> OutputT:
+        unknown = sorted({*checkpoint.nodes, *(send.node for send in checkpoint.sends)} - self.nodes.keys())
+        if unknown:
+            raise ValueError(f"the checkpoint refers to {unknown!r}, which are not nodes of this graph")
+        start = Position(
+            self.build_start_values(checkpoint.values),
+            frozenset(checkpoint.nodes),
+            tuple(ParsedSend(send.node, parse_values(self.channels, send.values)) for send in checkpoint.sends),
+        )
+        async with AsyncExitStack() as run_exits:
+            return await self.run_steps(start, Run({}, run_exits, asyncio.Lock(), step_limit), save_checkpoint)
 
     def find_async_nodes(self) -> list[str]:
         names: list[str] = []
@@ -95,47 +133,87 @@ class CompiledGraph[StateT, InputT, OutputT]:
                     assert_never(node.action)
         return sorted(names)
 
-    def invoke(self, input: InputT, *, step_limit: int = 25) -> OutputT:
+    def run_in_new_loop[ResultT](self, start_run: Callable[[], Coroutine[object, object, ResultT]]) -> ResultT:
         async_nodes = self.find_async_nodes()
         if async_nodes:
-            raise TypeError(f"nodes {async_nodes!r} have only an async function, so call ainvoke")
+            raise TypeError(f"nodes {async_nodes!r} have only an async function, so call ainvoke or aresume")
         try:
             asyncio.get_running_loop()
         except RuntimeError:
-            return asyncio.run(self.ainvoke(input, step_limit=step_limit))
+            return asyncio.run(start_run())
         with ThreadPoolExecutor(max_workers=1) as executor:
-            run = executor.submit(copy_context().run, asyncio.run, self.ainvoke(input, step_limit=step_limit))
-            return run.result()
+            return executor.submit(copy_context().run, asyncio.run, start_run()).result()
 
-    async def run_steps(self, given: Mapping[str, object], update: Mapping[str, object], run: Run) -> OutputT:
+    def invoke(
+        self, input: InputT, *, step_limit: int = 25, save_checkpoint: Callable[[Checkpoint], object] | None = None
+    ) -> OutputT:
+        return self.run_in_new_loop(lambda: self.ainvoke(input, step_limit=step_limit, save_checkpoint=save_checkpoint))
+
+    def resume(
+        self,
+        checkpoint: Checkpoint,
+        *,
+        step_limit: int = 25,
+        save_checkpoint: Callable[[Checkpoint], object] | None = None,
+    ) -> OutputT:
+        return self.run_in_new_loop(
+            lambda: self.aresume(checkpoint, step_limit=step_limit, save_checkpoint=save_checkpoint)
+        )
+
+    def build_start_values(self, given: Mapping[str, object]) -> dict[str, object]:
         initial = {
             name: channel.reducer.make_initial()
             for name, channel in self.channels.items()
             if channel.reducer is not None
         }
-        start = parse_values(self.channels, {**initial, **given})
-        values = apply_writes(self.channels, start, [update])
-        names = self.entry_nodes
-        sends: tuple[ParsedSend, ...] = ()
+        return parse_values(self.channels, {**initial, **given})
+
+    async def save_position(self, position: Position, save_checkpoint: Callable[[Checkpoint], object] | None) -> None:
+        if save_checkpoint is None:
+            return
+        checkpoint = Checkpoint(
+            values=dump_values(self.channels, position.values),
+            nodes=tuple(sorted(position.nodes)),
+            sends=tuple(
+                PendingSend(node=send.node, values=dump_values(self.channels, send.values)) for send in position.sends
+            ),
+        )
+        await call_without_blocking(save_checkpoint, checkpoint)
+
+    async def run_steps(
+        self, start: Position, run: Run, save_checkpoint: Callable[[Checkpoint], object] | None
+    ) -> OutputT:
+        position = start
         steps = 0
-        while names or sends:
+        while position.nodes or position.sends:
             if steps == run.step_limit:
                 raise RuntimeError(f"the graph did not finish within {run.step_limit} steps")
             steps += 1
             calls = [
-                *(NodeCall(self.nodes[name], self.nodes[name].build_input(values)) for name in sorted(names)),
-                *(NodeCall(self.nodes[send.node], self.nodes[send.node].input_schema(**send.values)) for send in sends),
+                *(
+                    NodeCall(self.nodes[name], self.nodes[name].build_input(position.values))
+                    for name in sorted(position.nodes)
+                ),
+                *(
+                    NodeCall(self.nodes[send.node], self.nodes[send.node].input_schema(**send.values))
+                    for send in position.sends
+                ),
             ]
             async with AsyncExitStack() as step_exits:
                 outcomes = await self.run_step(calls, run, step_exits)
-                values = apply_writes(self.channels, values, [outcome.writes for outcome in outcomes])
-            names = frozenset[str]().union(*(outcome.routes.targets for outcome in outcomes))
-            sends = tuple(
-                ParsedSend(send.node, parse_values(self.channels, extract_writes(send.arg)))
-                for outcome in outcomes
-                for send in outcome.routes.sends
-            )
-        return self.output_schema(**{name: values[name] for name in self.output_fields if name in values})
+                position = Position(
+                    apply_writes(self.channels, position.values, [outcome.writes for outcome in outcomes]),
+                    frozenset[str]().union(*(outcome.routes.targets for outcome in outcomes)),
+                    tuple(
+                        ParsedSend(send.node, parse_values(self.channels, extract_writes(send.arg)))
+                        for outcome in outcomes
+                        for send in outcome.routes.sends
+                    ),
+                )
+                await self.save_position(position, save_checkpoint)
+        return self.output_schema(
+            **{name: position.values[name] for name in self.output_fields if name in position.values}
+        )
 
     async def run_step(self, calls: Sequence[NodeCall], run: Run, step_exits: AsyncExitStack) -> list[Outcome]:
         try:
@@ -152,7 +230,8 @@ class CompiledGraph[StateT, InputT, OutputT]:
             case CallPlan() as plan:
                 return await self.call_function(plan, call, run, step_exits)
             case CompiledGraph() as child:
-                result = await child.run_steps(extract_writes(call.node_input), {}, run)
+                start = Position(child.build_start_values(extract_writes(call.node_input)), child.entry_nodes, ())
+                result = await child.run_steps(start, run, None)
                 return read_outcome(result, call.node.targets, self.nodes.keys())
             case _:
                 assert_never(call.node.action)
