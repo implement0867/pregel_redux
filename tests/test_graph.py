@@ -43,6 +43,10 @@ class AppendModel(BaseModel):
     items: Annotated[list[str], Reducer(append_item, initial_factory=list)] = []
 
 
+class WrongInitialState(TypedDict, total=False):
+    items: Annotated[list[str], Reducer(join_lists, initial_factory=lambda: [1])]
+
+
 type AppendSchema = AppendDict | AppendDataclass | AppendModel
 
 
@@ -202,6 +206,42 @@ def test_input_and_first_node_write_go_through_the_reducer(
     actual = asyncio.run(builder.compile().ainvoke(input_state))
 
     assert actual == schema(items=expected), f"Expected the items {expected}, got {actual}."
+
+
+@pytest.mark.parametrize("schema", [AppendDict, AppendDataclass, AppendModel], ids=["typed-dict", "dataclass", "model"])
+@pytest.mark.parametrize(
+    ("input_state", "node_write"),
+    [({"items": 1}, "node"), ({}, 1), ({}, None)],
+    ids=["input-of-another-type", "node-write-of-another-type", "node-write-of-none"],
+)
+def test_value_that_is_not_of_the_declared_type_of_its_channel_is_rejected(
+    schema: type[AppendSchema], input_state: AppendSchema, node_write: object
+) -> None:
+    """
+    Arrange: a graph of each schema kind with a channel that holds a list of strings.
+    Act: run the graph with an input or a node write that puts another type into the list.
+    Assert: a ValueError is raised.
+    """
+    builder = StateGraph(schema)
+    builder.add_node("write", lambda state: {"items": node_write})
+    builder.add_edge(Endpoint.start, "write")
+
+    with pytest.raises(ValueError):
+        asyncio.run(builder.compile().ainvoke(input_state))
+
+
+def test_initial_value_that_is_not_of_the_declared_type_of_its_channel_is_rejected() -> None:
+    """
+    Arrange: a graph whose reducer channel holds a list of strings and has a list of numbers as its initial value.
+    Act: run the graph.
+    Assert: a ValueError is raised.
+    """
+    builder = StateGraph(WrongInitialState)
+    builder.add_node("write", lambda state: None)
+    builder.add_edge(Endpoint.start, "write")
+
+    with pytest.raises(ValueError):
+        asyncio.run(builder.compile().ainvoke({}))
 
 
 @pytest.mark.parametrize("schema", [AppendDict, AppendDataclass, AppendModel], ids=["typed-dict", "dataclass", "model"])

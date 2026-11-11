@@ -364,3 +364,35 @@ def test_child_graph_with_the_name_of_a_node_is_rejected(name: str) -> None:
 
     with pytest.raises(ValueError):
         builder.add_node(name, build_chain_graph(["first"]))
+
+
+class LooseState(TypedDict, total=False):
+    items: list[object]
+
+
+class NumbersState(TypedDict, total=False):
+    items: list[int]
+
+
+@pytest.mark.parametrize(
+    ("items", "expectation"),
+    [([1, 2], does_not_raise()), (["a"], pytest.raises(ValueError)), ([1, None], pytest.raises(ValueError))],
+    ids=["numbers", "text", "number-and-none"],
+)
+def test_child_graph_rejects_a_parent_value_that_is_not_of_the_type_of_its_channel(
+    items: list[object], expectation: AbstractContextManager[object]
+) -> None:
+    """
+    Arrange: a parent graph whose channel holds a list of objects, and a child graph that declares a list of numbers.
+    Act: run the parent graph with a list as the input.
+    Assert: a ValueError is raised only when the list does not contain only numbers.
+    """
+    child = StateGraph(NumbersState)
+    child.add_node("read", lambda state: None)
+    child.add_edge(Endpoint.start, "read")
+    parent = StateGraph(LooseState)
+    parent.add_node("child", child)
+    parent.add_edge(Endpoint.start, "child")
+
+    with expectation:
+        asyncio.run(parent.compile().ainvoke({"items": items}))

@@ -117,7 +117,8 @@ class CompiledGraph[StateT, InputT, OutputT]:
             for name, channel in self.channels.items()
             if channel.reducer is not None
         }
-        values = apply_writes(self.channels, {**initial, **given}, [update])
+        start = {name: self.channels[name].parse(value) for name, value in {**initial, **given}.items()}
+        values = apply_writes(self.channels, start, [update])
         names = self.entry_nodes
         sends: tuple[Send, ...] = ()
         steps = 0
