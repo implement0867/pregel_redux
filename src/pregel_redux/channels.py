@@ -155,15 +155,20 @@ def extract_writes(update: object) -> dict[str, object]:
             raise TypeError(f"{update!r} is not a mapping, a dataclass instance, a Pydantic model or None")
 
 
+def reject_unknown_channels(channels: Mapping[str, Channel], names: Iterable[str]) -> None:
+    unknown = sorted(set(names) - channels.keys())
+    if unknown:
+        raise ValueError(f"{unknown!r} are not channels of this graph")
+
+
 def apply_writes(
     channels: Mapping[str, Channel], values: Mapping[str, object], updates: Iterable[Mapping[str, object]]
 ) -> dict[str, object]:
     result = dict(values)
     written: set[str] = set()
     for update in updates:
+        reject_unknown_channels(channels, update)
         for name, value in update.items():
-            if name not in channels:
-                raise ValueError(f"{name!r} is not a channel of this graph")
             reducer = channels[name].reducer
             if reducer is not None:
                 result[name] = reducer.function(result[name], value)

@@ -216,6 +216,29 @@ def test_each_send_starts_the_child_graph_with_its_payload(topics: list[str], ex
 
 
 @pytest.mark.parametrize(
+    "payload",
+    [{"missing": 1}, {"topics": ["cats"], "missing": 1}],
+    ids=["unknown-field", "known-and-unknown-field"],
+)
+def test_send_with_a_field_that_is_not_a_channel_of_the_child_graph_is_rejected(payload: dict[str, object]) -> None:
+    """
+    Arrange: a parent node that sends a payload with a field that the child graph does not have.
+    Act: run the parent graph.
+    Assert: a ValueError is raised.
+    """
+    child = StateGraph(State, input_schema=TopicsInput, output_schema=JokesOutput)
+    child.add_node("write", lambda state: None)
+    child.add_edge(Endpoint.start, "write")
+    builder = StateGraph(State)
+    builder.add_node("plan", lambda state: Command[str](goto=[Send("child", payload)]))
+    builder.add_node("child", child)
+    builder.add_edge(Endpoint.start, "plan")
+
+    with pytest.raises(ValueError):
+        asyncio.run(builder.compile().ainvoke({}))
+
+
+@pytest.mark.parametrize(
     ("first_depth", "second_depth", "same_step"),
     [(0, 1, False), (1, 1, False), (1, 1, True), (0, 3, False), (2, 3, True)],
     ids=[

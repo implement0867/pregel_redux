@@ -1,4 +1,6 @@
 from collections.abc import Callable, Mapping, Sequence
+from contextlib import AbstractContextManager
+from contextlib import nullcontext as does_not_raise
 from dataclasses import dataclass, field, make_dataclass
 from operator import add, mul
 from types import new_class
@@ -15,8 +17,8 @@ from pregel_redux.channels import (
     build_channels,
     extract_writes,
     merge_channels,
+    reject_unknown_channels,
 )
-from pregel_redux.graph import build_start_values
 from tests.conftest import append_item, join_lists
 
 
@@ -317,61 +319,51 @@ def test_update_of_an_unsupported_type_is_rejected(update: object) -> None:
 
 
 @pytest.mark.parametrize(
-    ("given", "expected"),
+    ("names", "expectation"),
     [
-        ({}, {"items": []}),
-        ({"latest": 1}, {"items": [], "latest": 1}),
-        ({"items": [5]}, {"items": [5]}),
-        ({"items": [5], "latest": 1}, {"items": [5], "latest": 1}),
+        ([], does_not_raise()),
+        (["items"], does_not_raise()),
+        (["items", "latest"], does_not_raise()),
+        (["missing"], pytest.raises(ValueError)),
+        (["items", "missing"], pytest.raises(ValueError)),
     ],
-    ids=["nothing-given", "plain-channel-given", "reducer-channel-given", "both-given"],
+    ids=["no-names", "one-channel", "all-channels", "unknown-name", "channel-and-unknown-name"],
 )
-def test_start_values_are_the_initial_values_and_the_given_values(
-    channels: dict[str, Channel], given: Mapping[str, object], expected: Mapping[str, object]
+def test_names_that_are_not_channels_are_rejected(
+    channels: dict[str, Channel], names: Sequence[str], expectation: AbstractContextManager[object]
 ) -> None:
     """
-    Arrange: the channels of a schema with one reducer field and one plain field, and some given values.
-    Act: build the start values.
-    Assert: each reducer channel has its initial value unless a value is given, and a given value is kept as it is.
+    Arrange: the channels of a schema and a list of names.
+    Act: check the names against the channels.
+    Assert: a ValueError is raised only when one of the names is not a channel.
     """
-    actual = build_start_values(channels, given)
-
-    assert actual == expected, f"Expected {expected}, got {actual}. A given value must replace the initial value."
-
-
-def test_start_values_reject_a_given_value_for_an_unknown_channel(channels: dict[str, Channel]) -> None:
-    """
-    Arrange: the channels of a schema and a given value for a name that is not a channel.
-    Act: build the start values.
-    Assert: a ValueError is raised.
-    """
-    with pytest.raises(ValueError):
-        build_start_values(channels, {"missing": 1})
+    with expectation:
+        reject_unknown_channels(channels, names)
 
 
 @pytest.mark.parametrize(
-    ("given", "updates", "expected"),
+    ("values", "updates", "expected"),
     [
         ({"items": [0]}, [{"items": [1]}, {"items": [2]}], {"items": [0, 1, 2]}),
-        ({}, [{"items": [1]}, {"items": [2]}], {"items": [1, 2]}),
-        ({"latest": 1}, [{"latest": 2}], {"items": [], "latest": 2}),
+        ({"items": []}, [{"items": [1]}, {"items": [2]}], {"items": [1, 2]}),
+        ({"items": [], "latest": 1}, [{"latest": 2}], {"items": [], "latest": 2}),
         ({"items": [0], "latest": 1}, [{"items": [1]}, {"latest": 2}], {"items": [0, 1], "latest": 2}),
         ({"items": [0]}, [], {"items": [0]}),
     ],
-    ids=["reducer-with-given-value", "reducer-with-initial-value", "replacement", "two-channels", "no-updates"],
+    ids=["reducer-with-a-value", "reducer-with-the-initial-value", "replacement", "two-channels", "no-updates"],
 )
 def test_writes_of_one_step_give_the_next_values(
     channels: dict[str, Channel],
-    given: Mapping[str, object],
+    values: Mapping[str, object],
     updates: Sequence[Mapping[str, object]],
     expected: Mapping[str, object],
 ) -> None:
     """
-    Arrange: the start values of a schema with one reducer field and one plain field, and the updates of one step.
+    Arrange: the values of a schema with one reducer field and one plain field, and the updates of one step.
     Act: apply the updates.
     Assert: the reducer combined the writes to its channel, and a write to the plain channel replaced the value.
     """
-    actual = apply_writes(channels, build_start_values(channels, given), updates)
+    actual = apply_writes(channels, values, updates)
 
     assert actual == expected, f"Expected {expected}, got {actual}. The reducer must combine the writes of one step."
 
@@ -385,13 +377,13 @@ def test_first_write_to_a_reducer_channel_goes_through_the_reducer(
     updates: Sequence[Mapping[str, object]], expected: Sequence[object]
 ) -> None:
     """
-    Arrange: the start values of a schema with a reducer whose update type is not its channel type.
+    Arrange: the initial value of a channel with a reducer whose update type is not its channel type.
     Act: apply the first writes to the channel.
     Assert: the reducer combined each write with the initial value, so the channel holds a list.
     """
     channels = build_channels(AppendState)
 
-    actual = apply_writes(channels, build_start_values(channels, {}), updates)["items"]
+    actual = apply_writes(channels, {"items": []}, updates)["items"]
 
     assert actual == expected, f"Expected {expected}, got {actual}. The first write must not replace the initial value."
 
@@ -408,4 +400,4 @@ def test_invalid_writes_are_rejected(channels: dict[str, Channel], updates: Sequ
     Assert: a ValueError is raised.
     """
     with pytest.raises(ValueError):
-        apply_writes(channels, build_start_values(channels, {}), updates)
+        apply_writes(channels, {"items": []}, updates)
