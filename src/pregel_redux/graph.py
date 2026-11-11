@@ -14,9 +14,9 @@ from pregel_redux.channels import (
     build_channels,
     extract_writes,
     merge_channels,
-    reject_unknown_channels,
+    parse_values,
 )
-from pregel_redux.commands import Endpoint, Outcome, Send, read_declared_targets, read_outcome
+from pregel_redux.commands import Endpoint, Outcome, read_declared_targets, read_outcome
 from pregel_redux.dependencies import CallPlan, Depends, execute_plan, open_providers, plan_call
 
 type Node[InputT] = Callable[Concatenate[InputT, ...], object]
@@ -51,20 +51,17 @@ class CompiledNode:
     def build_input(self, values: Mapping[str, object]) -> object:
         return self.input_schema(**{name: values[name] for name in self.input_fields if name in values})
 
-    def build_send_input(self, send: Send) -> object:
-        payload = send.arg
-        match payload:
-            case Mapping():
-                fields: dict[str, object] = {**payload}
-                return self.input_schema(**fields)
-            case _:
-                return payload
-
 
 @dataclass(frozen=True)
 class NodeCall:
     node: CompiledNode
     node_input: object
+
+
+@dataclass(frozen=True)
+class ParsedSend:
+    node: str
+    values: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -111,16 +108,15 @@ class CompiledGraph[StateT, InputT, OutputT]:
             return run.result()
 
     async def run_steps(self, given: Mapping[str, object], update: Mapping[str, object], run: Run) -> OutputT:
-        reject_unknown_channels(self.channels, given)
         initial = {
             name: channel.reducer.make_initial()
             for name, channel in self.channels.items()
             if channel.reducer is not None
         }
-        start = {name: self.channels[name].parse(value) for name, value in {**initial, **given}.items()}
+        start = parse_values(self.channels, {**initial, **given})
         values = apply_writes(self.channels, start, [update])
         names = self.entry_nodes
-        sends: tuple[Send, ...] = ()
+        sends: tuple[ParsedSend, ...] = ()
         steps = 0
         while names or sends:
             if steps == run.step_limit:
@@ -128,13 +124,17 @@ class CompiledGraph[StateT, InputT, OutputT]:
             steps += 1
             calls = [
                 *(NodeCall(self.nodes[name], self.nodes[name].build_input(values)) for name in sorted(names)),
-                *(NodeCall(self.nodes[send.node], self.nodes[send.node].build_send_input(send)) for send in sends),
+                *(NodeCall(self.nodes[send.node], self.nodes[send.node].input_schema(**send.values)) for send in sends),
             ]
             async with AsyncExitStack() as step_exits:
                 outcomes = await self.run_step(calls, run, step_exits)
                 values = apply_writes(self.channels, values, [outcome.writes for outcome in outcomes])
             names = frozenset[str]().union(*(outcome.routes.targets for outcome in outcomes))
-            sends = tuple(send for outcome in outcomes for send in outcome.routes.sends)
+            sends = tuple(
+                ParsedSend(send.node, parse_values(self.channels, extract_writes(send.arg)))
+                for outcome in outcomes
+                for send in outcome.routes.sends
+            )
         return self.output_schema(**{name: values[name] for name in self.output_fields if name in values})
 
     async def run_step(self, calls: Sequence[NodeCall], run: Run, step_exits: AsyncExitStack) -> list[Outcome]:

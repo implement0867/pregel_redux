@@ -176,6 +176,11 @@ def reject_unknown_channels(channels: Mapping[str, Channel], names: Iterable[str
         raise ValueError(f"{unknown!r} are not channels of this graph")
 
 
+def parse_values(channels: Mapping[str, Channel], values: Mapping[str, object]) -> dict[str, object]:
+    reject_unknown_channels(channels, values)
+    return {name: channels[name].parse(value) for name, value in values.items()}
+
+
 def apply_writes(
     channels: Mapping[str, Channel], values: Mapping[str, object], updates: Iterable[Mapping[str, object]]
 ) -> dict[str, object]:

@@ -4,7 +4,7 @@ from dataclasses import dataclass
 from typing import Annotated, Literal, TypedDict
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel
 
 from pregel_redux import Command, Depends, Endpoint, Reducer, Send, StateDep, StateGraph
 from pregel_redux.commands import resolve_goto
@@ -223,8 +223,42 @@ def test_model_input_type_checks_the_payload_of_a_send(payload: Mapping[str, obj
     builder.add_node("write_joke", write_model_joke, input_schema=ModelRequest)
     builder.add_edge(Endpoint.start, "plan")
 
-    with pytest.raises(ValidationError):
+    with pytest.raises(ValueError):
         asyncio.run(builder.compile().ainvoke({}))
+
+
+@pytest.mark.parametrize(
+    "payload",
+    [{"topic": ["cats"]}, {"topic": None}, {"subject": "cats"}, {"topic": "cats", "subject": "cats"}, "cats"],
+    ids=["wrong-type", "none", "unknown-field", "known-and-unknown-field", "not-a-mapping"],
+)
+@pytest.mark.parametrize(
+    ("write_joke", "input_schema"),
+    [(write_dict_joke, DictRequest), (write_dataclass_joke, DataclassRequest), (write_model_joke, ModelRequest)],
+    ids=["typed-dict", "dataclass", "model"],
+)
+def test_send_with_a_payload_that_its_channels_cannot_hold_is_rejected(
+    write_joke: Callable[..., object], input_schema: type[object], payload: object
+) -> None:
+    """
+    Arrange: a node that sends a payload with a value of the wrong type, an unknown field, or no fields.
+    Act: run the graph.
+    Assert: a ValueError or a TypeError is raised, and the target node does not run.
+    """
+    received: list[object] = []
+
+    def record_request(request: object) -> None:
+        received.append(request)
+
+    builder = StateGraph(State)
+    builder.add_node("plan", lambda state: Command[str](goto=Send("write_joke", payload)))
+    builder.add_node("write_joke", record_request, input_schema=input_schema)
+    builder.add_edge(Endpoint.start, "plan")
+
+    with pytest.raises((ValueError, TypeError)):
+        asyncio.run(builder.compile().ainvoke({}))
+
+    assert received == [], f"Expected the target node not to run, got the requests {received}."
 
 
 @pytest.mark.parametrize("topics", [["cats"], ["cats", "dogs"], []], ids=repr)
