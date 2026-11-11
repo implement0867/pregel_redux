@@ -12,11 +12,12 @@ from pregel_redux.channels import (
     Channel,
     apply_writes,
     build_channels,
+    extract_fields,
     extract_writes,
     merge_channels,
     parse_values,
 )
-from pregel_redux.checkpoints import Checkpoint, PendingSend, dump_values
+from pregel_redux.checkpoints import Checkpoint, PendingSend, dump_values, load_values
 from pregel_redux.commands import Endpoint, Outcome, read_declared_targets, read_outcome
 from pregel_redux.dependencies import (
     CallPlan,
@@ -113,9 +114,9 @@ class CompiledGraph[StateT, InputT, OutputT]:
         if unknown:
             raise ValueError(f"the checkpoint refers to {unknown!r}, which are not nodes of this graph")
         start = Position(
-            self.build_start_values(checkpoint.values),
+            self.build_start_values(load_values(self.channels, checkpoint.values)),
             frozenset(checkpoint.nodes),
-            tuple(ParsedSend(send.node, parse_values(self.channels, send.values)) for send in checkpoint.sends),
+            tuple(ParsedSend(send.node, load_values(self.channels, send.values)) for send in checkpoint.sends),
         )
         async with AsyncExitStack() as run_exits:
             return await self.run_steps(start, Run({}, run_exits, asyncio.Lock(), step_limit), save_checkpoint)
@@ -205,7 +206,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
                     apply_writes(self.channels, position.values, [outcome.writes for outcome in outcomes]),
                     frozenset[str]().union(*(outcome.routes.targets for outcome in outcomes)),
                     tuple(
-                        ParsedSend(send.node, parse_values(self.channels, extract_writes(send.arg)))
+                        ParsedSend(send.node, parse_values(self.channels, extract_fields(send.arg)))
                         for outcome in outcomes
                         for send in outcome.routes.sends
                     ),

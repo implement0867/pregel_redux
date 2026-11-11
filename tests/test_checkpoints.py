@@ -29,6 +29,15 @@ class Review(BaseModel):
 
     score: int
     note: str = Field(alias="comment")
+    author: str = Field(default="", validation_alias="writer")
+    reader: str = Field(default="", serialization_alias="audience")
+
+
+class Event(BaseModel):
+    model_config = ConfigDict(frozen=True, strict=True)
+
+    at: datetime
+    seats: tuple[int, ...]
 
 
 @dataclass(frozen=True)
@@ -45,6 +54,7 @@ class State(TypedDict, total=False):
     started: datetime
     tags: frozenset[str]
     weights: dict[int, float]
+    event: Event
 
 
 class TopicRequest(TypedDict):
@@ -144,7 +154,7 @@ def test_checkpoint_is_saved_for_the_start_and_after_each_step(
                 "topics": ["cats"],
                 "jokes": ["a joke about cats"],
                 "budget": {"limit": 1, "spent": 1},
-                "review": {"score": 1, "comment": "a joke about cats"},
+                "review": {"score": 1, "note": "a joke about cats", "author": "", "reader": ""},
             },
             nodes=(),
             sends=(),
@@ -164,10 +174,11 @@ def test_checkpoint_is_saved_for_the_start_and_after_each_step(
             "topics": st.lists(st.text(), max_size=3),
             "jokes": st.lists(st.text(), max_size=2),
             "budget": st.builds(Budget, st.integers(), st.integers()),
-            "review": st.builds(Review, score=st.integers(), comment=st.text()),
+            "review": st.builds(Review, score=st.integers(), comment=st.text(), writer=st.text(), reader=st.text()),
+            "event": st.builds(Event, at=st.datetimes(), seats=st.lists(st.integers(), max_size=2).map(tuple)),
             "started": st.datetimes(),
             "tags": st.frozensets(st.text(), max_size=3),
-            "weights": st.dictionaries(st.integers(), st.floats(allow_nan=False, allow_infinity=False), max_size=3),
+            "weights": st.dictionaries(st.integers(), st.floats(allow_nan=False), max_size=3),
         },
     )
 )

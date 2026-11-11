@@ -1,10 +1,10 @@
 import asyncio
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated, Literal, TypedDict
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from pregel_redux import Command, Depends, Endpoint, Reducer, Send, StateDep, StateGraph
 from pregel_redux.commands import resolve_goto
@@ -214,6 +214,42 @@ def test_send_gives_the_payload_as_the_input_type_of_the_node(
     asyncio.run(builder.compile().ainvoke({}))
 
     assert received == [expected], f"Expected the node to receive {expected!r}, got {received}."
+
+
+def test_send_of_an_instance_keeps_the_fields_that_have_a_default() -> None:
+    """
+    Arrange: payloads of a model and of a dataclass whose number comes from a default factory or equals the default.
+    Act: send each payload to a node with that input type.
+    Assert: the node receives the numbers of the payloads, and the default factory does not run again.
+    """
+    numbers = iter(range(1, 10))
+
+    class NumberedModel(BaseModel):
+        number: int = Field(default_factory=lambda: next(numbers))
+
+    @dataclass
+    class NumberedDataclass:
+        number: int = field(default_factory=lambda: next(numbers))
+        retries: int = 0
+
+    received: list[object] = []
+    payloads = [NumberedModel(), NumberedDataclass(), NumberedDataclass(retries=0)]
+    builder = StateGraph(State)
+    builder.add_node(
+        "plan",
+        lambda state: Command[str](
+            goto=[Send("model", payloads[0]), *(Send("dataclass", item) for item in payloads[1:])]
+        ),
+    )
+    builder.add_node("model", received.append, input_schema=NumberedModel)
+    builder.add_node("dataclass", received.append, input_schema=NumberedDataclass)
+    builder.add_edge(Endpoint.start, "plan")
+
+    asyncio.run(builder.compile().ainvoke({}))
+
+    missing = [payload for payload in payloads if payload not in received]
+    assert len(received) == 3, f"Expected three node calls, got {received}."
+    assert missing == [], f"Expected the nodes to receive {payloads}, got {received}."
 
 
 @pytest.mark.parametrize("payload", [{"topic": ["cats"]}, {}, {"subject": "cats"}], ids=repr)

@@ -170,6 +170,18 @@ def extract_writes(update: object) -> dict[str, object]:
             raise TypeError(f"{update!r} is not a mapping, a dataclass instance, a Pydantic model or None")
 
 
+def extract_fields(payload: object) -> dict[str, object]:
+    match payload:
+        case Mapping():
+            return {**payload}
+        case BaseModel():
+            return {name: getattr(payload, name) for name in type(payload).model_fields}
+        case _ if dataclasses.is_dataclass(payload) and not isinstance(payload, type):
+            return {field.name: getattr(payload, field.name) for field in dataclasses.fields(payload)}
+        case _:
+            raise TypeError(f"{payload!r} is not a mapping, a dataclass instance or a Pydantic model")
+
+
 def reject_unknown_channels(channels: Mapping[str, Channel], names: Iterable[str]) -> None:
     unknown = sorted(set(names) - channels.keys())
     if unknown:
