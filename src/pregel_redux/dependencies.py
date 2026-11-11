@@ -1,6 +1,6 @@
 import asyncio
 import inspect
-from collections.abc import AsyncGenerator, Callable, Iterable, Mapping, MutableMapping
+from collections.abc import AsyncGenerator, Awaitable, Callable, Iterable, Mapping, MutableMapping
 from contextlib import (
     AbstractAsyncContextManager,
     AbstractContextManager,
@@ -80,20 +80,24 @@ def read_dependency_parameters(function: Callable[..., object], *, state_paramet
     return {parameter.name: read_request(function, parameter) for parameter in parameters[state_parameters:]}
 
 
-async def run_in_thread(function: Callable[..., object], *arguments: object, **named_arguments: object) -> object:
-    await asyncio.sleep(0)  # deliver a pending cancellation
-    call = asyncio.ensure_future(asyncio.to_thread(function, *arguments, **named_arguments))
+async def finish_despite_cancellation[ResultT](work: Awaitable[ResultT]) -> ResultT:
+    future = asyncio.ensure_future(work)
     cancelled = False
-    while not call.done():
+    while not future.done():
         try:
-            await asyncio.wait([call])
+            await asyncio.wait([future])
         except asyncio.CancelledError:
             cancelled = True
-    result = call.result()
+    result = future.result()
     task = asyncio.current_task()
     if cancelled and task is not None:
         task.cancel()
     return result
+
+
+async def run_in_thread(function: Callable[..., object], *arguments: object, **named_arguments: object) -> object:
+    await asyncio.sleep(0)  # deliver a pending cancellation
+    return await finish_despite_cancellation(asyncio.to_thread(function, *arguments, **named_arguments))
 
 
 @dataclass(frozen=True)

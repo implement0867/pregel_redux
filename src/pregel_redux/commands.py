@@ -4,6 +4,8 @@ from dataclasses import dataclass
 from enum import Enum
 from typing import Literal, get_args, get_origin
 
+from pydantic import JsonValue
+
 from pregel_redux.channels import extract_writes
 
 
@@ -25,6 +27,8 @@ type Target[NameT: str] = NameT | Literal[Endpoint.end] | Send
 class Command[NameT: str]:
     update: object = None
     goto: Target[NameT] | Sequence[Target[NameT]] = ()
+    resume: JsonValue = None
+    resume_by_interrupt_id: Mapping[str, JsonValue] | None = None
 
 
 @dataclass(frozen=True)

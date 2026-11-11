@@ -13,12 +13,13 @@ from pregel_redux import Depends
 from pregel_redux.channels import (
     Channel,
     Reducer,
-    apply_writes,
     build_channels,
     extract_writes,
     merge_channels,
+    parse_updates,
     reject_unknown_channels,
 )
+from pregel_redux.pregel import TaskWrites, apply_writes, open_channels
 from tests.conftest import append_item, join_lists
 
 
@@ -39,7 +40,7 @@ class ModelState[T](BaseModel):
 
 
 class AppendState(TypedDict):
-    items: Annotated[list[object], Reducer(append_item, initial_factory=list)]
+    items: Annotated[list[object], Reducer(append_item, initial_factory=list, update_type=object)]
 
 
 class Total(BaseModel):
@@ -97,7 +98,14 @@ def build_marker() -> Reducer[list[int], list[int]]:
 
 
 def build_append_marker() -> Reducer[list[int], int]:
-    return Reducer(append_item, initial_factory=list)
+    return Reducer(append_item, initial_factory=list, update_type=int)
+
+
+def apply_updates(
+    channels: Mapping[str, Channel], values: Mapping[str, object], updates: Sequence[Mapping[str, object]]
+) -> dict[str, object]:
+    writes = [TaskWrites(parse_updates(channels, update), frozenset(), (), ()) for update in updates]
+    return apply_writes(open_channels(channels, values, {}, {}), [], writes, [], []).channels.read_values()
 
 
 def call_without_type_check(function: Callable[..., object], arguments: Mapping[str, object]) -> object:
@@ -392,7 +400,7 @@ def test_writes_of_one_step_give_the_next_values(
     Act: apply the updates.
     Assert: the reducer combined the writes to its channel, and a write to the plain channel replaced the value.
     """
-    actual = apply_writes(channels, values, updates)
+    actual = apply_updates(channels, values, updates)
 
     assert actual == expected, f"Expected {expected}, got {actual}. The reducer must combine the writes of one step."
 
@@ -412,7 +420,7 @@ def test_first_write_to_a_reducer_channel_goes_through_the_reducer(
     """
     channels = build_channels(AppendState)
 
-    actual = apply_writes(channels, {"items": []}, updates)["items"]
+    actual = apply_updates(channels, {"items": []}, updates)["items"]
 
     assert actual == expected, f"Expected {expected}, got {actual}. The first write must not replace the initial value."
 
@@ -444,7 +452,7 @@ def test_invalid_writes_are_rejected(channels: dict[str, Channel], updates: Sequ
     Assert: a ValueError is raised.
     """
     with pytest.raises(ValueError):
-        apply_writes(channels, {"items": []}, updates)
+        apply_updates(channels, {"items": []}, updates)
 
 
 @pytest.mark.parametrize(
@@ -460,7 +468,7 @@ def test_written_value_is_stored_as_the_declared_type_of_the_channel(written: ob
     """
     channels = build_channels(TotalState)
 
-    actual = apply_writes(channels, {}, [{"total": written}])["total"]
+    actual = apply_updates(channels, {}, [{"total": written}])["total"]
 
     assert actual == Total(count=1), (
         f"Expected Total(count=1), got {actual!r}. The channel must hold its declared type."
@@ -483,7 +491,7 @@ def test_constraint_in_the_annotation_of_a_field_applies_to_its_channel(
     channels = build_channels(build_schema(Annotated[int, Field(gt=0)]))
 
     with expectation:
-        apply_writes(channels, {}, [{"items": written}])
+        apply_updates(channels, {}, [{"items": written}])
 
 
 @pytest.mark.parametrize(
