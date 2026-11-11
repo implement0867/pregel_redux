@@ -12,6 +12,7 @@ from pregel_redux.channels import Channel, apply_writes, extract_fields, extract
 from pregel_redux.checkpoints import Checkpoint, PendingSend, dump_values, load_values
 from pregel_redux.commands import Outcome, read_outcome
 from pregel_redux.dependencies import CallPlan, Depends, call_without_blocking, execute_plan, open_providers
+from pregel_redux.settings import RunSettings
 
 
 @dataclass(frozen=True)
@@ -61,19 +62,24 @@ class CompiledGraph[StateT, InputT, OutputT]:
     entry_nodes: frozenset[str]
 
     async def ainvoke(
-        self, input: InputT, *, step_limit: int = 25, save_checkpoint: Callable[[Checkpoint], object] | None = None
+        self,
+        input: InputT,
+        *,
+        step_limit: int | None = None,
+        save_checkpoint: Callable[[Checkpoint], object] | None = None,
     ) -> OutputT:
         values = apply_writes(self.channels, self.build_start_values({}), [extract_writes(input)])
         start = Position(values, self.entry_nodes, ())
         await self.save_position(start, save_checkpoint)
+        limit = RunSettings().step_limit if step_limit is None else step_limit
         async with AsyncExitStack() as run_exits:
-            return await self.run_steps(start, Run({}, run_exits, asyncio.Lock(), step_limit), save_checkpoint)
+            return await self.run_steps(start, Run({}, run_exits, asyncio.Lock(), limit), save_checkpoint)
 
     async def aresume(
         self,
         checkpoint: Checkpoint,
         *,
-        step_limit: int = 25,
+        step_limit: int | None = None,
         save_checkpoint: Callable[[Checkpoint], object] | None = None,
     ) -> OutputT:
         unknown = sorted({*checkpoint.nodes, *(send.node for send in checkpoint.sends)} - self.nodes.keys())
@@ -84,8 +90,9 @@ class CompiledGraph[StateT, InputT, OutputT]:
             frozenset(checkpoint.nodes),
             tuple(ParsedSend(send.node, load_values(self.channels, send.values)) for send in checkpoint.sends),
         )
+        limit = RunSettings().step_limit if step_limit is None else step_limit
         async with AsyncExitStack() as run_exits:
-            return await self.run_steps(start, Run({}, run_exits, asyncio.Lock(), step_limit), save_checkpoint)
+            return await self.run_steps(start, Run({}, run_exits, asyncio.Lock(), limit), save_checkpoint)
 
     def find_async_nodes(self) -> list[str]:
         names: list[str] = []
@@ -112,7 +119,11 @@ class CompiledGraph[StateT, InputT, OutputT]:
             return executor.submit(copy_context().run, asyncio.run, start_run()).result()
 
     def invoke(
-        self, input: InputT, *, step_limit: int = 25, save_checkpoint: Callable[[Checkpoint], object] | None = None
+        self,
+        input: InputT,
+        *,
+        step_limit: int | None = None,
+        save_checkpoint: Callable[[Checkpoint], object] | None = None,
     ) -> OutputT:
         return self.run_in_new_loop(lambda: self.ainvoke(input, step_limit=step_limit, save_checkpoint=save_checkpoint))
 
@@ -120,7 +131,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         self,
         checkpoint: Checkpoint,
         *,
-        step_limit: int = 25,
+        step_limit: int | None = None,
         save_checkpoint: Callable[[Checkpoint], object] | None = None,
     ) -> OutputT:
         return self.run_in_new_loop(
