@@ -7,7 +7,7 @@ from types import new_class
 from typing import Annotated, NotRequired, TypedDict
 
 import pytest
-from pydantic import BaseModel, ConfigDict, Field
+from pydantic import BaseModel, ConfigDict, Field, PydanticSchemaGenerationError
 
 from pregel_redux import Depends
 from pregel_redux.channels import (
@@ -493,7 +493,7 @@ def test_field_of_a_type_that_pydantic_cannot_validate_is_rejected(schema: objec
     """
     Arrange: a schema of each kind with a field whose type is a class for which Pydantic cannot make a validator.
     Act: build the channels of the schema.
-    Assert: a TypeError is raised.
+    Assert: the PydanticSchemaGenerationError of Pydantic is raised.
     """
-    with pytest.raises(TypeError):
+    with pytest.raises(PydanticSchemaGenerationError):
         build_channels(schema)

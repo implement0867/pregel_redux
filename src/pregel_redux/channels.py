@@ -17,7 +17,7 @@ from typing import (
     runtime_checkable,
 )
 
-from pydantic import BaseModel, PydanticSchemaGenerationError, TypeAdapter, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 from typing_extensions import TypeForm
 
 
@@ -100,19 +100,12 @@ def find_reducer(name: str, metadata: tuple[object, ...]) -> Reducer[object, obj
             raise TypeError(f"field {name!r} has more than one Reducer annotation")
 
 
-def build_adapter(name: str, hint: TypeForm[object]) -> TypeAdapter[object]:
-    try:
-        return TypeAdapter(hint)
-    except PydanticSchemaGenerationError as error:
-        raise TypeError(f"field {name!r} has the type {hint!r}, and Pydantic cannot validate that type") from error
-
-
 def build_channel(name: str, hint: TypeForm[object]) -> Channel:
     unwrapped = get_args(hint)[0] if get_origin(hint) in (Required, NotRequired) else hint
     if get_origin(unwrapped) is Annotated:
         value_type, *metadata = get_args(unwrapped)
-        return Channel(name, value_type, find_reducer(name, tuple(metadata)), build_adapter(name, unwrapped))
-    return Channel(name, unwrapped, None, build_adapter(name, unwrapped))
+        return Channel(name, value_type, find_reducer(name, tuple(metadata)), TypeAdapter(unwrapped))
+    return Channel(name, unwrapped, None, TypeAdapter(unwrapped))
 
 
 def read_field_hints(schema_class: object) -> dict[str, TypeForm[object]]:
@@ -132,7 +125,7 @@ def build_channels(schema: object) -> dict[str, Channel]:
                     name,
                     info.annotation,
                     find_reducer(name, tuple(info.metadata)),
-                    build_adapter(name, info.rebuild_annotation()),
+                    TypeAdapter(info.rebuild_annotation()),
                 )
                 for name, info in schema.model_fields.items()
             }
