@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Never, assert_never
 from uuid import UUID, uuid4, uuid5
@@ -15,14 +15,18 @@ from pregel_redux.checkpoints import (
     JoinVersion,
     PendingSend,
     PendingWrite,
+    RunResumeRecord,
     SavedArrival,
     SavedBranch,
     SavedJoin,
     SavedWrites,
+    TaskInterruptRecord,
+    TaskWritesRecord,
     TriggerVersions,
 )
-from pregel_redux.commands import Endpoint, Send
+from pregel_redux.commands import Command, Endpoint, Send
 from pregel_redux.graph.compiled import CompiledGraph, Journal, NodeCall, TaskRef
+from pregel_redux.interrupts import Finished, Interrupt, Interrupted, ResumeInput, Scratchpad
 from pregel_redux.pregel import (
     Arrival,
     BranchChannel,
@@ -241,7 +245,7 @@ class ThreadScope:
     checkpoint_ns: str
 
     async def begin(self, position: Position, step: int) -> "tuple[Position, ThreadJournal]":
-        journal = ThreadJournal(self, uuid4(), step, {})
+        journal = ThreadJournal(self, uuid4(), step, ())
         await journal.save(position, CheckpointSource.input)
         return position, journal
 
@@ -249,8 +253,7 @@ class ThreadScope:
         saved = await self.checkpointer.aget_tuple(self.thread_id, self.checkpoint_ns)
         if saved is None:
             return None
-        pending = {write.task_id: write.writes for write in saved.pending_writes}
-        journal = ThreadJournal(self, saved.checkpoint.id, saved.checkpoint.step + 1, pending)
+        journal = ThreadJournal(self, saved.checkpoint.id, saved.checkpoint.step + 1, saved.pending_writes)
         return load_position(self.graph, saved.checkpoint), journal
 
 
@@ -259,7 +262,7 @@ class ThreadJournal:
     scope: ThreadScope
     checkpoint_id: UUID
     step: int
-    pending: Mapping[str, SavedWrites]
+    pending: Sequence[PendingWrite]
 
     def make_task_id(self, task: TaskRef) -> str:
         return str(uuid5(self.checkpoint_id, f"{self.scope.checkpoint_ns}|{self.step}|{name_task(task)}"))
@@ -271,21 +274,62 @@ class ThreadJournal:
         await scope.checkpointer.aput(scope.thread_id, checkpoint)
         self.checkpoint_id = checkpoint_id
         self.step += 1
-        self.pending = {}
+        self.pending = ()
 
-    async def record(self, task: TaskRef, writes: TaskWrites) -> None:
+    def make_task_ns(self, task: TaskRef) -> str:
+        parent_ns = f"{self.scope.checkpoint_ns}|" if self.scope.checkpoint_ns else ""
+        return f"{parent_ns}{task.node}:{self.make_task_id(task)}"
+
+    async def put_write(self, write: PendingWrite) -> None:
         scope = self.scope
-        write = PendingWrite(task_id=self.make_task_id(task), writes=dump_writes(scope.graph, writes))
         await scope.checkpointer.aput_writes(scope.thread_id, scope.checkpoint_ns, self.checkpoint_id, write)
 
+    async def record(self, task: TaskRef, writes: TaskWrites) -> None:
+        saved = dump_writes(self.scope.graph, writes)
+        await self.put_write(TaskWritesRecord(task_id=self.make_task_id(task), writes=saved))
+
+    async def record_interrupt(
+        self, task: TaskRef, interrupts: Sequence[Interrupt], resume: Sequence[JsonValue]
+    ) -> None:
+        await self.put_write(
+            TaskInterruptRecord(task_id=self.make_task_id(task), interrupts=tuple(interrupts), resume=tuple(resume))
+        )
+
     def find_writes(self, task: TaskRef) -> TaskWrites | None:
-        saved = self.pending.get(self.make_task_id(task))
-        return None if saved is None else load_writes(self.scope.graph, saved)
+        task_id = self.make_task_id(task)
+        saved = [
+            write.writes for write in self.pending if isinstance(write, TaskWritesRecord) and write.task_id == task_id
+        ]
+        return load_writes(self.scope.graph, saved[0]) if saved else None
+
+    def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad:
+        task_id = self.make_task_id(task)
+        saved = [
+            value
+            for write in self.pending
+            if isinstance(write, TaskInterruptRecord) and write.task_id == task_id
+            for value in write.resume
+        ]
+        return Scratchpad(self.make_task_ns(task), saved, resume, 0)
+
+    async def read_resume(self, command: Command[str] | None) -> ResumeInput:
+        if command is not None and command.resume is not None:
+            finished = {write.task_id for write in self.pending if isinstance(write, TaskWritesRecord)}
+            waiting = [
+                interrupt.id
+                for write in self.pending
+                if isinstance(write, TaskInterruptRecord) and write.task_id not in finished
+                for interrupt in write.interrupts
+            ]
+            if len(waiting) > 1:
+                raise ValueError(f"the interrupts {waiting!r} wait for an answer, so give resume_by_interrupt_id")
+            await self.put_write(RunResumeRecord(value=command.resume))
+            return ResumeInput([command.resume], command.resume_by_interrupt_id or {})
+        saved = [write.value for write in self.pending if isinstance(write, RunResumeRecord)]
+        return ResumeInput(saved, {} if command is None else command.resume_by_interrupt_id or {})
 
     async def enter_child(self, child: AnyGraph, call: NodeCall) -> tuple[Position, Journal]:
-        parent_ns = f"{self.scope.checkpoint_ns}|" if self.scope.checkpoint_ns else ""
-        checkpoint_ns = f"{parent_ns}{call.task.node}:{self.make_task_id(call.task)}"
-        scope = ThreadScope(child, self.scope.checkpointer, self.scope.thread_id, checkpoint_ns)
+        scope = ThreadScope(child, self.scope.checkpointer, self.scope.thread_id, self.make_task_ns(call.task))
         return await scope.load() or await scope.begin(child.feed(child.open(extract_writes(call.node_input)), {}), -1)
 
 
@@ -294,20 +338,30 @@ class PersistentGraph[StateT, InputT, OutputT]:
     graph: CompiledGraph[StateT, InputT, OutputT]
     checkpointer: Checkpointer
 
-    async def ainvoke(self, input: InputT | None, *, thread_id: str, step_limit: int | None = None) -> OutputT:
+    async def ainvoke(
+        self, input: InputT | Command[str] | None, *, thread_id: str, step_limit: int | None = None
+    ) -> Finished[OutputT] | Interrupted:
         scope = ThreadScope(self.graph, self.checkpointer, thread_id, "")
         loaded = await scope.load()
-        if input is None:
-            if loaded is None:
-                raise LookupError(f"thread {thread_id!r} has no checkpoint, so the run needs an input")
-            position, journal = loaded
-        elif loaded is None:
-            position, journal = await scope.begin(self.graph.feed(self.graph.open({}), extract_writes(input)), -1)
-        else:
-            position, journal = await scope.begin(self.graph.feed(loaded[0], extract_writes(input)), loaded[1].step)
-        return await self.graph.run(position, step_limit, journal)
+        match input:
+            case None | Command():
+                if loaded is None:
+                    raise LookupError(f"thread {thread_id!r} has no checkpoint, so the run needs an input")
+                position, journal = loaded
+                resume = await journal.read_resume(input)
+            case _ if loaded is None:
+                start = self.graph.feed(self.graph.open({}), extract_writes(input))
+                position, journal = await scope.begin(start, -1)
+                resume = ResumeInput([], {})
+            case _:
+                start = self.graph.feed(loaded[0], extract_writes(input))
+                position, journal = await scope.begin(start, loaded[1].step)
+                resume = ResumeInput([], {})
+        return await self.graph.run(position, step_limit, journal, resume)
 
-    def invoke(self, input: InputT | None, *, thread_id: str, step_limit: int | None = None) -> OutputT:
+    def invoke(
+        self, input: InputT | Command[str] | None, *, thread_id: str, step_limit: int | None = None
+    ) -> Finished[OutputT] | Interrupted:
         return self.graph.run_in_new_loop(
             lambda: self.ainvoke(input, thread_id=thread_id, step_limit=step_limit), "ainvoke"
         )

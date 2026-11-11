@@ -12,7 +12,9 @@ from pregel_redux import (
     Checkpointer,
     Command,
     Endpoint,
+    Finished,
     InMemoryCheckpointer,
+    Interrupted,
     PersistentGraph,
     Reducer,
     Send,
@@ -180,7 +182,7 @@ def test_resume_of_a_pending_send_starts_its_node_with_the_stored_payload() -> N
 
     actual = asyncio.run(graph.ainvoke(None, thread_id="thread"))
 
-    expected = {"jokes": ["joke about cats", "joke about dogs", "review"]}
+    expected = Finished({"jokes": ["joke about cats", "joke about dogs", "review"]})
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 
@@ -198,7 +200,7 @@ def test_resume_keeps_the_sources_of_a_join_that_finished_before_the_failure() -
 
     actual = asyncio.run(graph.ainvoke(None, thread_id="thread"))
 
-    expected = {"jokes": ["first", "second", "last", "target"]}
+    expected = Finished({"jokes": ["first", "second", "last", "target"]})
     assert actual == expected, f"Expected {expected}, got {actual}."
     assert calls == ["last", "target"], f"Expected the calls ['last', 'target'], got {calls}."
 
@@ -218,9 +220,9 @@ def test_run_on_a_thread_starts_with_the_values_of_its_latest_checkpoint(
     graph = build_joke_graph(InMemoryCheckpointer(), [], [])
     asyncio.run(graph.ainvoke({"topics": ["cats"]}, thread_id="thread"))
 
-    actual = asyncio.run(graph.ainvoke({"topics": ["dogs"]}, thread_id=second_thread))["jokes"]
+    actual = asyncio.run(graph.ainvoke({"topics": ["dogs"]}, thread_id=second_thread))
 
-    assert actual == expected, f"Expected {expected}, got {actual}."
+    assert actual == Finished({"jokes": expected}), f"Expected {expected}, got {actual}."
 
 
 def test_resume_of_a_thread_without_a_checkpoint_is_rejected() -> None:
@@ -450,7 +452,7 @@ def test_resume_does_not_run_a_node_that_finished_in_the_failed_step(finished_no
     """
     calls: list[str] = []
 
-    async def run_thread() -> Output:
+    async def run_thread() -> Finished[Output] | Interrupted:
         saved = asyncio.Event()
         failures: list[Exception] = [ConnectionError("no network")]
 
@@ -482,7 +484,7 @@ def test_resume_does_not_run_a_node_that_finished_in_the_failed_step(finished_no
 
     actual = asyncio.run(run_thread())
 
-    expected = {"jokes": ["failing", *(f"finished {index}" for index in range(finished_nodes))]}
+    expected = Finished({"jokes": ["failing", *(f"finished {index}" for index in range(finished_nodes))]})
     assert actual == expected, f"Expected {expected}, got {actual}."
     assert calls == ["failing"], f"Expected the calls ['failing'], got {calls}."
 

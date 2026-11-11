@@ -9,7 +9,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from typing import Never, Protocol, assert_never
 
-from pydantic import TypeAdapter
+from pydantic import JsonValue, TypeAdapter
 
 from pregel_redux.channels import Channel, extract_writes, parse_updates
 from pregel_redux.checkpoints import CheckpointSource
@@ -20,6 +20,15 @@ from pregel_redux.dependencies import (
     execute_plan,
     finish_despite_cancellation,
     open_providers,
+)
+from pregel_redux.interrupts import (
+    Finished,
+    GraphInterrupt,
+    Interrupt,
+    Interrupted,
+    ResumeInput,
+    Scratchpad,
+    current_scratchpad,
 )
 from pregel_redux.pregel import (
     Arrival,
@@ -51,6 +60,7 @@ class Run:
     exits: AsyncExitStack
     lock: asyncio.Lock
     step_limit: int
+    resume: ResumeInput
 
 
 @dataclass(frozen=True)
@@ -95,7 +105,11 @@ class NodeCall:
 class Journal(Protocol):
     async def save(self, position: Position, source: CheckpointSource) -> None: ...
     async def record(self, task: TaskRef, writes: TaskWrites) -> None: ...
+    async def record_interrupt(
+        self, task: TaskRef, interrupts: Sequence[Interrupt], resume: Sequence[JsonValue]
+    ) -> None: ...
     def find_writes(self, task: TaskRef) -> TaskWrites | None: ...
+    def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad: ...
     async def enter_child(
         self, child: "CompiledGraph[object, Never, object]", call: NodeCall
     ) -> "tuple[Position, Journal]": ...
@@ -108,8 +122,16 @@ class NoJournal:
     async def record(self, task: TaskRef, writes: TaskWrites) -> None:
         pass
 
+    async def record_interrupt(
+        self, task: TaskRef, interrupts: Sequence[Interrupt], resume: Sequence[JsonValue]
+    ) -> None:
+        pass
+
     def find_writes(self, task: TaskRef) -> TaskWrites | None:
         return None
+
+    def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad:
+        return Scratchpad(str(task.node), [], resume, 0)
 
     async def enter_child(
         self, child: "CompiledGraph[object, Never, object]", call: NodeCall
@@ -126,12 +148,24 @@ class CompiledGraph[StateT, InputT, OutputT]:
     entry_nodes: frozenset[str]
 
     async def ainvoke(self, input: InputT, *, step_limit: int | None = None) -> OutputT:
-        return await self.run(self.feed(self.open({}), extract_writes(input)), step_limit, NoJournal())
+        start = self.feed(self.open({}), extract_writes(input))
+        result = await self.run(start, step_limit, NoJournal(), ResumeInput([], {}))
+        match result:
+            case Finished():
+                return result.output
+            case Interrupted():
+                raise RuntimeError(
+                    f"the run stopped at {result.interrupts!r}, and only a graph with a checkpointer can continue it"
+                )
+            case _:
+                assert_never(result)
 
-    async def run(self, position: Position, step_limit: int | None, journal: Journal) -> OutputT:
+    async def run(
+        self, position: Position, step_limit: int | None, journal: Journal, resume: ResumeInput
+    ) -> Finished[OutputT] | Interrupted:
         limit = RunSettings().step_limit if step_limit is None else step_limit
         async with AsyncExitStack() as run_exits:
-            return await self.run_steps(position, Run({}, run_exits, asyncio.Lock(), limit), journal)
+            return await self.run_steps(position, Run({}, run_exits, asyncio.Lock(), limit, resume), journal)
 
     def find_async_nodes(self) -> list[str]:
         names: list[str] = []
@@ -203,7 +237,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
             case _:
                 assert_never(task)
 
-    async def run_steps(self, start: Position, run: Run, journal: Journal) -> OutputT:
+    async def run_steps(self, start: Position, run: Run, journal: Journal) -> Finished[OutputT] | Interrupted:
         position = start
         steps = 0
         while tasks := plan_tasks(position, self.triggers):
@@ -213,15 +247,21 @@ class CompiledGraph[StateT, InputT, OutputT]:
                     raise RuntimeError(f"the graph did not finish within {run.step_limit} steps")
                 steps += 1
             async with AsyncExitStack() as step_exits:
-                writes = await self.run_step(calls, run, journal, step_exits)
+                results = await self.run_step(calls, run, journal, step_exits)
+                interrupts = [
+                    item for result in results if isinstance(result, Interrupted) for item in result.interrupts
+                ]
+                if interrupts:
+                    return Interrupted(tuple(interrupts))
+                writes = [result for result in results if isinstance(result, TaskWrites)]
                 position = apply_writes(position, tasks, writes, [], self.trigger_keys)
                 await journal.save(position, CheckpointSource.loop)
         values = position.channels.read_values()
-        return self.output_schema(**{name: values[name] for name in self.output_fields if name in values})
+        return Finished(self.output_schema(**{name: values[name] for name in self.output_fields if name in values}))
 
     async def run_step(
         self, calls: Sequence[NodeCall], run: Run, journal: Journal, step_exits: AsyncExitStack
-    ) -> list[TaskWrites]:
+    ) -> list[TaskWrites | Interrupted]:
         try:
             async with asyncio.TaskGroup() as group:
                 tasks = [group.create_task(self.run_task(call, run, journal, step_exits)) for call in calls]
@@ -231,11 +271,19 @@ class CompiledGraph[StateT, InputT, OutputT]:
             raise
         return [task.result() for task in tasks]
 
-    async def run_task(self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack) -> TaskWrites:
+    async def run_task(
+        self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack
+    ) -> TaskWrites | Interrupted:
         saved = journal.find_writes(call.task)
         if saved is not None:
             return saved
-        writes = await self.run_node(call, run, journal, step_exits)
+        scratchpad = journal.open_scratchpad(call.task, run.resume)
+        current_scratchpad.set(scratchpad)
+        try:
+            writes = await self.run_node(call, run, journal, step_exits)
+        except GraphInterrupt as stop:
+            await finish_despite_cancellation(journal.record_interrupt(call.task, stop.interrupts, scratchpad.resume))
+            return Interrupted(stop.interrupts)
         await finish_despite_cancellation(journal.record(call.task, writes))
         return writes
 
@@ -252,7 +300,14 @@ class CompiledGraph[StateT, InputT, OutputT]:
                         return await self.call_function(action, name, call, run, step_exits)
                     case CompiledGraph():
                         start, child_journal = await journal.enter_child(action, call)
-                        return self.read_writes(name, await action.run_steps(start, run, child_journal))
+                        result = await action.run_steps(start, run, child_journal)
+                        match result:
+                            case Finished():
+                                return self.read_writes(name, result.output)
+                            case Interrupted():
+                                raise GraphInterrupt(result.interrupts)
+                            case _:
+                                assert_never(result)
                     case _:
                         assert_never(action)
             case _:

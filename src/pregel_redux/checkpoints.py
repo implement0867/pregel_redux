@@ -1,9 +1,11 @@
 from dataclasses import dataclass, field
-from enum import Enum
-from typing import Protocol
+from enum import Enum, StrEnum
+from typing import Annotated, Literal, Protocol
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, JsonValue
+from pydantic import BaseModel, ConfigDict, Field, JsonValue
+
+from pregel_redux.interrupts import Interrupt
 
 
 class CheckpointSource(Enum):
@@ -33,9 +35,32 @@ class SavedWrites(Record):
     sends: tuple[PendingSend, ...]
 
 
-class PendingWrite(Record):
+class PendingKind(StrEnum):
+    writes = "writes"
+    interrupt = "interrupt"
+    resume = "resume"
+
+
+class TaskWritesRecord(Record):
+    kind: Literal[PendingKind.writes] = PendingKind.writes
     task_id: str
     writes: SavedWrites
+
+
+class TaskInterruptRecord(Record):
+    kind: Literal[PendingKind.interrupt] = PendingKind.interrupt
+    task_id: str
+    interrupts: tuple[Interrupt, ...]
+    resume: tuple[JsonValue, ...]
+
+
+class RunResumeRecord(Record):
+    kind: Literal[PendingKind.resume] = PendingKind.resume
+    task_id: None = None
+    value: JsonValue
+
+
+type PendingWrite = Annotated[TaskWritesRecord | TaskInterruptRecord | RunResumeRecord, Field(discriminator="kind")]
 
 
 class SavedBranch(Record):
@@ -112,7 +137,9 @@ class InMemoryCheckpointer:
         records = self.threads[thread_id][checkpoint_ns]
         saved = [CheckpointTuple.model_validate_json(record) for record in records]
         index = next(index for index, item in enumerate(saved) if item.checkpoint.id == checkpoint_id)
-        kept = tuple(item for item in saved[index].pending_writes if item.task_id != write.task_id)
+        kept = tuple(
+            item for item in saved[index].pending_writes if (item.kind, item.task_id) != (write.kind, write.task_id)
+        )
         records[index] = CheckpointTuple(
             checkpoint=saved[index].checkpoint, pending_writes=(*kept, write)
         ).model_dump_json()
