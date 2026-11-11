@@ -289,6 +289,50 @@ def test_graph_that_does_not_finish_within_the_step_limit_raises(step_limit: int
         asyncio.run(graph.ainvoke({}, step_limit=step_limit))
 
 
+@pytest.mark.parametrize("step_limit", [1, 3])
+def test_step_limit_of_the_environment_applies_when_the_call_gives_no_limit(
+    step_limit: int, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """
+    Arrange: a graph that does not finish, and a step limit in the environment.
+    Act: run the graph without a step limit argument.
+    Assert: the run stops at the step limit of the environment.
+    """
+    monkeypatch.setenv("PREGEL_REDUX_STEP_LIMIT", str(step_limit))
+    graph = build_routed_graph([False] * 100).compile()
+
+    with pytest.raises(RuntimeError, match=f"within {step_limit} steps"):
+        asyncio.run(graph.ainvoke({}))
+
+
+def test_step_limit_of_the_environment_can_be_larger_than_the_default(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Arrange: a graph that needs more steps than the default limit, and a larger limit in the environment.
+    Act: run the graph without a step limit argument.
+    Assert: the run finishes.
+    """
+    monkeypatch.setenv("PREGEL_REDUX_STEP_LIMIT", "1000")
+    graph = build_routed_graph([*[False] * 40, True]).compile()
+
+    actual = asyncio.run(graph.ainvoke({}))
+
+    expected = {"items": ["done"], "failures": 40}
+    assert actual == expected, f"Expected {expected}, got {actual}. The limit of the environment must apply."
+
+
+def test_step_limit_argument_replaces_the_step_limit_of_the_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    """
+    Arrange: a graph that does not finish, and a step limit in the environment.
+    Act: run the graph with a different step limit argument.
+    Assert: the run stops at the step limit of the argument.
+    """
+    monkeypatch.setenv("PREGEL_REDUX_STEP_LIMIT", "1000")
+    graph = build_routed_graph([False] * 100).compile()
+
+    with pytest.raises(RuntimeError, match="within 2 steps"):
+        asyncio.run(graph.ainvoke({}, step_limit=2))
+
+
 @pytest.mark.parametrize(
     "failure",
     [LookupError("no value"), ValueError("wrong value"), KeyError("key")],
