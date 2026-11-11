@@ -7,7 +7,7 @@ from types import new_class
 from typing import Annotated, NotRequired, TypedDict
 
 import pytest
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict, Field, PydanticSchemaGenerationError
 
 from pregel_redux import Depends
 from pregel_redux.channels import (
@@ -39,7 +39,33 @@ class ModelState[T](BaseModel):
 
 
 class AppendState(TypedDict):
-    items: Annotated[list[int], Reducer(append_item, initial_factory=list)]
+    items: Annotated[list[object], Reducer(append_item, initial_factory=list)]
+
+
+class Total(BaseModel):
+    count: int
+
+
+class TotalState(TypedDict):
+    total: Total
+
+
+class Connection:
+    pass
+
+
+class ConnectionDict(TypedDict):
+    connections: list[Connection]
+
+
+@dataclass
+class ConnectionDataclass:
+    connection: Connection
+
+
+class ConnectionModel(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+    connection: Connection
 
 
 class OtherInitialFactoryState(TypedDict):
@@ -113,11 +139,11 @@ def test_parameterized_generic_schema_gives_one_typed_channel_per_field(schema: 
     Assert: each channel has the type argument in its value type, and the reducer field has its marker.
     """
     expected = {
-        "items": Channel("items", list[argument], build_marker()),
-        "latest": Channel("latest", argument, None),
+        "items": (list[argument], build_marker()),
+        "latest": (argument, None),
     }
 
-    actual = build_channels(schema)
+    actual = {name: (channel.value_type, channel.reducer) for name, channel in build_channels(schema).items()}
 
     assert actual == expected, f"Expected {expected}, got {actual}. Each field must keep its type argument."
 
@@ -129,9 +155,10 @@ def test_unparameterized_generic_schema_keeps_its_type_parameter() -> None:
     Assert: the value type of the channel contains the type parameter.
     """
     (parameter,) = DictState.__type_params__
-    expected = Channel("items", list[parameter], build_marker())
+    expected = (list[parameter], build_marker())
+    channel = build_channels(DictState)["items"]
 
-    actual = build_channels(DictState)["items"]
+    actual = (channel.value_type, channel.reducer)
 
     assert actual == expected, f"Expected {expected}, got {actual}. The type parameter must stay in the value type."
 
@@ -150,9 +177,10 @@ def test_reducer_marker_at_any_position_gives_the_reducer_of_the_channel(
     Assert: the channel has the marker as its reducer.
     """
     schema = build_schema(Annotated[list[int], *metadata])
-    expected = Channel("items", list[int], build_marker())
+    expected = (list[int], build_marker())
+    channel = build_channels(schema)["items"]
 
-    actual = build_channels(schema)["items"]
+    actual = (channel.value_type, channel.reducer)
 
     assert actual == expected, f"Expected {expected}, got {actual}. The Reducer marker must give the reducer."
 
@@ -171,9 +199,10 @@ def test_annotation_without_a_reducer_marker_gives_a_channel_without_a_reducer(
     Assert: the channel has no reducer.
     """
     schema = build_schema(Annotated[list[int], *metadata])
-    expected = Channel("items", list[int], None)
+    expected = (list[int], None)
+    channel = build_channels(schema)["items"]
 
-    actual = build_channels(schema)["items"]
+    actual = (channel.value_type, channel.reducer)
 
     assert actual == expected, f"Expected {expected}, got {actual}. Only a Reducer marker declares a reducer."
 
@@ -390,14 +419,81 @@ def test_first_write_to_a_reducer_channel_goes_through_the_reducer(
 
 @pytest.mark.parametrize(
     "updates",
-    [[{"latest": 1}, {"latest": 2}], [{"missing": 1}]],
-    ids=["two-writes-without-reducer", "unknown-channel"],
+    [
+        [{"latest": 1}, {"latest": 2}],
+        [{"missing": 1}],
+        [{"latest": "text"}],
+        [{"latest": None}],
+        [{"items": ["text"]}],
+        [{"items": [1]}, {"items": ["text"]}],
+    ],
+    ids=[
+        "two-writes-without-reducer",
+        "unknown-channel",
+        "value-of-another-type",
+        "none",
+        "reducer-result-of-another-type",
+        "second-reducer-result-of-another-type",
+    ],
 )
 def test_invalid_writes_are_rejected(channels: dict[str, Channel], updates: Sequence[Mapping[str, object]]) -> None:
     """
-    Arrange: updates with two writes to a channel without a reducer, or a write to an unknown channel.
+    Arrange: updates with two writes to a channel without a reducer, a write to an unknown channel,
+        or a write that gives a value that is not of the declared type of the channel.
     Act: apply the updates.
     Assert: a ValueError is raised.
     """
     with pytest.raises(ValueError):
         apply_writes(channels, {"items": []}, updates)
+
+
+@pytest.mark.parametrize(
+    "written",
+    [Total(count=1), {"count": 1}, {"count": "1"}],
+    ids=["model-instance", "mapping-of-the-fields", "mapping-with-a-number-as-text"],
+)
+def test_written_value_is_stored_as_the_declared_type_of_the_channel(written: object) -> None:
+    """
+    Arrange: the channels of a schema with a field whose type is a Pydantic model.
+    Act: apply a write that Pydantic can parse into the model.
+    Assert: the channel holds an instance of the model.
+    """
+    channels = build_channels(TotalState)
+
+    actual = apply_writes(channels, {}, [{"total": written}])["total"]
+
+    assert actual == Total(count=1), (
+        f"Expected Total(count=1), got {actual!r}. The channel must hold its declared type."
+    )
+
+
+@pytest.mark.parametrize(
+    ("written", "expectation"),
+    [(1, does_not_raise()), (0, pytest.raises(ValueError)), (-1, pytest.raises(ValueError))],
+    ids=["value-within-the-constraint", "value-at-the-limit", "value-outside-the-constraint"],
+)
+def test_constraint_in_the_annotation_of_a_field_applies_to_its_channel(
+    build_schema: Callable[[object], object], written: int, expectation: AbstractContextManager[object]
+) -> None:
+    """
+    Arrange: a schema of each kind with a field that has a Pydantic constraint in its annotation.
+    Act: apply a write to the channel of the field.
+    Assert: a ValueError is raised only when the value does not satisfy the constraint.
+    """
+    channels = build_channels(build_schema(Annotated[int, Field(gt=0)]))
+
+    with expectation:
+        apply_writes(channels, {}, [{"items": written}])
+
+
+@pytest.mark.parametrize(
+    "schema", [ConnectionDict, ConnectionDataclass, ConnectionModel], ids=["typed-dict", "dataclass", "model"]
+)
+def test_field_of_a_type_that_pydantic_cannot_validate_is_rejected(schema: object) -> None:
+    """
+    Arrange: a schema of each kind with a field whose type is a class for which Pydantic cannot make a validator.
+    Act: build the channels of the schema.
+    Assert: the PydanticSchemaGenerationError of Pydantic is raised.
+    """
+    with pytest.raises(PydanticSchemaGenerationError):
+        build_channels(schema)

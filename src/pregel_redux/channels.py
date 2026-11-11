@@ -1,12 +1,13 @@
 import dataclasses
 from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import (
     Annotated,
     NotRequired,
     Protocol,
     Required,
+    Self,
     TypeVar,
     get_args,
     get_origin,
@@ -16,7 +17,8 @@ from typing import (
     runtime_checkable,
 )
 
-from pydantic import BaseModel
+from pydantic import BaseModel, TypeAdapter, ValidationError
+from typing_extensions import TypeForm
 
 
 class Missing:
@@ -60,14 +62,21 @@ class Channel:
     name: str
     value_type: object
     reducer: Reducer[object, object] | None
+    adapter: TypeAdapter[object] = field(compare=False, repr=False)
+
+    def parse(self, value: object) -> object:
+        try:
+            return self.adapter.validate_python(value)
+        except ValidationError as error:
+            raise ValueError(f"channel {self.name!r} cannot hold {value!r}, its type is {self.value_type!r}") from error
 
 
 @runtime_checkable
 class SubscriptableHint(Protocol):
-    def __getitem__(self, arguments: tuple[object, ...]) -> object: ...
+    def __getitem__(self, arguments: tuple[object, ...]) -> Self: ...
 
 
-def substitute_type_arguments(hint: object, arguments: Mapping[object, object]) -> object:
+def substitute_type_arguments[HintT](hint: HintT, arguments: Mapping[object, HintT]) -> HintT:
     match hint:
         case TypeVar():
             return arguments.get(hint, hint)
@@ -91,15 +100,15 @@ def find_reducer(name: str, metadata: tuple[object, ...]) -> Reducer[object, obj
             raise TypeError(f"field {name!r} has more than one Reducer annotation")
 
 
-def build_channel(name: str, hint: object) -> Channel:
+def build_channel(name: str, hint: TypeForm[object]) -> Channel:
     unwrapped = get_args(hint)[0] if get_origin(hint) in (Required, NotRequired) else hint
     if get_origin(unwrapped) is Annotated:
         value_type, *metadata = get_args(unwrapped)
-        return Channel(name, value_type, find_reducer(name, tuple(metadata)))
-    return Channel(name, unwrapped, None)
+        return Channel(name, value_type, find_reducer(name, tuple(metadata)), TypeAdapter(unwrapped))
+    return Channel(name, unwrapped, None, TypeAdapter(unwrapped))
 
 
-def read_field_hints(schema_class: object) -> dict[str, object]:
+def read_field_hints(schema_class: object) -> dict[str, TypeForm[object]]:
     if is_typeddict(schema_class):
         return get_type_hints(schema_class, include_extras=True)
     if dataclasses.is_dataclass(schema_class):
@@ -112,13 +121,18 @@ def build_channels(schema: object) -> dict[str, Channel]:
     match schema:
         case type() if issubclass(schema, BaseModel):
             return {
-                name: Channel(name, field.annotation, find_reducer(name, tuple(field.metadata)))
-                for name, field in schema.model_fields.items()
+                name: Channel(
+                    name,
+                    info.annotation,
+                    find_reducer(name, tuple(info.metadata)),
+                    TypeAdapter(info.rebuild_annotation()),
+                )
+                for name, info in schema.model_fields.items()
             }
         case _:
             origin = get_origin(schema)
             hints = read_field_hints(schema if origin is None else origin)
-            arguments: dict[object, object] = (
+            arguments: dict[object, TypeForm[object]] = (
                 {} if origin is None else dict(zip(origin.__parameters__, get_args(schema), strict=True))
             )
             return {
@@ -170,12 +184,12 @@ def apply_writes(
     for update in updates:
         reject_unknown_channels(channels, update)
         for name, value in update.items():
-            reducer = channels[name].reducer
-            if reducer is not None:
-                result[name] = reducer.function(result[name], value)
+            channel = channels[name]
+            if channel.reducer is not None:
+                result[name] = channel.parse(channel.reducer.function(result[name], value))
             elif name in written:
                 raise ValueError(f"channel {name!r} received more than one value in one step and it has no reducer")
             else:
-                result[name] = value
+                result[name] = channel.parse(value)
             written.add(name)
     return result
