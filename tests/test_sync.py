@@ -2,17 +2,16 @@ import asyncio
 import threading
 from collections.abc import Callable, Iterator
 from functools import partial
-from operator import add
 from typing import Annotated, TypedDict
 
 import pytest
 
 from pregel_redux import Depends, Endpoint, Reducer, Scope, StateGraph
-from tests.conftest import Journal
+from tests.conftest import Journal, join_lists
 
 
 class State(TypedDict, total=False):
-    released: Annotated[list[bool], Reducer(add)]
+    released: Annotated[list[bool], Reducer(join_lists, initial_factory=list)]
 
 
 def build_blocked_node(wait_for_release: Callable[[], bool]) -> Callable[..., object]:
