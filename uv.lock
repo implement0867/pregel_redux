@@ -188,7 +188,7 @@ wheels = [
 
 [[package]]
 name = "pregel-redux"
-version = "0.2.5"
+version = "0.2.6"
 source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
