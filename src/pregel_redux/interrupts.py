@@ -1,5 +1,6 @@
 from contextvars import ContextVar
 from dataclasses import dataclass
+from typing import assert_never
 
 from pydantic import JsonValue, TypeAdapter
 from typing_extensions import TypeForm
@@ -48,3 +49,21 @@ def interrupt[AnswerT](payload: JsonValue, answer_type: TypeForm[AnswerT]) -> An
     if index >= len(task.answers):
         raise NodeInterrupt(payload)
     return TypeAdapter[AnswerT](answer_type).validate_json(task.answers[index])
+
+
+def find_interruption(group: BaseExceptionGroup) -> NodeInterrupt:
+    interruptions, rest = group.split(NodeInterrupt)
+    if interruptions is None or rest is not None:
+        raise group
+    return first_interruption(interruptions)
+
+
+def first_interruption(group: BaseExceptionGroup[NodeInterrupt]) -> NodeInterrupt:
+    first = group.exceptions[0]
+    match first:
+        case NodeInterrupt():
+            return first
+        case BaseExceptionGroup():
+            return first_interruption(first)
+        case _:
+            assert_never(first)

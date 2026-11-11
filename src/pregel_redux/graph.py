@@ -21,9 +21,23 @@ from pregel_redux.channels import (
     reject_unknown_channels,
 )
 from pregel_redux.checkpoints import CheckpointSource, InterruptedTask, TaskAddress
-from pregel_redux.commands import Endpoint, Send, read_declared_targets, read_outcome
-from pregel_redux.dependencies import CallPlan, Depends, execute_plan, open_providers, plan_call
-from pregel_redux.interrupts import Interrupt, InterruptId, NodeInterrupt, TaskInterrupts, current_interrupts
+from pregel_redux.commands import Endpoint, read_declared_targets, read_outcome
+from pregel_redux.dependencies import (
+    CallPlan,
+    Depends,
+    execute_plan,
+    finish_despite_cancellation,
+    open_providers,
+    plan_call,
+)
+from pregel_redux.interrupts import (
+    Interrupt,
+    InterruptId,
+    NodeInterrupt,
+    TaskInterrupts,
+    current_interrupts,
+    find_interruption,
+)
 
 type Node[InputT] = Callable[Concatenate[InputT, ...], object]
 
@@ -47,7 +61,7 @@ class PullTask:
 @dataclass(frozen=True)
 class PushTask:
     node: str
-    node_input: object
+    payload: object
 
 
 type Task = PullTask | PushTask
@@ -100,9 +114,10 @@ def interrupt_task(task: TaskAddress, node: str, state: InterruptedTask) -> Inte
 
 class Journal(Protocol):
     async def save(self, graph: "CompiledGraph[object, Never, object]", position: Position) -> None: ...
-    async def record(
-        self, graph: "CompiledGraph[object, Never, object]", task: TaskAddress, state: TaskOutput | InterruptedTask
-    ) -> None: ...
+    async def record_output(
+        self, graph: "CompiledGraph[object, Never, object]", task: TaskAddress, output: TaskOutput
+    ) -> TaskOutput: ...
+    async def record_interrupt(self, task: TaskAddress, state: InterruptedTask) -> None: ...
     async def load_latest(
         self, graph: "CompiledGraph[object, Never, object]", caller: TaskAddress | None
     ) -> Position | None: ...
@@ -112,9 +127,12 @@ class Unrecorded:
     async def save(self, graph: "CompiledGraph[object, Never, object]", position: Position) -> None:
         pass
 
-    async def record(
-        self, graph: "CompiledGraph[object, Never, object]", task: TaskAddress, state: TaskOutput | InterruptedTask
-    ) -> None:
+    async def record_output(
+        self, graph: "CompiledGraph[object, Never, object]", task: TaskAddress, output: TaskOutput
+    ) -> TaskOutput:
+        return output
+
+    async def record_interrupt(self, task: TaskAddress, state: InterruptedTask) -> None:
         pass
 
     async def load_latest(
@@ -147,14 +165,22 @@ class CompiledNode:
     def build_input(self, values: Mapping[str, object]) -> object:
         return self.input_schema(**{name: values[name] for name in self.input_fields if name in values})
 
-    def build_send_input(self, send: Send) -> object:
-        payload = send.arg
+    def build_send_input(self, payload: object) -> object:
         match payload:
             case Mapping():
                 fields: dict[str, object] = {**payload}
                 return self.input_schema(**fields)
             case _:
                 return payload
+
+    def build_task_input(self, task: Task, values: Mapping[str, object]) -> object:
+        match task:
+            case PullTask():
+                return self.build_input(values)
+            case PushTask():
+                return self.build_send_input(task.payload)
+            case _:
+                assert_never(task)
 
 
 @dataclass(frozen=True)
@@ -194,7 +220,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
                 assert_never(result)
 
     def invoke(self, input: InputT, *, step_limit: int = 25) -> OutputT:
-        self.reject_async_nodes()
+        self.reject_async_nodes("ainvoke")
         return run_coroutine(lambda: self.ainvoke(input, step_limit=step_limit))
 
     def find_async_nodes(self) -> list[str]:
@@ -210,10 +236,10 @@ class CompiledGraph[StateT, InputT, OutputT]:
                     assert_never(node.action)
         return sorted(names)
 
-    def reject_async_nodes(self) -> None:
+    def reject_async_nodes(self, async_method: str) -> None:
         async_nodes = self.find_async_nodes()
         if async_nodes:
-            raise TypeError(f"nodes {async_nodes!r} have only an async function, so call the async method")
+            raise TypeError(f"nodes {async_nodes!r} have only an async function, so call {async_method}")
 
     def build_state(self, values: Mapping[str, object]) -> StateT:
         return self.state_schema(**{name: values[name] for name in self.state_fields if name in values})
@@ -267,10 +293,11 @@ class CompiledGraph[StateT, InputT, OutputT]:
             if steps == run.step_limit:
                 raise RuntimeError(f"the graph did not finish within {run.step_limit} steps")
             steps += 1
+            node_inputs = [self.nodes[task.node].build_task_input(task, position.values) for task in position.tasks]
             outputs: list[TaskOutput] = []
             interrupts: list[Interrupt] = []
             async with AsyncExitStack() as step_exits:
-                for result in await self.run_step(position, run, step_exits):
+                for result in await self.run_step(position, node_inputs, run, step_exits):
                     match result:
                         case TaskOutput():
                             outputs.append(result)
@@ -286,13 +313,13 @@ class CompiledGraph[StateT, InputT, OutputT]:
         return Finished(self.build_output(position.values))
 
     async def run_step(
-        self, position: Position, run: Run, step_exits: AsyncExitStack
+        self, position: Position, node_inputs: Sequence[object], run: Run, step_exits: AsyncExitStack
     ) -> list[TaskOutput | Interrupted]:
         try:
             async with asyncio.TaskGroup() as group:
                 tasks = [
-                    group.create_task(self.run_task(position, index, run, step_exits))
-                    for index in range(len(position.tasks))
+                    group.create_task(self.run_task(position, index, node_input, run, step_exits))
+                    for index, node_input in enumerate(node_inputs)
                 ]
         except ExceptionGroup as failures:
             if len(failures.exceptions) == 1:
@@ -301,76 +328,75 @@ class CompiledGraph[StateT, InputT, OutputT]:
         return [task.result() for task in tasks]
 
     async def run_task(
-        self, position: Position, index: int, run: Run, step_exits: AsyncExitStack
+        self, position: Position, index: int, node_input: object, run: Run, step_exits: AsyncExitStack
     ) -> TaskOutput | Interrupted:
         address = TaskAddress(checkpoint_id=position.checkpoint_id, index=index)
-        task = position.tasks[index]
+        node_name = position.tasks[index].node
         recorded = position.progress.get(index)
         match recorded:
             case TaskOutput():
                 return recorded
             case InterruptedTask() if address not in run.answers:
-                return interrupt_task(address, task.node, recorded)
+                return interrupt_task(address, node_name, recorded)
             case InterruptedTask() | None:
-                return await self.execute_task(position, address, task, run, step_exits)
+                return await self.execute_task(address, node_name, node_input, run, step_exits)
             case _:
                 assert_never(recorded)
 
     async def execute_task(
-        self, position: Position, address: TaskAddress, task: Task, run: Run, step_exits: AsyncExitStack
+        self, address: TaskAddress, node_name: str, node_input: object, run: Run, step_exits: AsyncExitStack
     ) -> TaskOutput | Interrupted:
-        node = self.nodes[task.node]
-        match task:
-            case PullTask():
-                node_input = node.build_input(position.values)
-            case PushTask():
-                node_input = task.node_input
-            case _:
-                assert_never(task)
+        node = self.nodes[node_name]
         match node.action:
             case CallPlan() as plan:
                 answers = run.answers.get(address, ())
                 current_interrupts.set(TaskInterrupts(answers))
-                try:
-                    output = await self.call_function(plan, node, node_input, run, step_exits)
-                except NodeInterrupt as interruption:
-                    state = InterruptedTask(answers=answers, payload=interruption.payload)
-                    await run.journal.record(self, address, state)
-                    return interrupt_task(address, task.node, state)
+                result = await self.call_function(plan, node, node_input, run, step_exits)
+                match result:
+                    case NodeInterrupt():
+                        state = InterruptedTask(answers=answers, payload=result.payload)
+                        await finish_despite_cancellation(run.journal.record_interrupt(address, state))
+                        return interrupt_task(address, node_name, state)
+                    case TaskOutput():
+                        output = result
+                    case _:
+                        assert_never(result)
             case CompiledGraph() as child:
                 start = await child.enter(run.journal, address, node_input)
-                result = await child.run_steps(start, run)
-                match result:
+                child_result = await child.run_steps(start, run)
+                match child_result:
                     case Finished(output=child_output):
                         output = self.read_task_output(child_output, node)
                     case Interrupted():
-                        return result
+                        return child_result
                     case _:
-                        assert_never(result)
+                        assert_never(child_result)
             case _:
                 assert_never(node.action)
-        await run.journal.record(self, address, output)
-        return output
+        return await finish_despite_cancellation(run.journal.record_output(self, address, output))
 
     def read_task_output(self, result: object, node: CompiledNode) -> TaskOutput:
         outcome = read_outcome(result, node.targets, self.nodes.keys())
-        pushes = tuple(
-            PushTask(send.node, self.nodes[send.node].build_send_input(send)) for send in outcome.routes.sends
-        )
+        pushes = tuple(PushTask(send.node, send.arg) for send in outcome.routes.sends)
         return TaskOutput(outcome.writes, outcome.routes.targets, pushes)
 
     async def call_function(
         self, plan: CallPlan, node: CompiledNode, node_input: object, run: Run, step_exits: AsyncExitStack
-    ) -> TaskOutput:
+    ) -> TaskOutput | NodeInterrupt:
         if plan.run_providers:
             async with run.lock:
                 await open_providers(plan.run_providers, run.values, run.exits)
         node_values = ChainMap[Depends, object]({}, dict(run.values))
         output: TaskOutput | None = None
-        async with AsyncExitStack[bool]() as node_exits:
-            result = await execute_plan(plan, node_input, node_values, node_exits)
-            output = self.read_task_output(result, node)
-            step_exits.push_async_callback(node_exits.pop_all().aclose)
+        try:
+            async with AsyncExitStack[bool]() as node_exits:
+                result = await execute_plan(plan, node_input, node_values, node_exits)
+                output = self.read_task_output(result, node)
+                step_exits.push_async_callback(node_exits.pop_all().aclose)
+        except NodeInterrupt as interruption:
+            return interruption
+        except BaseExceptionGroup as group:
+            return find_interruption(group)
         if output is None:
             raise RuntimeError(f"a dependency of {plan.function!r} suppressed the exception of its node")
         return output

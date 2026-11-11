@@ -193,6 +193,7 @@ source = { editable = "." }
 dependencies = [
     { name = "pydantic" },
     { name = "typing-extensions" },
+    { name = "typing-inspection" },
 ]
 
 [package.dev-dependencies]
@@ -207,6 +208,7 @@ dev = [
 requires-dist = [
     { name = "pydantic", specifier = ">=2.14.3" },
     { name = "typing-extensions", specifier = ">=4.16.0" },
+    { name = "typing-inspection", specifier = ">=0.4.2" },
 ]
 
 [package.metadata.requires-dev]

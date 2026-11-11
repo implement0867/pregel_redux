@@ -1,7 +1,8 @@
-from collections.abc import Callable, Mapping, Sequence
+from collections.abc import Callable, Collection, Iterable, Mapping, Sequence
 from contextlib import AbstractContextManager
 from contextlib import nullcontext as does_not_raise
 from dataclasses import dataclass, field, make_dataclass
+from datetime import datetime
 from operator import add, mul
 from types import new_class
 from typing import Annotated, NotRequired, TypedDict, TypeVar
@@ -518,6 +519,25 @@ def keep_pair[T](current: tuple[T, T], update: T) -> tuple[T, T]:
     return (current[1], update)
 
 
+def keep_latest[T](current: T | None, update: T) -> T:
+    return update
+
+
+def extend_with_iterable[T](current: list[T], update: Iterable[T]) -> list[T]:
+    return [*current, *update]
+
+
+def extend_with_collection[T](current: list[T], update: Collection[T]) -> list[T]:
+    return [*current, *update]
+
+
+def set_entry[T](current: dict[str, T], update: T) -> dict[str, T]:
+    return {**current, "latest": update}
+
+
+type Stamps = list[datetime]
+
+
 @pytest.mark.parametrize(
     ("reducer", "value_type", "expected"),
     [
@@ -532,6 +552,12 @@ def keep_pair[T](current: tuple[T, T], update: T) -> tuple[T, T]:
         (Reducer(max, initial=0), int, int),
         (Reducer(add, initial=0), int, int),
         (Reducer[tuple[int, int], int](keep_pair, initial=(0, 0)), tuple[int, ...], int),
+        (Reducer[Sequence[int], int](take_first, initial_factory=list), list[int], int),
+        (Reducer[datetime | None, datetime](keep_latest, initial=None), datetime | None, datetime),
+        (Reducer[datetime | None, datetime](keep_latest, initial=None), None | datetime, datetime),
+        (Reducer[list[datetime], datetime](append_item, initial_factory=list), Stamps, datetime),
+        (Reducer[list[str], list[str]](extend_with_iterable, initial_factory=list), list[str], list[str]),
+        (Reducer[list[str], list[str]](extend_with_collection, initial_factory=list), list[str], list[str]),
     ],
     ids=[
         "same-type-variable",
@@ -541,6 +567,12 @@ def keep_pair[T](current: tuple[T, T], update: T) -> tuple[T, T]:
         "builtin",
         "no-annotations",
         "variadic-tuple",
+        "abstract-base-of-the-channel-type",
+        "optional-channel",
+        "optional-channel-with-none-first",
+        "type-alias",
+        "iterable-update",
+        "collection-update",
     ],
 )
 def test_update_type_of_a_reducer_is_the_type_of_its_update_parameter(
@@ -554,10 +586,11 @@ def test_update_type_of_a_reducer_is_the_type_of_its_update_parameter(
 @pytest.mark.parametrize(
     ("reducer", "value_type"),
     [
-        (Reducer[Sequence[int], int](take_first, initial_factory=list), list[int]),
+        (Reducer[dict[str, int], int](set_entry, initial_factory=dict), list[int]),
         (Reducer[tuple[int, int], int](keep_pair, initial=(0, 0)), tuple[int, int, int]),
+        (Reducer[int | str | None, int | str](keep_latest, initial=None), int | str | None),
     ],
-    ids=["other-origin", "longer-tuple"],
+    ids=["other-origin", "longer-tuple", "two-members-left"],
 )
 def test_type_variable_that_the_channel_type_does_not_bind_stays_in_the_update_type(
     reducer: Reducer[object, object], value_type: TypeForm[object]

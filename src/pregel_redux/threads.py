@@ -1,4 +1,4 @@
-from collections.abc import Iterable, Mapping
+from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from functools import cached_property
@@ -21,6 +21,7 @@ from pregel_redux.checkpoints import (
     TaskStateKind,
     dump_value,
 )
+from pregel_redux.dependencies import CallPlan
 from pregel_redux.graph import (
     CompiledGraph,
     Position,
@@ -43,9 +44,23 @@ def reject_unknown_nodes(graph: AnyGraph, names: Iterable[str]) -> None:
         raise ValueError(f"the checkpoint refers to {unknown!r}, which are not nodes of this graph")
 
 
+def settle_output(graph: AnyGraph, output: TaskOutput) -> TaskOutput:
+    reject_unknown_channels(graph.channels, output.writes)
+    return TaskOutput(
+        {name: graph.channels[name].parse_update(value) for name, value in output.writes.items()},
+        output.targets,
+        tuple(PushTask(push.node, graph.nodes[push.node].build_send_input(push.payload)) for push in output.pushes),
+    )
+
+
 def encode_push(graph: AnyGraph, push: PushTask) -> SendTask:
-    node_input = dump_value(graph.nodes[push.node].input_adapter, push.node_input, f"a send to node {push.node!r}")
+    node = graph.nodes[push.node]
+    node_input = dump_value(node.input_adapter, node.build_send_input(push.payload), f"a send to node {push.node!r}")
     return SendTask(node=push.node, node_input=node_input)
+
+
+def decode_push(graph: AnyGraph, send: SendTask) -> PushTask:
+    return PushTask(send.node, graph.nodes[send.node].input_adapter.validate_json(send.node_input, by_name=True))
 
 
 def encode_task(graph: AnyGraph, task: Task) -> EdgeTask | SendTask:
@@ -63,27 +78,20 @@ def decode_task(graph: AnyGraph, task: EdgeTask | SendTask) -> Task:
         case EdgeTask():
             return PullTask(task.node)
         case SendTask():
-            return PushTask(task.node, graph.nodes[task.node].input_adapter.validate_json(task.node_input))
+            return decode_push(graph, task)
         case _:
             assert_never(task)
 
 
-def encode_task_state(graph: AnyGraph, state: TaskOutput | InterruptedTask) -> CompletedTask | InterruptedTask:
-    match state:
-        case TaskOutput():
-            reject_unknown_channels(graph.channels, state.writes)
-            return CompletedTask(
-                writes={
-                    name: dump_value(graph.channels[name].update_adapter, value, f"a write to channel {name!r}")
-                    for name, value in state.writes.items()
-                },
-                targets=tuple(sorted(state.targets)),
-                sends=tuple(encode_push(graph, push) for push in state.pushes),
-            )
-        case InterruptedTask():
-            return state
-        case _:
-            assert_never(state)
+def encode_output(graph: AnyGraph, output: TaskOutput) -> CompletedTask:
+    return CompletedTask(
+        writes={
+            name: dump_value(graph.channels[name].update_adapter, value, f"a write to channel {name!r}")
+            for name, value in output.writes.items()
+        },
+        targets=tuple(sorted(output.targets)),
+        sends=tuple(encode_push(graph, push) for push in output.pushes),
+    )
 
 
 def decode_task_state(graph: AnyGraph, state: CompletedTask | InterruptedTask) -> TaskOutput | InterruptedTask:
@@ -92,12 +100,12 @@ def decode_task_state(graph: AnyGraph, state: CompletedTask | InterruptedTask) -
             reject_unknown_channels(graph.channels, state.writes)
             reject_unknown_nodes(graph, [*state.targets, *(send.node for send in state.sends)])
             return TaskOutput(
-                {name: graph.channels[name].update_adapter.validate_json(data) for name, data in state.writes.items()},
+                {
+                    name: graph.channels[name].update_adapter.validate_json(data, by_name=True)
+                    for name, data in state.writes.items()
+                },
                 frozenset(state.targets),
-                tuple(
-                    PushTask(send.node, graph.nodes[send.node].input_adapter.validate_json(send.node_input))
-                    for send in state.sends
-                ),
+                tuple(decode_push(graph, send) for send in state.sends),
             )
         case InterruptedTask():
             return state
@@ -132,10 +140,36 @@ def decode_checkpoint(graph: AnyGraph, saved: SavedCheckpoint) -> Position:
         caller=checkpoint.caller,
         step=checkpoint.step,
         source=checkpoint.source,
-        values={name: graph.channels[name].adapter.validate_json(data) for name, data in checkpoint.values.items()},
+        values={
+            name: graph.channels[name].adapter.validate_json(data, by_name=True)
+            for name, data in checkpoint.values.items()
+        },
         tasks=tuple(decode_task(graph, task) for task in checkpoint.tasks),
         progress={index: decode_task_state(graph, state) for index, state in saved.task_states.items()},
     )
+
+
+def close_step(graph: AnyGraph, source: Position, as_node: str, update: object) -> list[TaskOutput]:
+    if as_node not in graph.nodes:
+        raise ValueError(f"{as_node!r} is not a node of this graph")
+    finished: list[TaskOutput] = []
+    unfinished: set[str] = set()
+    for index, task in enumerate(source.tasks):
+        recorded = source.progress.get(index)
+        match recorded:
+            case _ if task.node == as_node:
+                pass
+            case TaskOutput():
+                finished.append(recorded)
+            case InterruptedTask() | None:
+                unfinished.add(task.node)
+            case _:
+                assert_never(recorded)
+    if unfinished:
+        raise ValueError(
+            f"the tasks of {sorted(unfinished)!r} have not finished, so resume them or update without as_node"
+        )
+    return [*finished, settle_output(graph, graph.read_task_output(update, graph.nodes[as_node]))]
 
 
 @dataclass(frozen=True)
@@ -152,8 +186,13 @@ class ThreadJournal:
     async def save(self, graph: AnyGraph, position: Position) -> None:
         await self.checkpointer.put_checkpoint(encode_position(graph, position, self.thread_id))
 
-    async def record(self, graph: AnyGraph, task: TaskAddress, state: TaskOutput | InterruptedTask) -> None:
-        await self.checkpointer.put_task_state(self.thread_id, task, encode_task_state(graph, state))
+    async def record_output(self, graph: AnyGraph, task: TaskAddress, output: TaskOutput) -> TaskOutput:
+        settled = settle_output(graph, output)
+        await self.checkpointer.put_task_state(self.thread_id, task, encode_output(graph, settled))
+        return settled
+
+    async def record_interrupt(self, task: TaskAddress, state: InterruptedTask) -> None:
+        await self.checkpointer.put_task_state(self.thread_id, task, state)
 
     async def load_latest(self, graph: AnyGraph, caller: TaskAddress | None) -> Position | None:
         saved = await self.read_latest(caller)
@@ -168,18 +207,29 @@ class ThreadJournal:
         for index, task in enumerate(saved.checkpoint.tasks):
             address = TaskAddress(checkpoint_id=saved.checkpoint.id, index=index)
             state = saved.task_states.get(index)
-            match state, graph.nodes[task.node].action:
-                case InterruptedTask(), _:
+            match state:
+                case InterruptedTask():
                     interrupt_id = InterruptId(task=address, index=len(state.answers))
                     interrupt = Interrupt(interrupt_id=interrupt_id, node=task.node, payload=state.payload)
                     pending.append(PendingInterrupt(interrupt, state.answers))
-                case None, CompiledGraph() as child:
-                    child_saved = await self.read_latest(address)
-                    if child_saved is not None:
-                        pending.extend(await self.find_interrupts(child, child_saved))
-                case _:
+                case CompletedTask():
                     pass
+                case None:
+                    pending.extend(await self.find_child_interrupts(graph, task.node, address))
+                case _:
+                    assert_never(state)
         return pending
+
+    async def find_child_interrupts(self, graph: AnyGraph, node: str, address: TaskAddress) -> list[PendingInterrupt]:
+        action = graph.nodes[node].action
+        match action:
+            case CompiledGraph():
+                child_saved = await self.read_latest(address)
+                return [] if child_saved is None else await self.find_interrupts(action, child_saved)
+            case CallPlan():
+                return []
+            case _:
+                assert_never(action)
 
 
 @dataclass(frozen=True)
@@ -247,19 +297,18 @@ class Thread[StateT, InputT, OutputT]:
         self, update: object, *, as_node: str | None = None, checkpoint_id: UUID | None = None
     ) -> UUID:
         source = decode_checkpoint(self.graph, await self.require_root(checkpoint_id))
+        updates: Sequence[Mapping[str, object]]
         match as_node:
             case None:
-                writes: Mapping[str, object] = extract_writes(update)
+                updates = [extract_writes(update)]
                 tasks = source.tasks
             case str():
-                if as_node not in self.graph.nodes:
-                    raise ValueError(f"{as_node!r} is not a node of this graph")
-                output = self.graph.read_task_output(update, self.graph.nodes[as_node])
-                writes = output.writes
-                tasks = plan_tasks([output])
+                outputs = close_step(self.graph, source, as_node, update)
+                updates = [output.writes for output in outputs]
+                tasks = plan_tasks(outputs)
             case _:
                 assert_never(as_node)
-        values = apply_writes(self.graph.channels, source.values, [writes])
+        values = apply_writes(self.graph.channels, source.values, updates)
         position = source.follow(CheckpointSource.update, values, tasks)
         await self.journal.save(self.graph, position)
         return position.checkpoint_id
@@ -286,15 +335,15 @@ class Thread[StateT, InputT, OutputT]:
         await self.checkpointer.delete_thread(self.thread_id)
 
     def invoke(self, input: InputT, *, step_limit: int = 25) -> RunResult[OutputT]:
-        self.graph.reject_async_nodes()
+        self.graph.reject_async_nodes("ainvoke")
         return run_coroutine(lambda: self.ainvoke(input, step_limit=step_limit))
 
     def resume(self, *answers: Answer, step_limit: int = 25) -> RunResult[OutputT]:
-        self.graph.reject_async_nodes()
+        self.graph.reject_async_nodes("aresume")
         return run_coroutine(lambda: self.aresume(*answers, step_limit=step_limit))
 
     def replay(self, checkpoint_id: UUID, *, step_limit: int = 25) -> RunResult[OutputT]:
-        self.graph.reject_async_nodes()
+        self.graph.reject_async_nodes("areplay")
         return run_coroutine(lambda: self.areplay(checkpoint_id, step_limit=step_limit))
 
     def update_state(self, update: object, *, as_node: str | None = None, checkpoint_id: UUID | None = None) -> UUID:

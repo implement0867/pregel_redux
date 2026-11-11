@@ -25,6 +25,7 @@ from pregel_redux import (
     Thread,
     interrupt,
 )
+from pregel_redux.checkpoints import TaskAddress, TaskState
 from tests.conftest import Journal, append_item, join_lists
 
 
@@ -77,7 +78,7 @@ class PetState(TypedDict, total=False):
 type Builder = StateGraph[State, State, State]
 
 
-def run_until_done(result: RunResult[State]) -> State:
+def run_until_done[OutputT](result: RunResult[OutputT]) -> OutputT:
     match result:
         case Finished(output=output):
             return output
@@ -85,7 +86,7 @@ def run_until_done(result: RunResult[State]) -> State:
             raise AssertionError(f"Expected the run to finish, it stopped at {interrupts!r}.")
 
 
-def read_interrupted(result: RunResult[State]) -> Interrupted:
+def read_interrupted[OutputT](result: RunResult[OutputT]) -> Interrupted:
     match result:
         case Interrupted():
             return result
@@ -742,9 +743,12 @@ def replay_the_last_checkpoint(thread: Thread[State, State, State]) -> object:
     return thread.replay(thread.history()[0].checkpoint.id)
 
 
-@pytest.mark.parametrize("call", [invoke_again, resume_again, replay_the_last_checkpoint])
+@pytest.mark.parametrize(
+    ("call", "async_method"),
+    [(invoke_again, "ainvoke"), (resume_again, "aresume"), (replay_the_last_checkpoint, "areplay")],
+)
 def test_sync_run_of_a_thread_rejects_a_graph_that_has_an_async_node(
-    call: Callable[[Thread[State, State, State]], object],
+    call: Callable[[Thread[State, State, State]], object], async_method: str
 ) -> None:
     async def write_async(state: State) -> State:
         return {}
@@ -755,5 +759,208 @@ def test_sync_run_of_a_thread_rejects_a_graph_that_has_an_async_node(
     thread = build_thread(builder)
     asyncio.run(thread.ainvoke({}))
 
-    with pytest.raises(TypeError):
+    with pytest.raises(TypeError, match=async_method):
         call(thread)
+
+
+def build_sibling_graph(journal: Journal, sibling: Callable[[State], State]) -> Builder:
+    builder = StateGraph(State)
+    builder.add_node("ask", build_asker(journal, "ask", 1))
+    builder.add_node("sibling", sibling)
+    builder.add_node("after_ask", build_writer(journal, "after_ask"))
+    builder.add_node("after_sibling", build_writer(journal, "after_sibling"))
+    builder.add_edge(Endpoint.start, "ask")
+    builder.add_edge(Endpoint.start, "sibling")
+    builder.add_edge("ask", "after_ask")
+    builder.add_edge("sibling", "after_sibling")
+    return builder
+
+
+def test_update_as_a_node_keeps_the_outcomes_of_its_finished_siblings(journal: Journal) -> None:
+    thread = build_thread(build_sibling_graph(journal, build_writer(journal, "sibling")))
+    read_interrupted(thread.invoke({}))
+
+    thread.update_state({"items": ["edit"]}, as_node="ask")
+    state = thread.get_state()
+    output = run_until_done(thread.resume())
+
+    assert state is not None, "Expected the saved state."
+    assert state.next == ("after_ask", "after_sibling"), f"Expected the successors of both nodes, got {state.next}."
+    assert output == {"items": ["sibling", "edit", "after_ask", "after_sibling"]}, f"Expected all writes, got {output}."
+    assert sorted(journal.events) == ["after_ask", "after_sibling", "ask", "sibling"], (
+        f"Expected the finished sibling not to run again, got {journal.events}."
+    )
+
+
+def test_update_as_a_node_while_another_task_waits_is_rejected(journal: Journal) -> None:
+    thread = build_thread(build_sibling_graph(journal, build_asker(journal, "sibling", 1)))
+    read_interrupted(thread.invoke({}))
+
+    with pytest.raises(ValueError):
+        thread.update_state({"items": ["edit"]}, as_node="ask")
+
+
+def test_update_without_a_node_runs_every_planned_task_again(journal: Journal) -> None:
+    thread = build_thread(build_sibling_graph(journal, build_writer(journal, "sibling")))
+    read_interrupted(thread.invoke({}))
+
+    thread.update_state({"topic": "edited"})
+    state = thread.get_state()
+
+    assert state is not None, "Expected the saved state."
+    assert state.next == ("ask", "sibling"), f"Expected both planned tasks to run again, got {state.next}."
+    assert state.interrupts == (), f"Expected the old interrupt to be gone, got {state.interrupts}."
+
+
+class Point(BaseModel):
+    x: int
+    y: int
+
+
+class CoercedState(TypedDict, total=False):
+    items: list[int]
+    point: Point
+    count: int
+
+
+@pytest.mark.parametrize(
+    "write",
+    [{"items": (1, 2)}, {"point": {"x": 1, "y": 2}}, {"count": "3"}],
+    ids=["tuple-into-a-list", "dict-into-a-model", "string-into-an-int"],
+)
+def test_thread_accepts_the_writes_that_a_plain_run_parses(write: dict[str, object]) -> None:
+    builder = StateGraph(CoercedState)
+    builder.add_node("write", lambda state: write)
+    builder.add_edge(Endpoint.start, "write")
+    graph = builder.compile()
+    expected = Finished(graph.invoke({}))
+
+    actual = Thread(graph=graph, checkpointer=InMemoryCheckpointer(), thread_id="thread").invoke({})
+
+    assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+class LimitState(TypedDict, total=False):
+    name: str
+    limit: int
+
+
+class LimitRequest(BaseModel):
+    name: str
+    limit: int = 10
+
+
+def test_send_payload_keeps_its_unset_fields_unset_after_a_resume() -> None:
+    failures: list[Exception] = [LookupError("fail one time")]
+
+    def review(request: LimitRequest) -> LimitRequest:
+        if failures:
+            raise failures.pop(0)
+        return request
+
+    builder = StateGraph(LimitState)
+    builder.add_node("plan", lambda state: Command[str](goto=Send("review", LimitRequest(name="cats"))))
+    builder.add_node("review", review, input_schema=LimitRequest)
+    builder.add_edge(Endpoint.start, "plan")
+    graph = builder.compile()
+    thread = Thread(graph=graph, checkpointer=InMemoryCheckpointer(), thread_id="thread")
+    with pytest.raises(LookupError):
+        thread.invoke({"limit": 5})
+
+    output = run_until_done(thread.resume())
+
+    assert output == {"name": "cats", "limit": 5}, f"Expected the unset limit not to be written, got {output}."
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_interrupt_inside_task_groups_of_an_async_node_stops_the_run(depth: int) -> None:
+    async def ask(levels: int) -> str:
+        if levels == 0:
+            await asyncio.sleep(0)
+            return interrupt("topic?", str)
+        async with asyncio.TaskGroup() as group:
+            answer = group.create_task(ask(levels - 1))
+        return answer.result()
+
+    async def ask_in_groups(state: State) -> State:
+        return {"items": [await ask(depth)]}
+
+    builder = StateGraph(State)
+    builder.add_node("ask", ask_in_groups)
+    builder.add_edge(Endpoint.start, "ask")
+    thread = build_thread(builder)
+
+    async def ask_and_answer() -> RunResult[State]:
+        interrupted = read_interrupted(await thread.ainvoke({}))
+        return await thread.aresume(Answer(interrupt_id=interrupted.interrupts[0].interrupt_id, value="cats"))
+
+    output = run_until_done(asyncio.run(ask_and_answer()))
+
+    assert output == {"items": ["cats"]}, f"Expected the answer in the output, got {output}."
+
+
+def test_exception_group_of_a_node_without_an_interrupt_leaves_the_run_unchanged() -> None:
+    failure = ExceptionGroup("node failures", [ValueError("wrong value")])
+
+    def fail(state: State) -> State:
+        raise failure
+
+    builder = StateGraph(State)
+    builder.add_node("fail", fail)
+    builder.add_edge(Endpoint.start, "fail")
+
+    with pytest.raises(ExceptionGroup) as raised:
+        build_thread(builder).invoke({})
+    assert raised.value is failure, f"Expected {failure!r}, got {raised.value!r}. The group must not be wrapped."
+
+
+def test_update_that_the_reducer_does_not_take_is_rejected() -> None:
+    builder = StateGraph(TopicState)
+    builder.add_node("write", lambda state: {"topics": "not a topic"})
+    builder.add_edge(Endpoint.start, "write")
+    thread = Thread(graph=builder.compile(), checkpointer=InMemoryCheckpointer(), thread_id="thread")
+
+    with pytest.raises(ValueError):
+        thread.invoke({})
+
+
+@dataclass
+class SlowCheckpointer(InMemoryCheckpointer):
+    recording: asyncio.Event = field(default_factory=asyncio.Event)
+
+    async def put_task_state(self, thread_id: str, task: TaskAddress, state: TaskState) -> None:
+        self.recording.set()
+        await asyncio.sleep(0.01)
+        await super().put_task_state(thread_id, task, state)
+
+
+def test_finished_task_is_recorded_when_a_sibling_fails_during_the_record(journal: Journal) -> None:
+    checkpointer = SlowCheckpointer()
+    failures: list[Exception] = [LookupError("fail one time")]
+
+    async def charge(state: State) -> State:
+        journal.events.append("charge")
+        return {"items": ["charge"]}
+
+    async def fail_while_recording(state: State) -> State:
+        await checkpointer.recording.wait()
+        if failures:
+            raise failures.pop(0)
+        return {"items": ["flaky"]}
+
+    builder = StateGraph(State)
+    builder.add_node("charge", charge)
+    builder.add_node("flaky", fail_while_recording)
+    builder.add_edge(Endpoint.start, "charge")
+    builder.add_edge(Endpoint.start, "flaky")
+    thread = build_thread(builder, checkpointer)
+
+    async def fail_and_resume() -> RunResult[State]:
+        with pytest.raises(LookupError):
+            await thread.ainvoke({})
+        return await thread.aresume()
+
+    output = run_until_done(asyncio.run(fail_and_resume()))
+
+    assert journal.events == ["charge"], f"Expected the finished node not to run again, got {journal.events}."
+    assert sorted(output.get("items", [])) == ["charge", "flaky"], f"Expected both writes, got {output}."

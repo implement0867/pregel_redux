@@ -1,6 +1,7 @@
 import dataclasses
 import inspect
-from collections.abc import Callable, Iterable, Mapping
+from collections import abc
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from copy import deepcopy
 from dataclasses import dataclass, field
 from functools import cached_property
@@ -11,6 +12,7 @@ from typing import (
     Required,
     Self,
     TypeVar,
+    assert_never,
     get_args,
     get_origin,
     get_type_hints,
@@ -21,6 +23,9 @@ from typing import (
 
 from pydantic import BaseModel, TypeAdapter, ValidationError
 from typing_extensions import TypeForm
+from typing_inspection.introspection import is_union_origin
+
+from pregel_redux.dependencies import expand_alias
 
 
 class Missing:
@@ -78,6 +83,18 @@ class Channel:
             return self.adapter
         return TypeAdapter(read_update_type(self.reducer, self.value_type))
 
+    def parse_update(self, value: object) -> object:
+        match self.reducer:
+            case None:
+                return self.parse(value)
+            case Reducer():
+                try:
+                    return self.update_adapter.validate_python(value)
+                except ValidationError as error:
+                    raise ValueError(f"channel {self.name!r} cannot take the update {value!r}") from error
+            case _:
+                assert_never(self.reducer)
+
 
 @runtime_checkable
 class SubscriptableHint(Protocol):
@@ -97,11 +114,33 @@ def substitute_type_arguments[HintT](hint: HintT, arguments: Mapping[object, Hin
             return hint
 
 
+def has_matching_origin(pattern_origin: object, concrete_origin: object) -> bool:
+    match pattern_origin, concrete_origin:
+        case type(), type():
+            return issubclass(concrete_origin, pattern_origin)
+        case _:
+            return pattern_origin is not None and pattern_origin == concrete_origin
+
+
+def bind_union_members(pattern_members: Sequence[object], concrete_members: Sequence[object]) -> dict[object, object]:
+    free = [member for member in pattern_members if member not in concrete_members]
+    rest = [member for member in concrete_members if member not in pattern_members]
+    match free, rest:
+        case [TypeVar() as variable], [member]:
+            return {variable: member}
+        case _:
+            return {}
+
+
 def bind_type_variables(pattern: object, concrete: object) -> dict[object, object]:
+    pattern, concrete = expand_alias(pattern), expand_alias(concrete)
+    pattern_origin, concrete_origin = get_origin(pattern), get_origin(concrete)
     match pattern:
         case TypeVar() if concrete is not Ellipsis:
             return {pattern: concrete}
-        case _ if get_origin(pattern) is not None and get_origin(pattern) == get_origin(concrete):
+        case _ if is_union_origin(pattern_origin) and is_union_origin(concrete_origin):
+            return bind_union_members(get_args(pattern), get_args(concrete))
+        case _ if has_matching_origin(pattern_origin, concrete_origin):
             pattern_arguments, concrete_arguments = get_args(pattern), get_args(concrete)
             if len(pattern_arguments) != len(concrete_arguments):
                 return {}
@@ -121,9 +160,19 @@ def read_update_type(reducer: Reducer[object, object], value_type: TypeForm[obje
         return value_type
     match parameters:
         case [current, update, *_] if update.annotation is not inspect.Parameter.empty:
-            return substitute_type_arguments(update.annotation, bind_type_variables(current.annotation, value_type))
+            bindings = bind_type_variables(current.annotation, value_type)
+            return make_restorable(substitute_type_arguments(update.annotation, bindings))
         case _:
             return value_type
+
+
+def make_restorable(update_type: TypeForm[object]) -> TypeForm[object]:
+    match get_origin(update_type), get_args(update_type):
+        case abc.Iterable | abc.Collection, (item,):
+            restorable = list[item]
+            return restorable
+        case _:
+            return update_type
 
 
 def find_reducer(name: str, metadata: tuple[object, ...]) -> Reducer[object, object] | None:

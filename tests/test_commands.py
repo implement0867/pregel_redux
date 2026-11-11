@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import Callable, Mapping
+from collections.abc import AsyncIterator, Callable, Mapping
 from dataclasses import dataclass
 from typing import Annotated, Literal, TypedDict
 
@@ -307,3 +307,50 @@ def test_provider_receives_the_payload_of_a_send_as_the_state(topic: str) -> Non
     actual = asyncio.run(builder.compile().ainvoke({}))
 
     assert actual.get("jokes", []) == [topic], f"Expected the provider to read {topic!r}, got {actual}."
+
+
+def test_invalid_send_payload_fails_after_the_dependencies_of_the_sender_close(journal: Journal) -> None:
+    async def open_session() -> AsyncIterator[str]:
+        yield "session"
+        journal.events.append("commit")
+
+    def plan(state: State, session: Annotated[str, Depends(open_session)]) -> Command[str]:
+        return Command(goto=Send("write_joke", {"topic": ["cats"]}))
+
+    builder = StateGraph(State)
+    builder.add_node("plan", plan)
+    builder.add_node("write_joke", write_model_joke, input_schema=ModelRequest)
+    builder.add_edge(Endpoint.start, "plan")
+
+    with pytest.raises(ValidationError):
+        asyncio.run(builder.compile().ainvoke({}))
+    assert journal.events == ["commit"], (
+        f"Expected the dependency of the sender to close normally, got {journal.events}."
+    )
+
+
+def test_invalid_payloads_of_two_senders_raise_one_error() -> None:
+    builder = StateGraph(State)
+    builder.add_node("first", lambda state: Command[str](goto=Send("write_joke", {})))
+    builder.add_node("second", lambda state: Command[str](goto=Send("write_joke", {})))
+    builder.add_node("write_joke", write_model_joke, input_schema=ModelRequest)
+    builder.add_edge(Endpoint.start, "first")
+    builder.add_edge(Endpoint.start, "second")
+
+    with pytest.raises(ValidationError):
+        asyncio.run(builder.compile().ainvoke({}))
+
+
+def test_input_that_cannot_be_built_stops_the_step_before_any_node_runs(journal: Journal) -> None:
+    async def write(state: State) -> None:
+        journal.events.append("first")
+
+    builder = StateGraph(State)
+    builder.add_node("first", write)
+    builder.add_node("second", lambda request: journal.events.append("second"), input_schema=DataclassRequest)
+    builder.add_edge(Endpoint.start, "first")
+    builder.add_edge(Endpoint.start, "second")
+
+    with pytest.raises(TypeError):
+        asyncio.run(builder.compile().ainvoke({}))
+    assert journal.events == [], f"Expected no node to run, got {journal.events}."

@@ -1,14 +1,15 @@
 import asyncio
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum, StrEnum
 from typing import Annotated, Literal, TypedDict
 from uuid import UUID, uuid4
+from zoneinfo import ZoneInfo
 
 import pytest
-from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic import BaseModel, ConfigDict, Field, Json, TypeAdapter, computed_field
 from typing_extensions import TypeForm
 
 from pregel_redux import CheckpointSource, InMemoryCheckpointer
@@ -37,6 +38,43 @@ class Point(BaseModel):
 class Alias(BaseModel):
     model_config = ConfigDict(populate_by_name=True)
     name: str = Field(alias="title")
+
+
+class Report(BaseModel):
+    title: str = Field(serialization_alias="headline")
+
+
+class Subject(BaseModel):
+    topic: str = Field(validation_alias="subject")
+
+
+class NameOnly(BaseModel):
+    model_config = ConfigDict(validate_by_alias=False, validate_by_name=True)
+    topic: str = Field(alias="subject")
+
+
+class Raw(BaseModel):
+    data: Json[list[int]]
+
+
+class Area(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+    width: int
+
+    @computed_field
+    @property
+    def area(self) -> int:
+        return self.width * 2
+
+
+class Limits(BaseModel):
+    name: str
+    limit: int = 10
+
+
+class Stamped(BaseModel):
+    name: str
+    token: UUID = Field(default_factory=uuid4)
 
 
 class Shape(BaseModel):
@@ -117,6 +155,13 @@ def build_counter() -> Counter:
         (dict[str, list[Point]], {"points": [Point(x=1, y=2)]}),
         (int | str, "1"),
         (int | None, None),
+        (datetime, datetime(2026, 3, 28, 12, tzinfo=timezone(timedelta(hours=2)))),
+        (Report, Report(title="cats")),
+        (Subject, Subject.model_validate({"subject": "cats"})),
+        (NameOnly, NameOnly.model_validate({"topic": "cats"})),
+        (Raw, Raw.model_validate({"data": "[1, 2]"})),
+        (Area, Area(width=2)),
+        (Limits, Limits(name="cats")),
     ],
     ids=lambda item: getattr(item, "__name__", None),
 )
@@ -124,9 +169,20 @@ def test_value_of_its_declared_type_is_restored_equal(value_type: TypeForm[objec
     adapter = TypeAdapter[object](value_type)
 
     record = SendTask(node="node", node_input=dump_value(adapter, value, "the value"))
-    restored = adapter.validate_json(SendTask.model_validate_json(record.model_dump_json()).node_input)
+    restored = adapter.validate_json(SendTask.model_validate_json(record.model_dump_json()).node_input, by_name=True)
 
     assert restored == value, f"Expected {value!r} after a round trip through JSON, got {restored!r}."
+
+
+@pytest.mark.parametrize("value", [Limits(name="cats"), Limits(name="cats", limit=10), Limits(name="dogs", limit=3)])
+def test_restored_model_keeps_the_fields_that_were_set(value: Limits) -> None:
+    adapter = TypeAdapter[object](Limits)
+
+    restored = adapter.validate_json(dump_value(adapter, value, "the value"), by_name=True)
+
+    assert isinstance(restored, Limits), f"Expected a Limits value, got {restored!r}."
+    actual = restored.model_fields_set
+    assert actual == value.model_fields_set, f"Expected the set fields {value.model_fields_set}, got {actual}."
 
 
 @pytest.mark.parametrize(
@@ -140,6 +196,10 @@ def test_value_of_its_declared_type_is_restored_equal(value_type: TypeForm[objec
         (float, float("nan")),
         (object, Point(x=1, y=2)),
         (object, object()),
+        (datetime, datetime(2026, 3, 28, 12, tzinfo=ZoneInfo("Europe/Paris"))),
+        (object, ShapeKind.circle),
+        (dict[str, object], {"kind": ShapeKind.circle}),
+        (Stamped, Stamped(name="cats")),
     ],
     ids=[
         "subclass",
@@ -150,6 +210,10 @@ def test_value_of_its_declared_type_is_restored_equal(value_type: TypeForm[objec
         "nan",
         "model-as-object",
         "plain-object",
+        "time-zone-with-rules",
+        "string-enum-as-object",
+        "string-enum-in-a-dict",
+        "unset-field-with-a-default-factory",
     ],
 )
 def test_value_that_would_not_be_restored_equal_is_rejected(value_type: TypeForm[object], value: object) -> None:
