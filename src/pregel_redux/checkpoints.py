@@ -1,6 +1,6 @@
 from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Annotated, Literal, Protocol
 from uuid import UUID
 
@@ -19,18 +19,28 @@ class CheckpointSource(Enum):
     fork = "fork"
 
 
+class PlannedTaskKind(StrEnum):
+    edge = "edge"
+    send = "send"
+
+
+class TaskStateKind(StrEnum):
+    completed = "completed"
+    interrupted = "interrupted"
+
+
 class TaskAddress(Record):
     checkpoint_id: UUID
     index: int
 
 
 class EdgeTask(Record):
-    kind: Literal["edge"] = "edge"
+    kind: Literal[PlannedTaskKind.edge] = PlannedTaskKind.edge
     node: str
 
 
 class SendTask(Record):
-    kind: Literal["send"] = "send"
+    kind: Literal[PlannedTaskKind.send] = PlannedTaskKind.send
     node: str
     node_input: JsonValue
 
@@ -51,14 +61,14 @@ class Checkpoint(Record):
 
 
 class CompletedTask(Record):
-    kind: Literal["completed"] = "completed"
+    kind: Literal[TaskStateKind.completed] = TaskStateKind.completed
     writes: dict[str, JsonValue]
     targets: tuple[str, ...]
     sends: tuple[SendTask, ...]
 
 
 class InterruptedTask(Record):
-    kind: Literal["interrupted"] = "interrupted"
+    kind: Literal[TaskStateKind.interrupted] = TaskStateKind.interrupted
     answers: tuple[JsonValue, ...]
     payload: JsonValue
 

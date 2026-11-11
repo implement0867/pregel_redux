@@ -3,7 +3,7 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from decimal import Decimal
-from enum import Enum
+from enum import Enum, StrEnum
 from typing import Annotated, Literal, TypedDict
 from uuid import UUID, uuid4
 
@@ -59,13 +59,18 @@ class Request(TypedDict):
     tags: tuple[str, ...]
 
 
+class ShapeKind(StrEnum):
+    circle = "circle"
+    square = "square"
+
+
 class Circles(BaseModel):
-    kind: Literal["circle"]
+    kind: Literal[ShapeKind.circle]
     radius: int
 
 
 class Squares(BaseModel):
-    kind: Literal["square"]
+    kind: Literal[ShapeKind.square]
     side: int
 
 
@@ -110,7 +115,7 @@ def build_counter() -> Counter:
         (Alias, Alias(title="cats")),
         (Counter, Counter(name="clicks")),
         (Request, {"topic": "cats", "tags": ("a",)}),
-        (Annotated[Circles | Squares, Field(discriminator="kind")], Squares(kind="square", side=2)),
+        (Annotated[Circles | Squares, Field(discriminator="kind")], Squares(kind=ShapeKind.square, side=2)),
         (dict[str, list[Point]], {"points": [Point(x=1, y=2)]}),
         (int | str, "1"),
         (int | None, None),

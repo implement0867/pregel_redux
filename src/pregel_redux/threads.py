@@ -18,6 +18,7 @@ from pregel_redux.checkpoints import (
     SavedCheckpoint,
     SendTask,
     TaskAddress,
+    TaskStateKind,
     dump_value,
     load_value,
 )
@@ -266,7 +267,7 @@ class Thread[StateT, InputT, OutputT]:
 
     async def snapshot(self, saved: SavedCheckpoint) -> StateSnapshot[StateT]:
         position = decode_checkpoint(self.graph, saved)
-        completed = {index for index, state in saved.task_states.items() if state.kind == "completed"}
+        completed = {index for index, state in saved.task_states.items() if state.kind is TaskStateKind.completed}
         interrupts = await self.journal.find_interrupts(self.graph, saved)
         return StateSnapshot(
             checkpoint=saved.checkpoint,
