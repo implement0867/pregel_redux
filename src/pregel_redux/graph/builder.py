@@ -56,14 +56,17 @@ class StateGraph[StateT, InputT, OutputT]:
         self.child_graphs: dict[str, GraphBuilder] = {}
         self.edges: set[Edge] = set()
         self.joins: set[Join] = set()
+        self.deferred: set[str] = set()
 
     @overload
-    def add_node(self, name: str, node: Node[StateT]) -> None: ...
+    def add_node(self, name: str, node: Node[StateT], *, defer: bool = False) -> None: ...
     @overload
-    def add_node[NodeInputT](self, name: str, node: Node[NodeInputT], *, input_schema: type[NodeInputT]) -> None: ...
+    def add_node[NodeInputT](
+        self, name: str, node: Node[NodeInputT], *, input_schema: type[NodeInputT], defer: bool = False
+    ) -> None: ...
     @overload
     def add_node[ChildStateT, ChildInputT, ChildOutputT](
-        self, name: str, node: "StateGraph[ChildStateT, ChildInputT, ChildOutputT]"
+        self, name: str, node: "StateGraph[ChildStateT, ChildInputT, ChildOutputT]", *, defer: bool = False
     ) -> None: ...
     def add_node(
         self,
@@ -71,9 +74,12 @@ class StateGraph[StateT, InputT, OutputT]:
         node: Callable[..., object] | GraphBuilder,
         *,
         input_schema: type[object] | None = None,
+        defer: bool = False,
     ) -> None:
         if name in self.nodes or name in self.child_graphs:
             raise ValueError(f"node {name!r} is already in this graph")
+        if defer:
+            self.deferred.add(name)
         match node:
             case GraphBuilder():
                 self.child_graphs[name] = node
@@ -171,6 +177,7 @@ class StateGraph[StateT, InputT, OutputT]:
                         edge.target for edge in self.edges if edge.source == name and isinstance(edge.target, str)
                     ),
                     joins=frozenset(key for key in join_keys if name in key.sources),
+                    defer=name in self.deferred,
                     triggers=(BranchKey(name), *(key for key in join_keys if key.target == name)),
                 )
                 for name, action in actions.items()

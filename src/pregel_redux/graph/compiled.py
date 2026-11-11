@@ -11,21 +11,36 @@ from typing import Never, Protocol, assert_never
 
 from pydantic import TypeAdapter
 
-from pregel_redux.channels import Channel, extract_writes, reject_unknown_channels
-from pregel_redux.commands import Send, read_outcome
-from pregel_redux.dependencies import CallPlan, Depends, execute_plan, open_providers
+from pregel_redux.channels import Channel, extract_writes, parse_updates
+from pregel_redux.checkpoints import CheckpointSource
+from pregel_redux.commands import Endpoint, Send, read_outcome
+from pregel_redux.dependencies import (
+    CallPlan,
+    Depends,
+    execute_plan,
+    finish_despite_cancellation,
+    open_providers,
+)
 from pregel_redux.pregel import (
     Arrival,
+    BranchChannel,
+    EphemeralValue,
+    JoinChannel,
     JoinKey,
+    LastValueAfterFinish,
+    NamedBarrierValue,
+    NamedBarrierValueAfterFinish,
+    NodeName,
     Position,
     PullTask,
     PushTask,
+    StartTask,
     Task,
     TaskWrites,
     TriggerKey,
-    advance,
+    apply_writes,
+    open_channels,
     plan_tasks,
-    start_position,
 )
 from pregel_redux.settings import RunSettings
 
@@ -46,6 +61,7 @@ class CompiledNode:
     targets: frozenset[str]
     joins: frozenset[JoinKey]
     triggers: tuple[TriggerKey, ...]
+    defer: bool
 
     @cached_property
     def input_adapter(self) -> TypeAdapter[object]:
@@ -65,27 +81,40 @@ class CompiledNode:
 
 
 @dataclass(frozen=True)
-class NodeCall:
-    name: str
+class TaskRef:
+    node: NodeName
     send_index: int | None
+
+
+@dataclass(frozen=True)
+class NodeCall:
+    task: TaskRef
     node_input: object
 
 
 class Journal(Protocol):
-    async def save(self, position: Position) -> None: ...
+    async def save(self, position: Position, source: CheckpointSource) -> None: ...
+    async def record(self, task: TaskRef, writes: TaskWrites) -> None: ...
+    def find_writes(self, task: TaskRef) -> TaskWrites | None: ...
     async def enter_child(
         self, child: "CompiledGraph[object, Never, object]", call: NodeCall
     ) -> "tuple[Position, Journal]": ...
 
 
 class NoJournal:
-    async def save(self, position: Position) -> None:
+    async def save(self, position: Position, source: CheckpointSource) -> None:
         pass
+
+    async def record(self, task: TaskRef, writes: TaskWrites) -> None:
+        pass
+
+    def find_writes(self, task: TaskRef) -> TaskWrites | None:
+        return None
 
     async def enter_child(
         self, child: "CompiledGraph[object, Never, object]", call: NodeCall
     ) -> "tuple[Position, Journal]":
-        return child.start(extract_writes(call.node_input), {}), self
+        return child.feed(child.open(extract_writes(call.node_input)), {}), self
 
 
 @dataclass(frozen=True)
@@ -97,7 +126,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
     entry_nodes: frozenset[str]
 
     async def ainvoke(self, input: InputT, *, step_limit: int | None = None) -> OutputT:
-        return await self.run(self.start({}, extract_writes(input)), step_limit, NoJournal())
+        return await self.run(self.feed(self.open({}), extract_writes(input)), step_limit, NoJournal())
 
     async def run(self, position: Position, step_limit: int | None, journal: Journal) -> OutputT:
         limit = RunSettings().step_limit if step_limit is None else step_limit
@@ -133,41 +162,61 @@ class CompiledGraph[StateT, InputT, OutputT]:
     def invoke(self, input: InputT, *, step_limit: int | None = None) -> OutputT:
         return self.run_in_new_loop(lambda: self.ainvoke(input, step_limit=step_limit), "ainvoke")
 
-    def start(self, given: Mapping[str, object], update: Mapping[str, object]) -> Position:
-        reject_unknown_channels(self.channels, given)
-        initial = {
-            name: channel.reducer.make_initial()
-            for name, channel in self.channels.items()
-            if channel.reducer is not None
-        }
-        values = {name: self.channels[name].parse(value) for name, value in {**initial, **given}.items()}
-        joins = {key for node in self.nodes.values() for key in node.joins}
-        entry = TaskWrites(fields=update, branches=self.entry_nodes, arrivals=(), sends=())
-        return advance(self.channels, start_position(values, self.nodes.keys(), joins), [], [entry])
+    @cached_property
+    def triggers(self) -> Mapping[str, tuple[TriggerKey, ...]]:
+        return {name: node.triggers for name, node in self.nodes.items()}
 
-    def build_call(self, task: Task, values: Mapping[str, object]) -> NodeCall:
+    @cached_property
+    def trigger_keys(self) -> frozenset[TriggerKey]:
+        return frozenset(key for keys in self.triggers.values() for key in keys)
+
+    def open(self, given: Mapping[str, object]) -> Position:
+        branches: dict[str, BranchChannel] = {
+            name: LastValueAfterFinish(None, finished=False) if node.defer else EphemeralValue(None)
+            for name, node in self.nodes.items()
+        }
+        joins: dict[JoinKey, JoinChannel] = {
+            key: (
+                NamedBarrierValueAfterFinish(key.sources, frozenset(), finished=False)
+                if self.nodes[key.target].defer
+                else NamedBarrierValue(key.sources, frozenset())
+            )
+            for node in self.nodes.values()
+            for key in node.joins
+        }
+        return open_channels(self.channels, given, branches, joins)
+
+    def feed(self, position: Position, input_writes: Mapping[str, object]) -> Position:
+        discarded = plan_tasks(position, self.triggers)
+        return apply_writes(position, discarded, [], [parse_updates(self.channels, input_writes)], self.trigger_keys)
+
+    def build_call(self, task: Task, position: Position) -> NodeCall:
         match task:
+            case StartTask():
+                return NodeCall(TaskRef(Endpoint.start, None), task.writes)
             case PullTask():
-                return NodeCall(task.node, None, self.nodes[task.node].build_input(values))
+                node_input = self.nodes[task.node].build_input(position.channels.read_values())
+                return NodeCall(TaskRef(task.node, None), node_input)
             case PushTask():
-                return NodeCall(task.send.node, task.index, self.nodes[task.send.node].build_send_input(task.send))
+                node = self.nodes[task.send.node]
+                return NodeCall(TaskRef(task.send.node, task.index), node.build_send_input(task.send))
             case _:
                 assert_never(task)
 
     async def run_steps(self, start: Position, run: Run, journal: Journal) -> OutputT:
         position = start
-        triggers = {name: node.triggers for name, node in self.nodes.items()}
         steps = 0
-        while tasks := plan_tasks(position, triggers):
-            if steps == run.step_limit:
-                raise RuntimeError(f"the graph did not finish within {run.step_limit} steps")
-            steps += 1
-            calls = [self.build_call(task, position.channels.values) for task in tasks]
+        while tasks := plan_tasks(position, self.triggers):
+            calls = [self.build_call(task, position) for task in tasks]
+            if any(call.task.node is not Endpoint.start for call in calls):
+                if steps == run.step_limit:
+                    raise RuntimeError(f"the graph did not finish within {run.step_limit} steps")
+                steps += 1
             async with AsyncExitStack() as step_exits:
                 writes = await self.run_step(calls, run, journal, step_exits)
-                position = advance(self.channels, position, tasks, writes)
-                await journal.save(position)
-        values = position.channels.values
+                position = apply_writes(position, tasks, writes, [], self.trigger_keys)
+                await journal.save(position, CheckpointSource.loop)
+        values = position.channels.read_values()
         return self.output_schema(**{name: values[name] for name in self.output_fields if name in values})
 
     async def run_step(
@@ -175,36 +224,53 @@ class CompiledGraph[StateT, InputT, OutputT]:
     ) -> list[TaskWrites]:
         try:
             async with asyncio.TaskGroup() as group:
-                tasks = [group.create_task(self.run_node(call, run, journal, step_exits)) for call in calls]
+                tasks = [group.create_task(self.run_task(call, run, journal, step_exits)) for call in calls]
         except ExceptionGroup as failures:
             if len(failures.exceptions) == 1:
                 raise failures.exceptions[0] from None
             raise
         return [task.result() for task in tasks]
 
+    async def run_task(self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack) -> TaskWrites:
+        saved = journal.find_writes(call.task)
+        if saved is not None:
+            return saved
+        writes = await self.run_node(call, run, journal, step_exits)
+        await finish_despite_cancellation(journal.record(call.task, writes))
+        return writes
+
     async def run_node(self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack) -> TaskWrites:
-        node = self.nodes[call.name]
-        match node.action:
-            case CallPlan() as plan:
-                return await self.call_function(plan, call, run, step_exits)
-            case CompiledGraph() as child:
-                start, child_journal = await journal.enter_child(child, call)
-                result = await child.run_steps(start, run, child_journal)
-                return self.read_writes(call.name, result)
+        match call.task.node:
+            case Endpoint.start:
+                return TaskWrites(
+                    parse_updates(self.channels, extract_writes(call.node_input)), self.entry_nodes, (), ()
+                )
+            case str() as name:
+                action = self.nodes[name].action
+                match action:
+                    case CallPlan():
+                        return await self.call_function(action, name, call, run, step_exits)
+                    case CompiledGraph():
+                        start, child_journal = await journal.enter_child(action, call)
+                        return self.read_writes(name, await action.run_steps(start, run, child_journal))
+                    case _:
+                        assert_never(action)
             case _:
-                assert_never(node.action)
+                assert_never(call.task.node)
 
     def read_writes(self, name: str, result: object) -> TaskWrites:
         node = self.nodes[name]
         outcome = read_outcome(result, node.targets, self.nodes.keys())
         return TaskWrites(
-            fields=outcome.writes,
+            fields=parse_updates(self.channels, outcome.writes),
             branches=outcome.routes.targets,
             arrivals=tuple(Arrival(key, name) for key in node.joins),
             sends=outcome.routes.sends,
         )
 
-    async def call_function(self, plan: CallPlan, call: NodeCall, run: Run, step_exits: AsyncExitStack) -> TaskWrites:
+    async def call_function(
+        self, plan: CallPlan, name: str, call: NodeCall, run: Run, step_exits: AsyncExitStack
+    ) -> TaskWrites:
         if plan.run_providers:
             async with run.lock:
                 await open_providers(plan.run_providers, run.values, run.exits)
@@ -212,7 +278,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         writes: TaskWrites | None = None
         async with AsyncExitStack[bool]() as node_exits:
             result = await execute_plan(plan, call.node_input, node_values, node_exits)
-            writes = self.read_writes(call.name, result)
+            writes = self.read_writes(name, result)
             step_exits.push_async_callback(node_exits.pop_all().aclose)
         if writes is None:
             raise RuntimeError(f"a dependency of {plan.function!r} suppressed the exception of its node")

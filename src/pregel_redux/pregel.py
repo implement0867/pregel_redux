@@ -1,9 +1,14 @@
 from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass
-from typing import assert_never
+from typing import Literal, assert_never
 
-from pregel_redux.channels import Channel, apply_writes
-from pregel_redux.commands import Send
+from pregel_redux.channels import Channel, FieldChannel, Stored, reject_unknown_channels
+from pregel_redux.commands import Endpoint, Send
+
+
+@dataclass(frozen=True)
+class StartKey:
+    pass
 
 
 @dataclass(frozen=True)
@@ -23,74 +28,152 @@ class JoinKey:
 
 
 @dataclass(frozen=True)
-class SendsKey:
+class TasksKey:
     pass
 
 
 type TriggerKey = BranchKey | JoinKey
-type ChannelKey = FieldKey | TriggerKey | SendsKey
+type ChannelKey = StartKey | FieldKey | TriggerKey | TasksKey
+type NodeName = str | Literal[Endpoint.start]
 
 
 @dataclass(frozen=True)
-class BranchCell:
-    triggered: bool
-
-    def advance(self, *, written: bool) -> "BranchCell | None":
-        return BranchCell(written) if written or self.triggered else None
-
-
-@dataclass(frozen=True)
-class JoinCell:
-    sources: frozenset[str]
-    arrived: frozenset[str]
+class EphemeralValue[ValueT]:
+    stored: Stored[ValueT] | None
 
     def is_available(self) -> bool:
-        return self.arrived == self.sources
+        return self.stored is not None
 
-    def advance(self, arrivals: Collection[str]) -> "JoinCell | None":
-        arrived = self.arrived.union(arrivals)
-        return None if arrived == self.arrived else JoinCell(self.sources, arrived)
+    def update(self, values: Sequence[ValueT]) -> "EphemeralValue[ValueT] | None":
+        if values:
+            return EphemeralValue(Stored(values[-1]))
+        return None if self.stored is None else EphemeralValue(None)
 
-    def consume(self) -> "JoinCell":
-        return JoinCell(self.sources, frozenset())
+    def consume(self) -> "EphemeralValue[ValueT] | None":
+        return None
+
+    def finish(self) -> "EphemeralValue[ValueT] | None":
+        return None
 
 
 @dataclass(frozen=True)
-class SendsCell:
-    sends: tuple[Send, ...]
+class LastValueAfterFinish[ValueT]:
+    stored: Stored[ValueT] | None
+    finished: bool
 
-    def advance(self, sends: Sequence[Send]) -> "SendsCell | None":
-        return SendsCell(tuple(sends)) if sends or self.sends else None
+    def is_available(self) -> bool:
+        return self.stored is not None and self.finished
+
+    def update(self, values: Sequence[ValueT]) -> "LastValueAfterFinish[ValueT] | None":
+        return LastValueAfterFinish(Stored(values[-1]), finished=False) if values else None
+
+    def consume(self) -> "LastValueAfterFinish[ValueT] | None":
+        return LastValueAfterFinish(None, finished=False) if self.finished else None
+
+    def finish(self) -> "LastValueAfterFinish[ValueT] | None":
+        if self.finished or self.stored is None:
+            return None
+        return LastValueAfterFinish(self.stored, finished=True)
+
+
+def add_names(names: frozenset[str], seen: frozenset[str], values: Sequence[str]) -> frozenset[str] | None:
+    unknown = sorted(set(values) - names)
+    if unknown:
+        raise ValueError(f"{unknown!r} are not sources of the join of {sorted(names)!r}")
+    added = seen.union(values)
+    return None if added == seen else added
+
+
+@dataclass(frozen=True)
+class NamedBarrierValue:
+    names: frozenset[str]
+    seen: frozenset[str]
+
+    def is_available(self) -> bool:
+        return self.seen == self.names
+
+    def update(self, values: Sequence[str]) -> "NamedBarrierValue | None":
+        seen = add_names(self.names, self.seen, values)
+        return None if seen is None else NamedBarrierValue(self.names, seen)
+
+    def consume(self) -> "NamedBarrierValue | None":
+        return NamedBarrierValue(self.names, frozenset()) if self.is_available() else None
+
+    def finish(self) -> "NamedBarrierValue | None":
+        return None
+
+
+@dataclass(frozen=True)
+class NamedBarrierValueAfterFinish:
+    names: frozenset[str]
+    seen: frozenset[str]
+    finished: bool
+
+    def is_available(self) -> bool:
+        return self.finished and self.seen == self.names
+
+    def update(self, values: Sequence[str]) -> "NamedBarrierValueAfterFinish | None":
+        seen = add_names(self.names, self.seen, values)
+        return None if seen is None else NamedBarrierValueAfterFinish(self.names, seen, self.finished)
+
+    def consume(self) -> "NamedBarrierValueAfterFinish | None":
+        if not self.is_available():
+            return None
+        return NamedBarrierValueAfterFinish(self.names, frozenset(), finished=False)
+
+    def finish(self) -> "NamedBarrierValueAfterFinish | None":
+        if self.finished or self.seen != self.names:
+            return None
+        return NamedBarrierValueAfterFinish(self.names, self.seen, finished=True)
+
+
+@dataclass(frozen=True)
+class Topic[ItemT]:
+    values: tuple[ItemT, ...]
+
+    def update(self, values: Sequence[ItemT]) -> "Topic[ItemT] | None":
+        return Topic(tuple(values)) if values or self.values else None
+
+
+type BranchChannel = EphemeralValue[None] | LastValueAfterFinish[None]
+type JoinChannel = NamedBarrierValue | NamedBarrierValueAfterFinish
 
 
 @dataclass(frozen=True)
 class Channels:
-    values: Mapping[str, object]
-    branches: Mapping[str, BranchCell]
-    joins: Mapping[JoinKey, JoinCell]
-    sends: SendsCell
+    start: EphemeralValue[Mapping[str, object]]
+    fields: Mapping[str, FieldChannel]
+    branches: Mapping[str, BranchChannel]
+    joins: Mapping[JoinKey, JoinChannel]
+    tasks: Topic[Send]
 
     def is_available(self, key: TriggerKey) -> bool:
         match key:
             case BranchKey():
-                return self.branches[key.node].triggered
+                return self.branches[key.node].is_available()
             case JoinKey():
                 return self.joins[key].is_available()
             case _:
                 assert_never(key)
+
+    def read_values(self) -> dict[str, object]:
+        return {name: stored.value for name, channel in self.fields.items() if (stored := channel.get()) is not None}
 
 
 @dataclass(frozen=True)
 class Position:
     channels: Channels
     versions: Mapping[ChannelKey, int]
-    seen: Mapping[str, Mapping[TriggerKey, int]]
+    seen: Mapping[NodeName, Mapping[StartKey | TriggerKey, int]]
 
-    def find_fired(self, node: str, triggers: Sequence[TriggerKey]) -> tuple[TriggerKey, ...]:
+    def is_triggered(self, node: str, triggers: Sequence[TriggerKey]) -> bool:
         seen = self.seen.get(node, {})
-        return tuple(
-            key for key in triggers if self.channels.is_available(key) and self.versions[key] > seen.get(key, 0)
-        )
+        return any(self.channels.is_available(key) and self.versions[key] > seen.get(key, 0) for key in triggers)
+
+
+@dataclass(frozen=True)
+class StartTask:
+    writes: Mapping[str, object]
 
 
 @dataclass(frozen=True)
@@ -105,7 +188,7 @@ class PushTask:
     send: Send
 
 
-type Task = PullTask | PushTask
+type Task = StartTask | PullTask | PushTask
 
 
 @dataclass(frozen=True)
@@ -122,62 +205,133 @@ class TaskWrites:
     sends: tuple[Send, ...]
 
 
-def start_position(values: Mapping[str, object], nodes: Collection[str], joins: Collection[JoinKey]) -> Position:
+def open_channels(
+    fields: Mapping[str, Channel],
+    given: Mapping[str, object],
+    branches: Mapping[str, BranchChannel],
+    joins: Mapping[JoinKey, JoinChannel],
+) -> Position:
+    reject_unknown_channels(fields, given)
+    opened = {name: channel.open() for name, channel in fields.items()}
     channels = Channels(
-        values=values,
-        branches={node: BranchCell(triggered=False) for node in nodes},
-        joins={key: JoinCell(key.sources, frozenset()) for key in joins},
-        sends=SendsCell(()),
+        start=EphemeralValue(None),
+        fields={**opened, **{name: opened[name].replace(value) for name, value in given.items()}},
+        branches=branches,
+        joins=joins,
+        tasks=Topic(()),
     )
-    return Position(channels, {FieldKey(name): 1 for name in values}, {})
+    return Position(channels, {FieldKey(name): 1 for name in channels.read_values()}, {})
 
 
 def plan_tasks(position: Position, triggers: Mapping[str, Sequence[TriggerKey]]) -> list[Task]:
-    pulls = [PullTask(node, fired) for node in sorted(triggers) if (fired := position.find_fired(node, triggers[node]))]
-    return [*pulls, *(PushTask(index, send) for index, send in enumerate(position.channels.sends.sends))]
+    stored = position.channels.start.stored
+    seen_start = position.seen.get(Endpoint.start, {}).get(StartKey(), 0)
+    starts = [StartTask(stored.value)] if stored is not None and position.versions[StartKey()] > seen_start else []
+    pulls = [
+        PullTask(node, tuple(triggers[node]))
+        for node in sorted(triggers)
+        if position.is_triggered(node, triggers[node])
+    ]
+    return [*starts, *pulls, *(PushTask(index, send) for index, send in enumerate(position.channels.tasks.values))]
 
 
-def replace_cells[KeyT, CellT](
-    cells: Mapping[KeyT, CellT], change: Callable[[KeyT, CellT], CellT | None]
-) -> tuple[dict[KeyT, CellT], list[KeyT]]:
-    changes = {key: changed for key, cell in cells.items() if (changed := change(key, cell)) is not None}
-    return {**cells, **changes}, list(changes)
+def change_channels[KeyT, ChannelT](
+    channels: Mapping[KeyT, ChannelT], change: Callable[[KeyT, ChannelT], ChannelT | None]
+) -> tuple[dict[KeyT, ChannelT], set[KeyT]]:
+    changes = {key: changed for key, channel in channels.items() if (changed := change(key, channel)) is not None}
+    return {**channels, **changes}, set(changes)
 
 
-def advance(
-    fields: Mapping[str, Channel], position: Position, tasks: Sequence[Task], writes: Sequence[TaskWrites]
+def group_values[KeyT, ValueT](pairs: Sequence[tuple[KeyT, ValueT]]) -> dict[KeyT, list[ValueT]]:
+    groups: dict[KeyT, list[ValueT]] = {}
+    for key, value in pairs:
+        groups.setdefault(key, []).append(value)
+    return groups
+
+
+def apply_writes(
+    position: Position,
+    tasks: Sequence[Task],
+    writes: Sequence[TaskWrites],
+    inputs: Sequence[Mapping[str, object]],
+    trigger_keys: Collection[TriggerKey],
 ) -> Position:
+    channels = position.channels
     pulls = [task for task in tasks if isinstance(task, PullTask)]
-    seen = {
+    bump_step = bool(tasks)
+    seen: dict[NodeName, Mapping[StartKey | TriggerKey, int]] = {
         **position.seen,
+        **(
+            {Endpoint.start: {StartKey(): position.versions[StartKey()]}}
+            if any(isinstance(task, StartTask) for task in tasks)
+            else {}
+        ),
         **{
-            task.node: {**position.seen.get(task.node, {}), **{key: position.versions[key] for key in task.triggers}}
+            task.node: {
+                **position.seen.get(task.node, {}),
+                **{key: position.versions[key] for key in task.triggers if key in position.versions},
+            }
             for task in pulls
         },
     }
-    consumed = {key for task in pulls for key in task.triggers if isinstance(key, JoinKey)}
-    written_branches = frozenset[str]().union(*(write.branches for write in writes))
-    arrivals = [arrival for write in writes for arrival in write.arrivals]
-    branches, changed_branches = replace_cells(
-        position.channels.branches, lambda node, cell: cell.advance(written=node in written_branches)
+    consumed = {key for task in pulls for key in task.triggers}
+
+    field_values = group_values([(name, value) for write in writes for name, value in write.fields.items()])
+    reject_unknown_channels(channels.fields, field_values)
+    branch_values = group_values([(node, None) for write in writes for node in write.branches])
+    join_values = group_values([(arrival.join, arrival.source) for write in writes for arrival in write.arrivals])
+    sends = [send for write in writes for send in write.sends]
+
+    start = channels.start.update(inputs) if inputs or (bump_step and channels.start.is_available()) else None
+    fields, changed_fields = change_channels(
+        channels.fields, lambda name, channel: channel.update(field_values.get(name, ()))
     )
-    joins, changed_joins = replace_cells(
-        {**position.channels.joins, **{key: position.channels.joins[key].consume() for key in consumed}},
-        lambda key, cell: cell.advance([arrival.source for arrival in arrivals if arrival.join == key]),
+    consumed_branches, branches_changed_by_consume = change_channels(
+        channels.branches, lambda node, channel: channel.consume() if BranchKey(node) in consumed else None
     )
-    sends = position.channels.sends.advance([send for write in writes for send in write.sends])
-    channels = Channels(
-        values=apply_writes(fields, position.channels.values, [write.fields for write in writes]),
-        branches=branches,
-        joins=joins,
-        sends=position.channels.sends if sends is None else sends,
+    branches, changed_branches = change_channels(
+        consumed_branches,
+        lambda node, channel: (
+            channel.update(branch_values.get(node, ()))
+            if node in branch_values or (bump_step and channel.is_available())
+            else None
+        ),
     )
+    consumed_joins, joins_changed_by_consume = change_channels(
+        channels.joins, lambda key, channel: channel.consume() if key in consumed else None
+    )
+    joins, changed_joins = change_channels(
+        consumed_joins, lambda key, channel: channel.update(join_values.get(key, ()))
+    )
+    tasks_channel = channels.tasks.update(sends) if sends or bump_step else None
+
+    start_updated = start is not None and start.is_available()
+    updated_triggers: set[TriggerKey] = {
+        *(BranchKey(node) for node in changed_branches if branches[node].is_available()),
+        *(key for key in changed_joins if joins[key].is_available()),
+    }
+    finished_branches: set[str] = set()
+    finished_joins: set[JoinKey] = set()
+    if bump_step and not start_updated and updated_triggers.isdisjoint(trigger_keys):
+        branches, finished_branches = change_channels(branches, lambda node, channel: channel.finish())
+        joins, finished_joins = change_channels(joins, lambda key, channel: channel.finish())
+
     changed: list[ChannelKey] = [
-        *(FieldKey(name) for write in writes for name in write.fields),
-        *(BranchKey(node) for node in changed_branches),
-        *consumed,
-        *changed_joins,
-        *([] if sends is None else [SendsKey()]),
+        *([] if start is None else [StartKey()]),
+        *(FieldKey(name) for name in changed_fields),
+        *(BranchKey(node) for node in branches_changed_by_consume | changed_branches | finished_branches),
+        *(joins_changed_by_consume | changed_joins | finished_joins),
+        *([] if tasks_channel is None else [TasksKey()]),
     ]
     next_version = max(position.versions.values(), default=0) + 1
-    return Position(channels, {**position.versions, **dict.fromkeys(changed, next_version)}, seen)
+    return Position(
+        Channels(
+            start=channels.start if start is None else start,
+            fields=fields,
+            branches=branches,
+            joins=joins,
+            tasks=channels.tasks if tasks_channel is None else tasks_channel,
+        ),
+        {**position.versions, **dict.fromkeys(changed, next_version)},
+        seen,
+    )

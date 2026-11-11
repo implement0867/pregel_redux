@@ -26,7 +26,7 @@ class JokesOutput(TypedDict, total=False):
 
 
 class AppendState(TypedDict, total=False):
-    items: Annotated[list[str], Reducer(append_item, initial_factory=list)]
+    items: Annotated[list[str], Reducer(append_item, initial_factory=list, update_type=str)]
 
 
 def build_joke_writer(joke: str) -> Callable[[State], JokesOutput]:

@@ -31,16 +31,18 @@ class BareCallableState(TypedDict, total=False):
 
 
 class AppendDict(TypedDict, total=False):
-    items: Annotated[list[str], Reducer(append_item, initial_factory=list)]
+    items: Annotated[list[str], Reducer(append_item, initial_factory=list, update_type=str)]
 
 
 @dataclass
 class AppendDataclass:
-    items: Annotated[list[str], Reducer(append_item, initial_factory=list)] = field(default_factory=list)
+    items: Annotated[list[str], Reducer(append_item, initial_factory=list, update_type=str)] = field(
+        default_factory=list
+    )
 
 
 class AppendModel(BaseModel):
-    items: Annotated[list[str], Reducer(append_item, initial_factory=list)] = []
+    items: Annotated[list[str], Reducer(append_item, initial_factory=list, update_type=str)] = []
 
 
 class WrongInitialState(TypedDict, total=False):

@@ -1,43 +1,54 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
-from typing import Never
-from uuid import UUID, uuid4
+from typing import Never, assert_never
+from uuid import UUID, uuid4, uuid5
 
-from pregel_redux.channels import extract_writes
+from pydantic import JsonValue
+
+from pregel_redux.channels import Stored, dump_json, extract_writes, load_json, reject_unknown_channels
 from pregel_redux.checkpoints import (
+    ChannelValues,
     ChannelVersions,
     Checkpoint,
     Checkpointer,
-    JoinArrivals,
+    CheckpointSource,
     JoinVersion,
     PendingSend,
-    TaskAddress,
+    PendingWrite,
+    SavedArrival,
+    SavedBranch,
+    SavedJoin,
+    SavedWrites,
     TriggerVersions,
-    dump_value,
-    dump_values,
-    load_value,
-    load_values,
 )
-from pregel_redux.commands import Send
-from pregel_redux.graph.compiled import CompiledGraph, Journal, NodeCall
+from pregel_redux.commands import Endpoint, Send
+from pregel_redux.graph.compiled import CompiledGraph, Journal, NodeCall, TaskRef
 from pregel_redux.pregel import (
-    BranchCell,
+    Arrival,
+    BranchChannel,
     BranchKey,
     ChannelKey,
     Channels,
+    EphemeralValue,
     FieldKey,
-    JoinCell,
+    JoinChannel,
     JoinKey,
+    LastValueAfterFinish,
+    NamedBarrierValue,
+    NamedBarrierValueAfterFinish,
+    NodeName,
     Position,
-    SendsCell,
-    SendsKey,
+    StartKey,
+    TasksKey,
+    TaskWrites,
+    Topic,
     TriggerKey,
 )
 
 type AnyGraph = CompiledGraph[object, Never, object]
 
 
-def dump_trigger_versions(versions: Mapping[TriggerKey, int]) -> TriggerVersions:
+def dump_trigger_versions(versions: Mapping[StartKey | TriggerKey, int]) -> TriggerVersions:
     return TriggerVersions(
         branches={key.node: version for key, version in versions.items() if isinstance(key, BranchKey)},
         joins=tuple(
@@ -48,75 +59,178 @@ def dump_trigger_versions(versions: Mapping[TriggerKey, int]) -> TriggerVersions
     )
 
 
-def load_trigger_versions(versions: TriggerVersions) -> dict[TriggerKey, int]:
+def load_trigger_versions(versions: TriggerVersions) -> dict[StartKey | TriggerKey, int]:
     return {
         **{BranchKey(node): version for node, version in versions.branches.items()},
         **{JoinKey(frozenset(join.sources), join.target): join.version for join in versions.joins},
     }
 
 
-def dump_position(graph: AnyGraph, position: Position, checkpoint_id: UUID, parent: TaskAddress | None) -> Checkpoint:
+def dump_send(graph: AnyGraph, send: Send) -> PendingSend:
+    node = graph.nodes[send.node]
+    return PendingSend(node=send.node, node_input=dump_json(node.input_adapter, node.build_send_input(send)))
+
+
+def load_send(graph: AnyGraph, send: PendingSend) -> Send:
+    return Send(send.node, load_json(graph.nodes[send.node].input_adapter, send.node_input))
+
+
+def dump_updates(graph: AnyGraph, updates: Mapping[str, object]) -> dict[str, JsonValue]:
+    return {name: dump_json(graph.channels[name].update_adapter, value) for name, value in updates.items()}
+
+
+def load_updates(graph: AnyGraph, updates: Mapping[str, JsonValue]) -> dict[str, object]:
+    reject_unknown_channels(graph.channels, updates)
+    return {name: load_json(graph.channels[name].update_adapter, value) for name, value in updates.items()}
+
+
+def dump_writes(graph: AnyGraph, writes: TaskWrites) -> SavedWrites:
+    return SavedWrites(
+        fields=dump_updates(graph, writes.fields),
+        branches=tuple(sorted(writes.branches)),
+        arrivals=tuple(
+            SavedArrival(sources=tuple(sorted(arrival.join.sources)), target=arrival.join.target, source=arrival.source)
+            for arrival in writes.arrivals
+        ),
+        sends=tuple(dump_send(graph, send) for send in writes.sends),
+    )
+
+
+def load_writes(graph: AnyGraph, saved: SavedWrites) -> TaskWrites:
+    return TaskWrites(
+        fields=load_updates(graph, saved.fields),
+        branches=frozenset(saved.branches),
+        arrivals=tuple(
+            Arrival(JoinKey(frozenset(arrival.sources), arrival.target), arrival.source) for arrival in saved.arrivals
+        ),
+        sends=tuple(load_send(graph, send) for send in saved.sends),
+    )
+
+
+def dump_branch(node: str, channel: BranchChannel) -> SavedBranch | None:
+    match channel:
+        case EphemeralValue(stored=Stored()):
+            return SavedBranch(node=node, finished=None)
+        case LastValueAfterFinish(stored=Stored()):
+            return SavedBranch(node=node, finished=channel.finished)
+        case _:
+            return None
+
+
+def load_branch(channel: BranchChannel, saved: SavedBranch) -> BranchChannel:
+    match channel:
+        case EphemeralValue():
+            return EphemeralValue(Stored(None))
+        case LastValueAfterFinish():
+            return LastValueAfterFinish(Stored(None), finished=bool(saved.finished))
+        case _:
+            assert_never(channel)
+
+
+def dump_join(key: JoinKey, channel: JoinChannel) -> SavedJoin:
+    match channel:
+        case NamedBarrierValue():
+            finished = None
+        case NamedBarrierValueAfterFinish():
+            finished = channel.finished
+        case _:
+            assert_never(channel)
+    return SavedJoin(
+        sources=tuple(sorted(key.sources)), target=key.target, seen=tuple(sorted(channel.seen)), finished=finished
+    )
+
+
+def load_join(channel: JoinChannel, saved: SavedJoin) -> JoinChannel:
+    match channel:
+        case NamedBarrierValue():
+            return NamedBarrierValue(channel.names, frozenset(saved.seen))
+        case NamedBarrierValueAfterFinish():
+            return NamedBarrierValueAfterFinish(channel.names, frozenset(saved.seen), finished=bool(saved.finished))
+        case _:
+            assert_never(channel)
+
+
+def dump_position(
+    graph: AnyGraph, position: Position, checkpoint_id: UUID, checkpoint_ns: str, step: int, source: CheckpointSource
+) -> Checkpoint:
     channels = position.channels
     versions = position.versions
+    branches = (dump_branch(node, channel) for node, channel in channels.branches.items())
     return Checkpoint(
         id=checkpoint_id,
-        parent=parent,
-        values=dump_values(graph.channels, channels.values),
-        branches=tuple(sorted(node for node, cell in channels.branches.items() if cell.triggered)),
-        joins=tuple(
-            JoinArrivals(sources=tuple(sorted(key.sources)), target=key.target, arrived=tuple(sorted(cell.arrived)))
-            for key, cell in channels.joins.items()
-            if cell.arrived
+        checkpoint_ns=checkpoint_ns,
+        step=step,
+        source=source,
+        channel_values=ChannelValues(
+            start=None if channels.start.stored is None else dump_updates(graph, channels.start.stored.value),
+            fields={name: saved.value for name, channel in channels.fields.items() if (saved := channel.checkpoint())},
+            branches=tuple(branch for branch in branches if branch is not None),
+            joins=tuple(dump_join(key, channel) for key, channel in channels.joins.items() if channel.seen),
+            tasks=tuple(dump_send(graph, send) for send in channels.tasks.values),
         ),
-        sends=tuple(
-            PendingSend(
-                node=send.node,
-                node_input=dump_value(
-                    graph.nodes[send.node].input_adapter, graph.nodes[send.node].build_send_input(send)
-                ),
-            )
-            for send in channels.sends.sends
-        ),
-        versions=ChannelVersions(
+        channel_versions=ChannelVersions(
+            start=versions.get(StartKey()),
             fields={key.name: version for key, version in versions.items() if isinstance(key, FieldKey)},
             triggers=dump_trigger_versions(
                 {key: version for key, version in versions.items() if isinstance(key, BranchKey | JoinKey)}
             ),
-            sends=versions.get(SendsKey()),
+            tasks=versions.get(TasksKey()),
         ),
-        seen={node: dump_trigger_versions(seen) for node, seen in position.seen.items()},
+        versions_seen={
+            node: dump_trigger_versions(seen) for node, seen in position.seen.items() if isinstance(node, str)
+        },
+        start_seen=position.seen.get(Endpoint.start, {}).get(StartKey()),
     )
 
 
 def load_position(graph: AnyGraph, checkpoint: Checkpoint) -> Position:
-    arrivals = {JoinKey(frozenset(join.sources), join.target): frozenset(join.arrived) for join in checkpoint.joins}
-    start = graph.start(load_values(graph.channels, checkpoint.values), {}).channels
+    values = checkpoint.channel_values
+    reject_unknown_channels(graph.channels, values.fields)
+    opened = graph.open({}).channels
+    joins = {JoinKey(frozenset(join.sources), join.target): join for join in values.joins}
     unknown_nodes = sorted(
-        {*checkpoint.branches, *checkpoint.seen, *(send.node for send in checkpoint.sends)} - graph.nodes.keys()
+        {*(branch.node for branch in values.branches), *checkpoint.versions_seen, *(send.node for send in values.tasks)}
+        - graph.nodes.keys()
     )
-    unknown_joins = [key for key in arrivals if key not in start.joins]
+    unknown_joins = [key for key in joins if key not in opened.joins]
     if unknown_nodes or unknown_joins:
         raise ValueError(
             f"the checkpoint refers to nodes {unknown_nodes!r} and joins {unknown_joins!r}, which are not in this graph"
         )
     channels = Channels(
-        values=start.values,
-        branches={node: BranchCell(triggered=node in checkpoint.branches) for node in start.branches},
-        joins={key: JoinCell(key.sources, arrivals.get(key, frozenset())) for key in start.joins},
-        sends=SendsCell(
-            tuple(
-                Send(send.node, load_value(graph.nodes[send.node].input_adapter, send.node_input))
-                for send in checkpoint.sends
-            )
-        ),
+        start=EphemeralValue(None if values.start is None else Stored(load_updates(graph, values.start))),
+        fields={
+            **opened.fields,
+            **{name: opened.fields[name].from_checkpoint(saved) for name, saved in values.fields.items()},
+        },
+        branches={
+            **opened.branches,
+            **{branch.node: load_branch(opened.branches[branch.node], branch) for branch in values.branches},
+        },
+        joins={**opened.joins, **{key: load_join(opened.joins[key], join) for key, join in joins.items()}},
+        tasks=Topic(tuple(load_send(graph, send) for send in values.tasks)),
     )
     versions: dict[ChannelKey, int] = {
-        **{FieldKey(name): version for name, version in checkpoint.versions.fields.items()},
-        **load_trigger_versions(checkpoint.versions.triggers),
-        **({} if checkpoint.versions.sends is None else {SendsKey(): checkpoint.versions.sends}),
+        **({} if checkpoint.channel_versions.start is None else {StartKey(): checkpoint.channel_versions.start}),
+        **{FieldKey(name): version for name, version in checkpoint.channel_versions.fields.items()},
+        **load_trigger_versions(checkpoint.channel_versions.triggers),
+        **({} if checkpoint.channel_versions.tasks is None else {TasksKey(): checkpoint.channel_versions.tasks}),
     }
-    seen = {node: load_trigger_versions(seen) for node, seen in checkpoint.seen.items()}
+    seen: dict[NodeName, Mapping[StartKey | TriggerKey, int]] = {
+        **{node: load_trigger_versions(seen) for node, seen in checkpoint.versions_seen.items()},
+        **({} if checkpoint.start_seen is None else {Endpoint.start: {StartKey(): checkpoint.start_seen}}),
+    }
     return Position(channels, versions, seen)
+
+
+def name_task(task: TaskRef) -> str:
+    match task.node:
+        case Endpoint.start:
+            return "start"
+        case str() as node:
+            return f"pull|{node}" if task.send_index is None else f"push|{node}|{task.send_index}"
+        case _:
+            assert_never(task.node)
 
 
 @dataclass(frozen=True)
@@ -124,33 +238,55 @@ class ThreadScope:
     graph: AnyGraph
     checkpointer: Checkpointer
     thread_id: str
-    parent: TaskAddress | None
+    checkpoint_ns: str
 
-    async def save(self, position: Position) -> UUID:
-        checkpoint_id = uuid4()
-        await self.checkpointer.put(self.thread_id, dump_position(self.graph, position, checkpoint_id, self.parent))
-        return checkpoint_id
+    async def begin(self, position: Position, step: int) -> "tuple[Position, ThreadJournal]":
+        journal = ThreadJournal(self, uuid4(), step, {})
+        await journal.save(position, CheckpointSource.input)
+        return position, journal
 
-    async def begin(self, position: Position) -> "tuple[Position, ThreadJournal]":
-        return position, ThreadJournal(self, await self.save(position))
-
-    async def resume(self) -> "tuple[Position, ThreadJournal] | None":
-        latest = await self.checkpointer.get_latest(self.thread_id, self.parent)
-        return None if latest is None else (load_position(self.graph, latest), ThreadJournal(self, latest.id))
+    async def load(self) -> "tuple[Position, ThreadJournal] | None":
+        saved = await self.checkpointer.aget_tuple(self.thread_id, self.checkpoint_ns)
+        if saved is None:
+            return None
+        pending = {write.task_id: write.writes for write in saved.pending_writes}
+        journal = ThreadJournal(self, saved.checkpoint.id, saved.checkpoint.step + 1, pending)
+        return load_position(self.graph, saved.checkpoint), journal
 
 
 @dataclass
 class ThreadJournal:
     scope: ThreadScope
     checkpoint_id: UUID
+    step: int
+    pending: Mapping[str, SavedWrites]
 
-    async def save(self, position: Position) -> None:
-        self.checkpoint_id = await self.scope.save(position)
+    def make_task_id(self, task: TaskRef) -> str:
+        return str(uuid5(self.checkpoint_id, f"{self.scope.checkpoint_ns}|{self.step}|{name_task(task)}"))
+
+    async def save(self, position: Position, source: CheckpointSource) -> None:
+        scope = self.scope
+        checkpoint_id = uuid4()
+        checkpoint = dump_position(scope.graph, position, checkpoint_id, scope.checkpoint_ns, self.step, source)
+        await scope.checkpointer.aput(scope.thread_id, checkpoint)
+        self.checkpoint_id = checkpoint_id
+        self.step += 1
+        self.pending = {}
+
+    async def record(self, task: TaskRef, writes: TaskWrites) -> None:
+        scope = self.scope
+        write = PendingWrite(task_id=self.make_task_id(task), writes=dump_writes(scope.graph, writes))
+        await scope.checkpointer.aput_writes(scope.thread_id, scope.checkpoint_ns, self.checkpoint_id, write)
+
+    def find_writes(self, task: TaskRef) -> TaskWrites | None:
+        saved = self.pending.get(self.make_task_id(task))
+        return None if saved is None else load_writes(self.scope.graph, saved)
 
     async def enter_child(self, child: AnyGraph, call: NodeCall) -> tuple[Position, Journal]:
-        address = TaskAddress(checkpoint_id=self.checkpoint_id, node=call.name, send_index=call.send_index)
-        scope = ThreadScope(child, self.scope.checkpointer, self.scope.thread_id, address)
-        return await scope.resume() or await scope.begin(child.start(extract_writes(call.node_input), {}))
+        parent_ns = f"{self.scope.checkpoint_ns}|" if self.scope.checkpoint_ns else ""
+        checkpoint_ns = f"{parent_ns}{call.task.node}:{self.make_task_id(call.task)}"
+        scope = ThreadScope(child, self.scope.checkpointer, self.scope.thread_id, checkpoint_ns)
+        return await scope.load() or await scope.begin(child.feed(child.open(extract_writes(call.node_input)), {}), -1)
 
 
 @dataclass(frozen=True)
@@ -158,24 +294,20 @@ class PersistentGraph[StateT, InputT, OutputT]:
     graph: CompiledGraph[StateT, InputT, OutputT]
     checkpointer: Checkpointer
 
-    async def ainvoke(self, input: InputT, *, thread_id: str, step_limit: int | None = None) -> OutputT:
-        latest = await self.checkpointer.get_latest(thread_id, None)
-        given = {} if latest is None else load_values(self.graph.channels, latest.values)
-        scope = ThreadScope(self.graph, self.checkpointer, thread_id, None)
-        position, journal = await scope.begin(self.graph.start(given, extract_writes(input)))
+    async def ainvoke(self, input: InputT | None, *, thread_id: str, step_limit: int | None = None) -> OutputT:
+        scope = ThreadScope(self.graph, self.checkpointer, thread_id, "")
+        loaded = await scope.load()
+        if input is None:
+            if loaded is None:
+                raise LookupError(f"thread {thread_id!r} has no checkpoint, so the run needs an input")
+            position, journal = loaded
+        elif loaded is None:
+            position, journal = await scope.begin(self.graph.feed(self.graph.open({}), extract_writes(input)), -1)
+        else:
+            position, journal = await scope.begin(self.graph.feed(loaded[0], extract_writes(input)), loaded[1].step)
         return await self.graph.run(position, step_limit, journal)
 
-    async def aresume(self, *, thread_id: str, step_limit: int | None = None) -> OutputT:
-        resumed = await ThreadScope(self.graph, self.checkpointer, thread_id, None).resume()
-        if resumed is None:
-            raise LookupError(f"thread {thread_id!r} has no checkpoint")
-        position, journal = resumed
-        return await self.graph.run(position, step_limit, journal)
-
-    def invoke(self, input: InputT, *, thread_id: str, step_limit: int | None = None) -> OutputT:
+    def invoke(self, input: InputT | None, *, thread_id: str, step_limit: int | None = None) -> OutputT:
         return self.graph.run_in_new_loop(
             lambda: self.ainvoke(input, thread_id=thread_id, step_limit=step_limit), "ainvoke"
         )
-
-    def resume(self, *, thread_id: str, step_limit: int | None = None) -> OutputT:
-        return self.graph.run_in_new_loop(lambda: self.aresume(thread_id=thread_id, step_limit=step_limit), "aresume")

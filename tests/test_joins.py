@@ -151,3 +151,54 @@ def test_join_of_an_unknown_node_is_rejected_by_compile(sources: tuple[str, str]
 
     with pytest.raises(ValueError, match="missing"):
         builder.compile()
+
+
+@pytest.mark.parametrize("long_branch", [2, 4])
+def test_deferred_node_runs_one_time_after_no_other_node_can_run(long_branch: int) -> None:
+    """
+    Arrange: two branches of different lengths, with a separate edge from each last node to a deferred target.
+    Act: run the graph.
+    Assert: the target runs one time, after all other nodes.
+    """
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("short", build_visitor("short"))
+    builder.add_node("target", build_visitor("target"), defer=True)
+    builder.add_edge(Endpoint.start, "short")
+    builder.add_edge("short", "target")
+    previous: str | Literal[Endpoint.start] = Endpoint.start
+    for index in range(long_branch):
+        builder.add_node(f"long {index}", build_visitor(f"long {index}"))
+        builder.add_edge(previous, f"long {index}")
+        previous = f"long {index}"
+    builder.add_edge(previous, "target")
+
+    actual = asyncio.run(builder.compile().ainvoke({}))["visits"]
+
+    assert actual.count("target") == 1, f"Expected one visit of the target, got {actual}."
+    assert actual[-1] == "target", f"Expected the target after all other nodes, got {actual}."
+
+
+@pytest.mark.parametrize("extra_steps", [1, 3])
+def test_join_to_a_deferred_node_waits_until_no_other_node_can_run(extra_steps: int) -> None:
+    """
+    Arrange: a join of two nodes to a deferred target, and a chain of nodes that still runs after the join is complete.
+    Act: run the graph.
+    Assert: the target runs one time, after the chain.
+    """
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("first", build_visitor("first"))
+    builder.add_node("second", build_visitor("second"))
+    builder.add_node("target", build_visitor("target"), defer=True)
+    builder.add_edge(Endpoint.start, "first")
+    builder.add_edge(Endpoint.start, "second")
+    builder.add_edge(("first", "second"), "target")
+    previous = "second"
+    for index in range(extra_steps):
+        builder.add_node(f"extra {index}", build_visitor(f"extra {index}"))
+        builder.add_edge(previous, f"extra {index}")
+        previous = f"extra {index}"
+
+    actual = asyncio.run(builder.compile().ainvoke({}))["visits"]
+
+    expected = ["first", "second", *(f"extra {index}" for index in range(extra_steps)), "target"]
+    assert actual == expected, f"Expected {expected}, got {actual}."

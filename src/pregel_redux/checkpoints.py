@@ -1,12 +1,14 @@
-from collections.abc import Mapping
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Protocol
 from uuid import UUID
 
-from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
-from pydantic_core import to_json
+from pydantic import BaseModel, ConfigDict, JsonValue
 
-from pregel_redux.channels import Channel, reject_unknown_channels
+
+class CheckpointSource(Enum):
+    input = "input"
+    loop = "loop"
 
 
 class Record(BaseModel):
@@ -18,10 +20,42 @@ class PendingSend(Record):
     node_input: JsonValue
 
 
-class JoinArrivals(Record):
+class SavedArrival(Record):
     sources: tuple[str, ...]
     target: str
-    arrived: tuple[str, ...]
+    source: str
+
+
+class SavedWrites(Record):
+    fields: dict[str, JsonValue]
+    branches: tuple[str, ...]
+    arrivals: tuple[SavedArrival, ...]
+    sends: tuple[PendingSend, ...]
+
+
+class PendingWrite(Record):
+    task_id: str
+    writes: SavedWrites
+
+
+class SavedBranch(Record):
+    node: str
+    finished: bool | None
+
+
+class SavedJoin(Record):
+    sources: tuple[str, ...]
+    target: str
+    seen: tuple[str, ...]
+    finished: bool | None
+
+
+class ChannelValues(Record):
+    start: dict[str, JsonValue] | None
+    fields: dict[str, JsonValue]
+    branches: tuple[SavedBranch, ...]
+    joins: tuple[SavedJoin, ...]
+    tasks: tuple[PendingSend, ...]
 
 
 class JoinVersion(Record):
@@ -36,57 +70,53 @@ class TriggerVersions(Record):
 
 
 class ChannelVersions(Record):
+    start: int | None
     fields: dict[str, int]
     triggers: TriggerVersions
-    sends: int | None
-
-
-class TaskAddress(Record):
-    checkpoint_id: UUID
-    node: str
-    send_index: int | None
+    tasks: int | None
 
 
 class Checkpoint(Record):
     id: UUID
-    parent: TaskAddress | None
-    values: dict[str, JsonValue]
-    branches: tuple[str, ...]
-    joins: tuple[JoinArrivals, ...]
-    sends: tuple[PendingSend, ...]
-    versions: ChannelVersions
-    seen: dict[str, TriggerVersions]
+    checkpoint_ns: str
+    step: int
+    source: CheckpointSource
+    channel_values: ChannelValues
+    channel_versions: ChannelVersions
+    versions_seen: dict[str, TriggerVersions]
+    start_seen: int | None
+
+
+class CheckpointTuple(Record):
+    checkpoint: Checkpoint
+    pending_writes: tuple[PendingWrite, ...]
 
 
 class Checkpointer(Protocol):
-    async def put(self, thread_id: str, checkpoint: Checkpoint) -> None: ...
-    async def get_latest(self, thread_id: str, parent: TaskAddress | None) -> Checkpoint | None: ...
+    async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None: ...
+    async def aput_writes(
+        self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite
+    ) -> None: ...
+    async def aget_tuple(self, thread_id: str, checkpoint_ns: str) -> CheckpointTuple | None: ...
 
 
 @dataclass
 class InMemoryCheckpointer:
-    threads: dict[str, list[str]] = field(default_factory=dict)
+    threads: dict[str, dict[str, list[str]]] = field(default_factory=dict)
 
-    async def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
-        self.threads.setdefault(thread_id, []).append(checkpoint.model_dump_json())
+    async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
+        saved = CheckpointTuple(checkpoint=checkpoint, pending_writes=())
+        self.threads.setdefault(thread_id, {}).setdefault(checkpoint.checkpoint_ns, []).append(saved.model_dump_json())
 
-    async def get_latest(self, thread_id: str, parent: TaskAddress | None) -> Checkpoint | None:
-        checkpoints = (Checkpoint.model_validate_json(record) for record in reversed(self.threads.get(thread_id, [])))
-        return next((checkpoint for checkpoint in checkpoints if checkpoint.parent == parent), None)
+    async def aput_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
+        records = self.threads[thread_id][checkpoint_ns]
+        saved = [CheckpointTuple.model_validate_json(record) for record in records]
+        index = next(index for index, item in enumerate(saved) if item.checkpoint.id == checkpoint_id)
+        kept = tuple(item for item in saved[index].pending_writes if item.task_id != write.task_id)
+        records[index] = CheckpointTuple(
+            checkpoint=saved[index].checkpoint, pending_writes=(*kept, write)
+        ).model_dump_json()
 
-
-def dump_value(adapter: TypeAdapter[object], value: object) -> JsonValue:
-    return adapter.dump_python(value, mode="json", by_alias=False, round_trip=True)
-
-
-def load_value(adapter: TypeAdapter[object], value: JsonValue) -> object:
-    return adapter.validate_json(to_json(value, inf_nan_mode="strings"), by_alias=False, by_name=True)
-
-
-def dump_values(channels: Mapping[str, Channel], values: Mapping[str, object]) -> dict[str, JsonValue]:
-    return {name: dump_value(channels[name].adapter, value) for name, value in values.items()}
-
-
-def load_values(channels: Mapping[str, Channel], values: Mapping[str, JsonValue]) -> dict[str, object]:
-    reject_unknown_channels(channels, values)
-    return {name: load_value(channels[name].adapter, value) for name, value in values.items()}
+    async def aget_tuple(self, thread_id: str, checkpoint_ns: str) -> CheckpointTuple | None:
+        records = self.threads.get(thread_id, {}).get(checkpoint_ns)
+        return CheckpointTuple.model_validate_json(records[-1]) if records else None
