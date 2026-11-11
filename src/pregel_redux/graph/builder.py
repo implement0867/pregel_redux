@@ -1,5 +1,5 @@
-from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from collections.abc import Callable, Collection, Mapping
+from dataclasses import dataclass, replace
 from typing import Any, Concatenate, Literal, Never, Protocol, overload, runtime_checkable
 
 from pregel_redux.channels import build_channels, merge_channels
@@ -116,15 +116,27 @@ class StateGraph[StateT, InputT, OutputT]:
         dependency_overrides: Mapping[ProviderT, Callable[..., object]] | None = None,
         *,
         checkpointer: Checkpointer,
+        interrupt_before: Collection[str] | Literal["*"] = (),
+        interrupt_after: Collection[str] | Literal["*"] = (),
     ) -> PersistentGraph[StateT, InputT, OutputT]: ...
     def compile[ProviderT: Callable[..., object]](
         self,
         dependency_overrides: Mapping[ProviderT, Callable[..., object]] | None = None,
         *,
         checkpointer: Checkpointer | None = None,
+        interrupt_before: Collection[str] | Literal["*"] = (),
+        interrupt_after: Collection[str] | Literal["*"] = (),
     ) -> CompiledGraph[StateT, InputT, OutputT] | PersistentGraph[StateT, InputT, OutputT]:
         graph = self.compile_graph(dependency_overrides)
-        return graph if checkpointer is None else PersistentGraph(graph, checkpointer)
+        if checkpointer is None:
+            return graph
+        names = frozenset(graph.nodes)
+        before = names if interrupt_before == "*" else frozenset(interrupt_before)
+        after = names if interrupt_after == "*" else frozenset(interrupt_after)
+        unknown = sorted((before | after) - names)
+        if unknown:
+            raise ValueError(f"interrupt_before or interrupt_after refer to {unknown!r}, which are not nodes")
+        return PersistentGraph(replace(graph, interrupt_before=before, interrupt_after=after), checkpointer)
 
     def compile_graph[ProviderT: Callable[..., object]](
         self, dependency_overrides: Mapping[ProviderT, Callable[..., object]] | None
@@ -183,4 +195,6 @@ class StateGraph[StateT, InputT, OutputT]:
                 for name, action in actions.items()
             },
             entry_nodes=entry_nodes,
+            interrupt_before=frozenset(),
+            interrupt_after=frozenset(),
         )

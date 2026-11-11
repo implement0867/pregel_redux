@@ -1,3 +1,4 @@
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import Annotated, Literal, Protocol
@@ -11,6 +12,8 @@ from pregel_redux.interrupts import Interrupt
 class CheckpointSource(Enum):
     input = "input"
     loop = "loop"
+    update = "update"
+    fork = "fork"
 
 
 class Record(BaseModel):
@@ -125,29 +128,49 @@ class Checkpointer(Protocol):
     async def aput_writes(
         self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite
     ) -> None: ...
-    async def aget_tuple(self, thread_id: str, checkpoint_ns: str) -> CheckpointTuple | None: ...
+    async def aget_tuple(
+        self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None
+    ) -> CheckpointTuple | None: ...
+    def alist(
+        self, thread_id: str, checkpoint_ns: str, *, before: UUID | None, limit: int | None
+    ) -> AsyncIterator[CheckpointTuple]: ...
+    async def adelete_thread(self, thread_id: str) -> None: ...
 
 
 @dataclass
 class InMemoryCheckpointer:
-    threads: dict[str, dict[str, list[str]]] = field(default_factory=dict)
+    threads: dict[str, dict[str, dict[UUID, str]]] = field(default_factory=dict)
 
     async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
         saved = CheckpointTuple(checkpoint=checkpoint, pending_writes=())
-        self.threads.setdefault(thread_id, {}).setdefault(checkpoint.checkpoint_ns, []).append(saved.model_dump_json())
+        self.threads.setdefault(thread_id, {}).setdefault(checkpoint.checkpoint_ns, {})[checkpoint.id] = (
+            saved.model_dump_json()
+        )
 
     async def aput_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
         records = self.threads[thread_id][checkpoint_ns]
-        saved = [CheckpointTuple.model_validate_json(record) for record in records]
-        index = next(index for index, item in enumerate(saved) if item.checkpoint.id == checkpoint_id)
-        kept = tuple(
-            item for item in saved[index].pending_writes if (item.kind, item.task_id) != (write.kind, write.task_id)
-        )
-        records[index] = CheckpointTuple(
-            checkpoint=saved[index].checkpoint, pending_writes=(*kept, write)
+        saved = CheckpointTuple.model_validate_json(records[checkpoint_id])
+        kept = tuple(item for item in saved.pending_writes if (item.kind, item.task_id) != (write.kind, write.task_id))
+        records[checkpoint_id] = CheckpointTuple(
+            checkpoint=saved.checkpoint, pending_writes=(*kept, write)
         ).model_dump_json()
 
-    async def aget_tuple(self, thread_id: str, checkpoint_ns: str) -> CheckpointTuple | None:
-        records = self.threads.get(thread_id, {}).get(checkpoint_ns, [])
-        saved = [CheckpointTuple.model_validate_json(record) for record in records]
-        return max(saved, key=lambda item: item.checkpoint.id, default=None)
+    async def aget_tuple(
+        self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None
+    ) -> CheckpointTuple | None:
+        records = self.threads.get(thread_id, {}).get(checkpoint_ns, {})
+        found = max(records, default=None) if checkpoint_id is None else checkpoint_id
+        if found is None or found not in records:
+            return None
+        return CheckpointTuple.model_validate_json(records[found])
+
+    async def alist(
+        self, thread_id: str, checkpoint_ns: str, *, before: UUID | None, limit: int | None
+    ) -> AsyncIterator[CheckpointTuple]:
+        records = self.threads.get(thread_id, {}).get(checkpoint_ns, {})
+        found = sorted((key for key in records if before is None or key < before), reverse=True)
+        for key in found[:limit]:
+            yield CheckpointTuple.model_validate_json(records[key])
+
+    async def adelete_thread(self, thread_id: str) -> None:
+        self.threads.pop(thread_id, None)

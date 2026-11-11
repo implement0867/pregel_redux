@@ -1,3 +1,4 @@
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
 import pytest
@@ -25,3 +26,7 @@ def append_item[T](current: list[T], update: T) -> list[T]:
 @pytest.fixture
 def journal() -> Journal:
     return Journal()
+
+
+async def collect[ItemT](items: AsyncIterator[ItemT]) -> list[ItemT]:
+    return [item async for item in items]

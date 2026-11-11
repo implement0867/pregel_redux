@@ -178,7 +178,7 @@ def test_resume_of_a_pending_send_starts_its_node_with_the_stored_payload() -> N
     checkpointer = InMemoryCheckpointer()
     graph = build_joke_graph(checkpointer, [], [])
     asyncio.run(graph.ainvoke({"topics": ["cats", "dogs"]}, thread_id="thread"))
-    checkpointer.threads["thread"][""] = checkpointer.threads["thread"][""][:3]
+    checkpointer.threads["thread"][""] = dict(sorted(checkpointer.threads["thread"][""].items())[:3])
 
     actual = asyncio.run(graph.ainvoke(None, thread_id="thread"))
 
@@ -334,22 +334,15 @@ def build_child_graph(failures: list[Exception], calls: list[str]) -> StateGraph
 
 
 @dataclass
-class FailingCheckpointer:
-    failing_put: int | None
-    stored: InMemoryCheckpointer = field(default_factory=InMemoryCheckpointer)
+class FailingCheckpointer(InMemoryCheckpointer):
+    failing_put: int | None = None
     puts: int = 0
 
     async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
         self.puts += 1
         if self.puts == self.failing_put:
             raise ConnectionError("no database")
-        await self.stored.aput(thread_id, checkpoint)
-
-    async def aput_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
-        await self.stored.aput_writes(thread_id, checkpoint_ns, checkpoint_id, write)
-
-    async def aget_tuple(self, thread_id: str, checkpoint_ns: str) -> CheckpointTuple | None:
-        return await self.stored.aget_tuple(thread_id, checkpoint_ns)
+        await super().aput(thread_id, checkpoint)
 
 
 def build_parent_graph(
@@ -392,7 +385,7 @@ def test_resume_does_not_run_the_finished_nodes_of_a_child_graph_again(
     """
     expected = asyncio.run(build_parent_graph([], [], InMemoryCheckpointer()).ainvoke({}, thread_id="thread"))
     calls: list[str] = []
-    graph = build_parent_graph(child_failures, calls, FailingCheckpointer(failing_put))
+    graph = build_parent_graph(child_failures, calls, FailingCheckpointer(failing_put=failing_put))
     with pytest.raises(ConnectionError):
         asyncio.run(graph.ainvoke({}, thread_id="thread"))
     calls.clear()
@@ -412,7 +405,7 @@ def test_resume_finds_the_run_of_a_child_graph_for_each_send(topics: list[str]) 
     """
     expected = asyncio.run(build_fan_out_graph([], InMemoryCheckpointer()).ainvoke({"topics": topics}, thread_id="t"))
     calls: list[str] = []
-    graph = build_fan_out_graph(calls, FailingCheckpointer(4 + 4 * len(topics)))
+    graph = build_fan_out_graph(calls, FailingCheckpointer(failing_put=4 + 4 * len(topics)))
     with pytest.raises(ConnectionError):
         asyncio.run(graph.ainvoke({"topics": topics}, thread_id="t"))
     calls.clear()
@@ -424,23 +417,16 @@ def test_resume_finds_the_run_of_a_child_graph_for_each_send(topics: list[str]) 
 
 
 @dataclass
-class SignallingCheckpointer:
-    signal_at_write: int
-    signal: asyncio.Event
-    stored: InMemoryCheckpointer = field(default_factory=InMemoryCheckpointer)
+class SignallingCheckpointer(InMemoryCheckpointer):
+    signal_at_write: int = 0
+    signal: asyncio.Event = field(default_factory=asyncio.Event)
     writes: int = 0
 
-    async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
-        await self.stored.aput(thread_id, checkpoint)
-
     async def aput_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
-        await self.stored.aput_writes(thread_id, checkpoint_ns, checkpoint_id, write)
+        await super().aput_writes(thread_id, checkpoint_ns, checkpoint_id, write)
         self.writes += 1
         if self.writes == self.signal_at_write:
             self.signal.set()
-
-    async def aget_tuple(self, thread_id: str, checkpoint_ns: str) -> CheckpointTuple | None:
-        return await self.stored.aget_tuple(thread_id, checkpoint_ns)
 
 
 @pytest.mark.parametrize("finished_nodes", [1, 2, 3])
@@ -476,7 +462,7 @@ def test_resume_does_not_run_a_node_that_finished_in_the_failed_step(finished_no
         for index in range(finished_nodes):
             builder.add_node(f"finished {index}", build_finished_node(f"finished {index}"))
             builder.add_edge(Endpoint.start, f"finished {index}")
-        graph = builder.compile(checkpointer=SignallingCheckpointer(1 + finished_nodes, saved))
+        graph = builder.compile(checkpointer=SignallingCheckpointer(signal_at_write=1 + finished_nodes, signal=saved))
         with pytest.raises(ConnectionError):
             await graph.ainvoke({}, thread_id="thread")
         calls.clear()
@@ -544,7 +530,9 @@ def test_checkpoints_of_a_thread_form_a_chain_in_the_order_of_their_ids(runs: in
     for _ in range(runs):
         asyncio.run(graph.ainvoke({"topics": ["cats"]}, thread_id="thread"))
 
-    stored = [CheckpointTuple.model_validate_json(record).checkpoint for record in checkpointer.threads["thread"][""]]
+    stored = [
+        CheckpointTuple.model_validate_json(record).checkpoint for record in checkpointer.threads["thread"][""].values()
+    ]
     ids = [checkpoint.id for checkpoint in stored]
     parents = [checkpoint.parent_id for checkpoint in stored]
     versions = {checkpoint.v for checkpoint in stored}
@@ -567,7 +555,7 @@ def test_latest_checkpoint_is_the_one_with_the_greatest_id() -> None:
     graph = build_joke_graph(checkpointer, [ConnectionError("no network")], calls)
     with pytest.raises(ConnectionError):
         asyncio.run(graph.ainvoke({"topics": ["cats"]}, thread_id="thread"))
-    checkpointer.threads["thread"][""].reverse()
+    checkpointer.threads["thread"][""] = dict(reversed(checkpointer.threads["thread"][""].items()))
     calls.clear()
 
     actual = asyncio.run(graph.ainvoke(None, thread_id="thread"))
@@ -586,7 +574,7 @@ def test_checkpoint_of_another_format_version_is_rejected() -> None:
     graph = build_joke_graph(checkpointer, [], [])
     asyncio.run(graph.ainvoke({"topics": ["cats"]}, thread_id="thread"))
     records = checkpointer.threads["thread"][""]
-    checkpointer.threads["thread"][""] = [record.replace('"v":1', '"v":2') for record in records]
+    checkpointer.threads["thread"][""] = {key: record.replace('"v":1', '"v":2') for key, record in records.items()}
 
     with pytest.raises(ValidationError):
         asyncio.run(graph.ainvoke(None, thread_id="thread"))
