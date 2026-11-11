@@ -2,10 +2,8 @@ import dataclasses
 from collections.abc import Callable, Iterable, Mapping
 from copy import deepcopy
 from dataclasses import dataclass
-from enum import Enum
 from typing import (
     Annotated,
-    Literal,
     NotRequired,
     Protocol,
     Required,
@@ -21,8 +19,11 @@ from typing import (
 from pydantic import BaseModel
 
 
-class Unset(Enum):
-    unset = "unset"
+class Missing:
+    pass
+
+
+MISSING = Missing()
 
 
 @dataclass(init=False)
@@ -41,10 +42,10 @@ class Reducer[ValueT, UpdateT]:
         self,
         function: Callable[[ValueT, UpdateT], ValueT],
         *,
-        initial: ValueT | Literal[Unset.unset] = Unset.unset,
+        initial: ValueT | Missing = MISSING,
         initial_factory: Callable[[], ValueT] | None = None,
     ) -> None:
-        if (initial is Unset.unset) == (initial_factory is None):
+        if (initial is MISSING) == (initial_factory is None):
             raise TypeError("a Reducer needs exactly one of initial and initial_factory")
         self.function = function
         self.initial = initial
