@@ -1,6 +1,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass, field
 from typing import Protocol
+from uuid import UUID
 
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from pydantic_core import to_json
@@ -40,7 +41,15 @@ class ChannelVersions(Record):
     sends: int | None
 
 
+class TaskAddress(Record):
+    checkpoint_id: UUID
+    node: str
+    send_index: int | None
+
+
 class Checkpoint(Record):
+    id: UUID
+    parent: TaskAddress | None
     values: dict[str, JsonValue]
     branches: tuple[str, ...]
     joins: tuple[JoinArrivals, ...]
@@ -51,7 +60,7 @@ class Checkpoint(Record):
 
 class Checkpointer(Protocol):
     async def put(self, thread_id: str, checkpoint: Checkpoint) -> None: ...
-    async def get_latest(self, thread_id: str) -> Checkpoint | None: ...
+    async def get_latest(self, thread_id: str, parent: TaskAddress | None) -> Checkpoint | None: ...
 
 
 @dataclass
@@ -61,9 +70,9 @@ class InMemoryCheckpointer:
     async def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
         self.threads.setdefault(thread_id, []).append(checkpoint.model_dump_json())
 
-    async def get_latest(self, thread_id: str) -> Checkpoint | None:
-        records = self.threads.get(thread_id)
-        return Checkpoint.model_validate_json(records[-1]) if records else None
+    async def get_latest(self, thread_id: str, parent: TaskAddress | None) -> Checkpoint | None:
+        checkpoints = (Checkpoint.model_validate_json(record) for record in reversed(self.threads.get(thread_id, [])))
+        return next((checkpoint for checkpoint in checkpoints if checkpoint.parent == parent), None)
 
 
 def dump_value(adapter: TypeAdapter[object], value: object) -> JsonValue:

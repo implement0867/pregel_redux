@@ -1,12 +1,23 @@
 import asyncio
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Annotated, TypedDict
 
 import pytest
 from pydantic import BaseModel
 
-from pregel_redux import Command, Endpoint, InMemoryCheckpointer, PersistentGraph, Reducer, Send, StateGraph
+from pregel_redux import (
+    Checkpoint,
+    Checkpointer,
+    Command,
+    Endpoint,
+    InMemoryCheckpointer,
+    PersistentGraph,
+    Reducer,
+    Send,
+    StateGraph,
+)
+from pregel_redux.checkpoints import TaskAddress
 from tests.conftest import join_lists
 
 
@@ -308,3 +319,99 @@ def test_resume_rejects_a_graph_that_has_an_async_node() -> None:
 
     with pytest.raises(TypeError, match="aresume"):
         graph.resume(thread_id="thread")
+
+
+def build_child_graph(failures: list[Exception], calls: list[str]) -> StateGraph[State, State, NarrowState]:
+    child = StateGraph(State, output_schema=NarrowState)
+    child.add_node("child first", build_failing_writer("child first", [], calls))
+    child.add_node("child last", build_failing_writer("child last", failures, calls))
+    child.add_edge(Endpoint.start, "child first")
+    child.add_edge("child first", "child last")
+    return child
+
+
+@dataclass
+class FailingCheckpointer:
+    failing_put: int | None
+    stored: InMemoryCheckpointer = field(default_factory=InMemoryCheckpointer)
+    puts: int = 0
+
+    async def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
+        self.puts += 1
+        if self.puts == self.failing_put:
+            raise ConnectionError("no database")
+        await self.stored.put(thread_id, checkpoint)
+
+    async def get_latest(self, thread_id: str, parent: TaskAddress | None) -> Checkpoint | None:
+        return await self.stored.get_latest(thread_id, parent)
+
+
+def build_parent_graph(
+    child_failures: list[Exception], calls: list[str], checkpointer: Checkpointer
+) -> PersistentGraph[State, State, Output]:
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("child", build_child_graph(child_failures, calls))
+    builder.add_node("after", build_failing_writer("after", [], calls))
+    builder.add_edge(Endpoint.start, "child")
+    builder.add_edge("child", "after")
+    return builder.compile(checkpointer=checkpointer)
+
+
+def build_fan_out_graph(calls: list[str], checkpointer: Checkpointer) -> PersistentGraph[State, State, Output]:
+    def start_children(state: State) -> Command[str]:
+        return Command(goto=[Send("child", {"topics": [topic]}) for topic in state.get("topics", [])])
+
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("plan", start_children)
+    builder.add_node("child", build_child_graph([], calls))
+    builder.add_edge(Endpoint.start, "plan")
+    return builder.compile(checkpointer=checkpointer)
+
+
+@pytest.mark.parametrize(
+    ("child_failures", "failing_put", "expected_calls"),
+    [
+        ([ConnectionError("no network")], None, ["child last", "after"]),
+        ([], 5, ["after"]),
+    ],
+    ids=["last-node-of-the-child-graph-failed", "save-after-the-child-graph-failed"],
+)
+def test_resume_does_not_run_the_finished_nodes_of_a_child_graph_again(
+    child_failures: list[Exception], failing_put: int | None, expected_calls: list[str]
+) -> None:
+    """
+    Arrange: a run that failed inside a child graph or in the save after the child graph, and a run that did not fail.
+    Act: resume the thread.
+    Assert: the output is that of the run that did not fail, and no finished node of the child graph runs again.
+    """
+    expected = asyncio.run(build_parent_graph([], [], InMemoryCheckpointer()).ainvoke({}, thread_id="thread"))
+    calls: list[str] = []
+    graph = build_parent_graph(child_failures, calls, FailingCheckpointer(failing_put))
+    with pytest.raises(ConnectionError):
+        asyncio.run(graph.ainvoke({}, thread_id="thread"))
+    calls.clear()
+
+    actual = asyncio.run(graph.aresume(thread_id="thread"))
+
+    assert actual == expected, f"Expected {expected}, got {actual}."
+    assert calls == expected_calls, f"Expected the calls {expected_calls}, got {calls}."
+
+
+@pytest.mark.parametrize("topics", [["cats"], ["cats", "dogs"], ["cats", "dogs", "birds"]])
+def test_resume_finds_the_run_of_a_child_graph_for_each_send(topics: list[str]) -> None:
+    """
+    Arrange: one finished run of a child graph for each send, and a failure of the save after those runs.
+    Act: resume the thread.
+    Assert: the output is that of a run that did not fail, and no node of a child graph runs again.
+    """
+    expected = asyncio.run(build_fan_out_graph([], InMemoryCheckpointer()).ainvoke({"topics": topics}, thread_id="t"))
+    calls: list[str] = []
+    graph = build_fan_out_graph(calls, FailingCheckpointer(3 + 3 * len(topics)))
+    with pytest.raises(ConnectionError):
+        asyncio.run(graph.ainvoke({"topics": topics}, thread_id="t"))
+    calls.clear()
+
+    actual = asyncio.run(graph.aresume(thread_id="t"))
+
+    assert actual == expected, f"Expected {expected}, got {actual}."
+    assert calls == [], f"Expected no calls, got {calls}."

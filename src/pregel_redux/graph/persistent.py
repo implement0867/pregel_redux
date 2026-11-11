@@ -1,6 +1,7 @@
 from collections.abc import Mapping
 from dataclasses import dataclass
 from typing import Never
+from uuid import UUID, uuid4
 
 from pregel_redux.channels import extract_writes
 from pregel_redux.checkpoints import (
@@ -10,6 +11,7 @@ from pregel_redux.checkpoints import (
     JoinArrivals,
     JoinVersion,
     PendingSend,
+    TaskAddress,
     TriggerVersions,
     dump_value,
     dump_values,
@@ -17,7 +19,7 @@ from pregel_redux.checkpoints import (
     load_values,
 )
 from pregel_redux.commands import Send
-from pregel_redux.graph.compiled import CompiledGraph
+from pregel_redux.graph.compiled import CompiledGraph, Journal, NodeCall
 from pregel_redux.pregel import (
     BranchCell,
     BranchKey,
@@ -53,10 +55,12 @@ def load_trigger_versions(versions: TriggerVersions) -> dict[TriggerKey, int]:
     }
 
 
-def dump_position(graph: AnyGraph, position: Position) -> Checkpoint:
+def dump_position(graph: AnyGraph, position: Position, checkpoint_id: UUID, parent: TaskAddress | None) -> Checkpoint:
     channels = position.channels
     versions = position.versions
     return Checkpoint(
+        id=checkpoint_id,
+        parent=parent,
         values=dump_values(graph.channels, channels.values),
         branches=tuple(sorted(node for node, cell in channels.branches.items() if cell.triggered)),
         joins=tuple(
@@ -116,13 +120,37 @@ def load_position(graph: AnyGraph, checkpoint: Checkpoint) -> Position:
 
 
 @dataclass(frozen=True)
-class ThreadJournal:
+class ThreadScope:
     graph: AnyGraph
     checkpointer: Checkpointer
     thread_id: str
+    parent: TaskAddress | None
+
+    async def save(self, position: Position) -> UUID:
+        checkpoint_id = uuid4()
+        await self.checkpointer.put(self.thread_id, dump_position(self.graph, position, checkpoint_id, self.parent))
+        return checkpoint_id
+
+    async def begin(self, position: Position) -> "tuple[Position, ThreadJournal]":
+        return position, ThreadJournal(self, await self.save(position))
+
+    async def resume(self) -> "tuple[Position, ThreadJournal] | None":
+        latest = await self.checkpointer.get_latest(self.thread_id, self.parent)
+        return None if latest is None else (load_position(self.graph, latest), ThreadJournal(self, latest.id))
+
+
+@dataclass
+class ThreadJournal:
+    scope: ThreadScope
+    checkpoint_id: UUID
 
     async def save(self, position: Position) -> None:
-        await self.checkpointer.put(self.thread_id, dump_position(self.graph, position))
+        self.checkpoint_id = await self.scope.save(position)
+
+    async def enter_child(self, child: AnyGraph, call: NodeCall) -> tuple[Position, Journal]:
+        address = TaskAddress(checkpoint_id=self.checkpoint_id, node=call.name, send_index=call.send_index)
+        scope = ThreadScope(child, self.scope.checkpointer, self.scope.thread_id, address)
+        return await scope.resume() or await scope.begin(child.start(extract_writes(call.node_input), {}))
 
 
 @dataclass(frozen=True)
@@ -131,19 +159,18 @@ class PersistentGraph[StateT, InputT, OutputT]:
     checkpointer: Checkpointer
 
     async def ainvoke(self, input: InputT, *, thread_id: str, step_limit: int | None = None) -> OutputT:
-        latest = await self.checkpointer.get_latest(thread_id)
+        latest = await self.checkpointer.get_latest(thread_id, None)
         given = {} if latest is None else load_values(self.graph.channels, latest.values)
-        position = self.graph.start(given, extract_writes(input))
-        journal = ThreadJournal(self.graph, self.checkpointer, thread_id)
-        await journal.save(position)
+        scope = ThreadScope(self.graph, self.checkpointer, thread_id, None)
+        position, journal = await scope.begin(self.graph.start(given, extract_writes(input)))
         return await self.graph.run(position, step_limit, journal)
 
     async def aresume(self, *, thread_id: str, step_limit: int | None = None) -> OutputT:
-        latest = await self.checkpointer.get_latest(thread_id)
-        if latest is None:
+        resumed = await ThreadScope(self.graph, self.checkpointer, thread_id, None).resume()
+        if resumed is None:
             raise LookupError(f"thread {thread_id!r} has no checkpoint")
-        journal = ThreadJournal(self.graph, self.checkpointer, thread_id)
-        return await self.graph.run(load_position(self.graph, latest), step_limit, journal)
+        position, journal = resumed
+        return await self.graph.run(position, step_limit, journal)
 
     def invoke(self, input: InputT, *, thread_id: str, step_limit: int | None = None) -> OutputT:
         return self.graph.run_in_new_loop(

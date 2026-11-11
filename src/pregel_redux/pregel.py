@@ -101,6 +101,7 @@ class PullTask:
 
 @dataclass(frozen=True)
 class PushTask:
+    index: int
     send: Send
 
 
@@ -133,7 +134,7 @@ def start_position(values: Mapping[str, object], nodes: Collection[str], joins: 
 
 def plan_tasks(position: Position, triggers: Mapping[str, Sequence[TriggerKey]]) -> list[Task]:
     pulls = [PullTask(node, fired) for node in sorted(triggers) if (fired := position.find_fired(node, triggers[node]))]
-    return [*pulls, *(PushTask(send) for send in position.channels.sends.sends)]
+    return [*pulls, *(PushTask(index, send) for index, send in enumerate(position.channels.sends.sends))]
 
 
 def replace_cells[KeyT, CellT](

@@ -67,16 +67,25 @@ class CompiledNode:
 @dataclass(frozen=True)
 class NodeCall:
     name: str
+    send_index: int | None
     node_input: object
 
 
 class Journal(Protocol):
     async def save(self, position: Position) -> None: ...
+    async def enter_child(
+        self, child: "CompiledGraph[object, Never, object]", call: NodeCall
+    ) -> "tuple[Position, Journal]": ...
 
 
 class NoJournal:
     async def save(self, position: Position) -> None:
         pass
+
+    async def enter_child(
+        self, child: "CompiledGraph[object, Never, object]", call: NodeCall
+    ) -> "tuple[Position, Journal]":
+        return child.start(extract_writes(call.node_input), {}), self
 
 
 @dataclass(frozen=True)
@@ -139,9 +148,9 @@ class CompiledGraph[StateT, InputT, OutputT]:
     def build_call(self, task: Task, values: Mapping[str, object]) -> NodeCall:
         match task:
             case PullTask():
-                return NodeCall(task.node, self.nodes[task.node].build_input(values))
+                return NodeCall(task.node, None, self.nodes[task.node].build_input(values))
             case PushTask():
-                return NodeCall(task.send.node, self.nodes[task.send.node].build_send_input(task.send))
+                return NodeCall(task.send.node, task.index, self.nodes[task.send.node].build_send_input(task.send))
             case _:
                 assert_never(task)
 
@@ -155,29 +164,32 @@ class CompiledGraph[StateT, InputT, OutputT]:
             steps += 1
             calls = [self.build_call(task, position.channels.values) for task in tasks]
             async with AsyncExitStack() as step_exits:
-                writes = await self.run_step(calls, run, step_exits)
+                writes = await self.run_step(calls, run, journal, step_exits)
                 position = advance(self.channels, position, tasks, writes)
                 await journal.save(position)
         values = position.channels.values
         return self.output_schema(**{name: values[name] for name in self.output_fields if name in values})
 
-    async def run_step(self, calls: Sequence[NodeCall], run: Run, step_exits: AsyncExitStack) -> list[TaskWrites]:
+    async def run_step(
+        self, calls: Sequence[NodeCall], run: Run, journal: Journal, step_exits: AsyncExitStack
+    ) -> list[TaskWrites]:
         try:
             async with asyncio.TaskGroup() as group:
-                tasks = [group.create_task(self.run_node(call, run, step_exits)) for call in calls]
+                tasks = [group.create_task(self.run_node(call, run, journal, step_exits)) for call in calls]
         except ExceptionGroup as failures:
             if len(failures.exceptions) == 1:
                 raise failures.exceptions[0] from None
             raise
         return [task.result() for task in tasks]
 
-    async def run_node(self, call: NodeCall, run: Run, step_exits: AsyncExitStack) -> TaskWrites:
+    async def run_node(self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack) -> TaskWrites:
         node = self.nodes[call.name]
         match node.action:
             case CallPlan() as plan:
                 return await self.call_function(plan, call, run, step_exits)
             case CompiledGraph() as child:
-                result = await child.run_steps(child.start(extract_writes(call.node_input), {}), run, NoJournal())
+                start, child_journal = await journal.enter_child(child, call)
+                result = await child.run_steps(start, run, child_journal)
                 return self.read_writes(call.name, result)
             case _:
                 assert_never(node.action)
