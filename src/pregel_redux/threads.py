@@ -190,7 +190,7 @@ class StateSnapshot[StateT]:
     interrupts: tuple[Interrupt, ...]
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True, kw_only=True)
 class Thread[StateT, InputT, OutputT]:
     graph: CompiledGraph[StateT, InputT, OutputT]
     checkpointer: Checkpointer

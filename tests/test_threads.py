@@ -141,7 +141,11 @@ def wrap_in_children(child: Builder, depth: int) -> Builder:
 
 
 def build_thread(builder: Builder, checkpointer: Checkpointer | None = None) -> Thread[State, State, State]:
-    return Thread(builder.compile(), InMemoryCheckpointer() if checkpointer is None else checkpointer, "thread")
+    return Thread(
+        graph=builder.compile(),
+        checkpointer=InMemoryCheckpointer() if checkpointer is None else checkpointer,
+        thread_id="thread",
+    )
 
 
 @pytest.mark.parametrize("names", [["first"], ["first", "second"], ["first", "second", "third"]], ids=len)
@@ -223,7 +227,7 @@ def test_saved_write_reaches_the_reducer_as_its_update_type_after_a_resume(names
         builder.add_edge(Endpoint.start, name)
     builder.add_node("flaky", fail_once)
     builder.add_edge(Endpoint.start, "flaky")
-    thread = Thread(builder.compile(), InMemoryCheckpointer(), "thread")
+    thread = Thread(graph=builder.compile(), checkpointer=InMemoryCheckpointer(), thread_id="thread")
     with pytest.raises(LookupError):
         thread.invoke({})
 
@@ -625,7 +629,7 @@ def test_value_that_a_checkpoint_cannot_restore_is_rejected(
     builder.add_node("write", write)
     builder.add_node("receive", lambda request: None, input_schema=HiddenRequest)
     builder.add_edge(Endpoint.start, "write")
-    thread = Thread(builder.compile(), InMemoryCheckpointer(), "thread")
+    thread = Thread(graph=builder.compile(), checkpointer=InMemoryCheckpointer(), thread_id="thread")
 
     with pytest.raises(ValueError):
         thread.invoke({})
@@ -648,14 +652,16 @@ def test_checkpoint_of_another_graph_is_rejected(journal: Journal, changed: str)
     other.add_edge(Endpoint.start, name)
 
     with pytest.raises(ValueError):
-        Thread(other.compile(), thread.checkpointer, "thread").resume()
+        Thread(graph=other.compile(), checkpointer=thread.checkpointer, thread_id="thread").resume()
 
 
 def test_state_of_an_unknown_checkpoint_is_none(journal: Journal) -> None:
     thread = build_thread(build_chain(journal, ["node"]))
     run_until_done(thread.invoke({}))
-    run_until_done(Thread(thread.graph, thread.checkpointer, "other").invoke({}))
-    other_id = Thread(thread.graph, thread.checkpointer, "other").history()[0].checkpoint.id
+    run_until_done(Thread(graph=thread.graph, checkpointer=thread.checkpointer, thread_id="other").invoke({}))
+    other_id = (
+        Thread(graph=thread.graph, checkpointer=thread.checkpointer, thread_id="other").history()[0].checkpoint.id
+    )
 
     assert thread.get_state(other_id) is None, "Expected no state for a checkpoint of another thread."
 
