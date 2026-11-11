@@ -8,14 +8,7 @@ from contextvars import copy_context
 from dataclasses import dataclass
 from typing import Any, Concatenate, Literal, Never, Protocol, assert_never, overload, runtime_checkable
 
-from pregel_redux.channels import (
-    Channel,
-    apply_writes,
-    build_channels,
-    build_start_values,
-    extract_writes,
-    merge_channels,
-)
+from pregel_redux.channels import Channel, apply_writes, build_channels, extract_writes, merge_channels
 from pregel_redux.commands import Endpoint, Outcome, Send, read_declared_targets, read_outcome
 from pregel_redux.dependencies import CallPlan, Depends, execute_plan, open_providers, plan_call
 
@@ -71,6 +64,16 @@ class NodeCall:
 class Edge:
     source: str | Literal[Endpoint.start]
     target: str | Literal[Endpoint.end]
+
+
+def build_start_values(channels: Mapping[str, Channel], given: Mapping[str, object]) -> dict[str, object]:
+    unknown = sorted(given.keys() - channels.keys())
+    if unknown:
+        raise ValueError(f"{unknown!r} are not channels of this graph")
+    initial = {
+        name: channel.reducer.make_initial() for name, channel in channels.items() if channel.reducer is not None
+    }
+    return {**initial, **given}
 
 
 @dataclass(frozen=True)

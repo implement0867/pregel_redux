@@ -13,10 +13,10 @@ from pregel_redux.channels import (
     Reducer,
     apply_writes,
     build_channels,
-    build_start_values,
     extract_writes,
     merge_channels,
 )
+from pregel_redux.graph import build_start_values
 from tests.conftest import append_item, join_lists
 
 

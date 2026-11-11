@@ -137,12 +137,6 @@ def merge_channels(schemas: Iterable[object]) -> dict[str, Channel]:
     return merged
 
 
-def read_field_default(field: dataclasses.Field[object]) -> object:
-    if field.default_factory is not dataclasses.MISSING:
-        return field.default_factory()
-    return field.default
-
-
 def extract_writes(update: object) -> dict[str, object]:
     match update:
         case None:
@@ -152,23 +146,13 @@ def extract_writes(update: object) -> dict[str, object]:
         case BaseModel():
             return {name: getattr(update, name) for name in update.model_fields_set}
         case _ if dataclasses.is_dataclass(update) and not isinstance(update, type):
-            return {
-                field.name: value
+            defaults = {
+                field.name: field.default if field.default_factory is dataclasses.MISSING else field.default_factory()
                 for field in dataclasses.fields(update)
-                if (value := getattr(update, field.name)) != read_field_default(field)
             }
+            return {name: value for name, default in defaults.items() if (value := getattr(update, name)) != default}
         case _:
             raise TypeError(f"{update!r} is not a mapping, a dataclass instance, a Pydantic model or None")
-
-
-def build_start_values(channels: Mapping[str, Channel], given: Mapping[str, object]) -> dict[str, object]:
-    unknown = sorted(given.keys() - channels.keys())
-    if unknown:
-        raise ValueError(f"{unknown!r} are not channels of this graph")
-    initial = {
-        name: channel.reducer.make_initial() for name, channel in channels.items() if channel.reducer is not None
-    }
-    return {**initial, **given}
 
 
 def apply_writes(
