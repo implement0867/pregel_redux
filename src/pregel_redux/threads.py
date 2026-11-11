@@ -6,6 +6,7 @@ from typing import Never, assert_never
 from uuid import UUID
 
 from pydantic import JsonValue
+from pydantic_core import to_json
 
 from pregel_redux.channels import apply_writes, extract_writes, reject_unknown_channels
 from pregel_redux.checkpoints import (
@@ -20,7 +21,6 @@ from pregel_redux.checkpoints import (
     TaskAddress,
     TaskStateKind,
     dump_value,
-    load_value,
 )
 from pregel_redux.graph import (
     CompiledGraph,
@@ -50,7 +50,7 @@ def encode_push(graph: AnyGraph, push: PushTask) -> SendTask:
 
 
 def decode_push(graph: AnyGraph, send: SendTask) -> PushTask:
-    return PushTask(send.node, load_value(graph.nodes[send.node].input_adapter, send.node_input))
+    return PushTask(send.node, graph.nodes[send.node].input_adapter.validate_json(to_json(send.node_input)))
 
 
 def encode_task(graph: AnyGraph, task: Task) -> EdgeTask | SendTask:
@@ -97,7 +97,10 @@ def decode_task_state(graph: AnyGraph, state: CompletedTask | InterruptedTask) -
             reject_unknown_channels(graph.channels, state.writes)
             reject_unknown_nodes(graph, [*state.targets, *(send.node for send in state.sends)])
             return TaskOutput(
-                {name: load_value(graph.channels[name].update_adapter, data) for name, data in state.writes.items()},
+                {
+                    name: graph.channels[name].update_adapter.validate_json(to_json(data))
+                    for name, data in state.writes.items()
+                },
                 frozenset(state.targets),
                 tuple(decode_push(graph, send) for send in state.sends),
             )
@@ -134,7 +137,9 @@ def decode_checkpoint(graph: AnyGraph, saved: SavedCheckpoint) -> Position:
         caller=checkpoint.caller,
         step=checkpoint.step,
         source=checkpoint.source,
-        values={name: load_value(graph.channels[name].adapter, data) for name, data in checkpoint.values.items()},
+        values={
+            name: graph.channels[name].adapter.validate_json(to_json(data)) for name, data in checkpoint.values.items()
+        },
         tasks=tuple(decode_task(graph, task) for task in checkpoint.tasks),
         progress={index: decode_task_state(graph, state) for index, state in saved.task_states.items()},
     )

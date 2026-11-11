@@ -118,14 +118,10 @@ class InMemoryCheckpointer:
         self.threads.pop(thread_id, None)
 
 
-def load_value(adapter: TypeAdapter[object], data: JsonValue) -> object:
-    return adapter.validate_json(to_json(data))
-
-
 def dump_value(adapter: TypeAdapter[object], value: object, owner: str) -> JsonValue:
     try:
         data: JsonValue = adapter.dump_python(value, mode="json", by_alias=True, warnings="error")
-        restored = load_value(adapter, data)
+        restored = adapter.validate_json(to_json(data))
     except (PydanticSerializationError, ValidationError) as error:
         raise ValueError(f"{owner} holds {value!r}, which a checkpoint cannot store") from error
     if restored != value:

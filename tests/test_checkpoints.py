@@ -9,6 +9,7 @@ from uuid import UUID, uuid4
 
 import pytest
 from pydantic import BaseModel, ConfigDict, Field, TypeAdapter
+from pydantic_core import to_json
 from typing_extensions import TypeForm
 
 from pregel_redux import CheckpointSource, InMemoryCheckpointer
@@ -21,7 +22,6 @@ from pregel_redux.checkpoints import (
     SendTask,
     TaskAddress,
     dump_value,
-    load_value,
 )
 
 
@@ -126,7 +126,7 @@ def test_value_of_its_declared_type_is_restored_equal(value_type: TypeForm[objec
     adapter = TypeAdapter[object](value_type)
 
     record = SendTask(node="node", node_input=dump_value(adapter, value, "the value"))
-    restored = load_value(adapter, SendTask.model_validate_json(record.model_dump_json()).node_input)
+    restored = adapter.validate_json(to_json(SendTask.model_validate_json(record.model_dump_json()).node_input))
 
     assert restored == value, f"Expected {value!r} after a round trip through JSON, got {restored!r}."
 
