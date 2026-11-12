@@ -37,6 +37,7 @@ from pregel_redux.graph.compiled import (
     NodeCall,
     TaskRef,
     iterate_in_new_loop,
+    name_task,
     refer_task,
     run_in_new_loop,
     stream_run,
@@ -66,7 +67,19 @@ from pregel_redux.pregel import (
     apply_writes,
     plan_tasks,
 )
-from pregel_redux.streams import CustomPart, InterruptsPart, Stream, StreamMode, StreamPart, UpdatesPart, ValuesPart
+from pregel_redux.snapshots import StateSnapshot, TaskSnapshot
+from pregel_redux.streams import (
+    CheckpointPart,
+    CustomPart,
+    InterruptsPart,
+    Stream,
+    StreamMode,
+    StreamPart,
+    TaskResultPart,
+    TaskStartPart,
+    UpdatesPart,
+    ValuesPart,
+)
 
 type AnyGraph = CompiledGraph[object, Never, object]
 
@@ -262,16 +275,6 @@ def load_position(graph: AnyGraph, checkpoint: Checkpoint) -> Position:
     return Position(channels, versions, seen)
 
 
-def name_task(task: TaskRef) -> str:
-    match task.node:
-        case Endpoint.start:
-            return "start"
-        case str() as node:
-            return f"pull|{node}" if task.send_index is None else f"push|{node}|{task.send_index}"
-        case _:
-            assert_never(task.node)
-
-
 @dataclass(frozen=True)
 class ThreadScope:
     graph: AnyGraph
@@ -281,18 +284,18 @@ class ThreadScope:
 
     async def put(
         self, position: Position, step: int, source: CheckpointSource, parent_id: UUID | None, newest_id: UUID | None
-    ) -> UUID:
+    ) -> Checkpoint:
         stamp = CheckpointStamp(make_checkpoint_id(newest_id), parent_id, datetime.now(UTC))
         checkpoint = dump_position(self.graph, position, stamp, self.checkpoint_ns, step, source)
         await self.checkpointer.aput(self.thread_id, checkpoint)
-        return stamp.checkpoint_id
+        return checkpoint
 
     async def begin(self, position: Position, step: int, parent_id: UUID | None) -> "ThreadJournal":
-        checkpoint_id = await self.put(position, step, CheckpointSource.input, parent_id, parent_id)
-        return ThreadJournal(self, checkpoint_id, step + 1, ())
+        checkpoint = await self.put(position, step, CheckpointSource.input, parent_id, parent_id)
+        return ThreadJournal(self, checkpoint, step + 1, ())
 
     def open_journal(self, saved: CheckpointTuple) -> "ThreadJournal":
-        return ThreadJournal(self, saved.checkpoint.id, saved.checkpoint.step + 1, saved.pending_writes)
+        return ThreadJournal(self, saved.checkpoint, saved.checkpoint.step + 1, saved.pending_writes)
 
     async def find(self, checkpoint_id: UUID | None) -> "Loaded | None":
         newest = await self.checkpointer.aget_tuple(self.thread_id, self.checkpoint_ns, None)
@@ -313,8 +316,8 @@ class ThreadScope:
         if checkpoint_id is None:
             return position, self.open_journal(loaded.saved)
         step = loaded.saved.checkpoint.step
-        fork_id = await self.put(position, step, CheckpointSource.fork, checkpoint_id, loaded.newest_id)
-        return position, ThreadJournal(self, fork_id, step + 1, ())
+        fork = await self.put(position, step, CheckpointSource.fork, checkpoint_id, loaded.newest_id)
+        return position, ThreadJournal(self, fork, step + 1, ())
 
     async def read_child_snapshot(self, journal: "ThreadJournal", task: TaskRef) -> "StateSnapshot | None":
         child = self.graph.nodes[task.node].action if isinstance(task.node, str) else None
@@ -363,35 +366,16 @@ class Loaded:
     newest_id: UUID
 
 
-@dataclass(frozen=True)
-class TaskSnapshot:
-    id: str
-    name: str
-    interrupts: tuple[Interrupt, ...]
-    finished: bool
-    state: "StateSnapshot | None"
-
-
-@dataclass(frozen=True)
-class StateSnapshot:
-    values: Mapping[str, object]
-    next: tuple[str, ...]
-    checkpoint_ns: str
-    checkpoint_id: UUID
-    parent_id: UUID | None
-    created_at: datetime
-    step: int
-    source: CheckpointSource
-    tasks: tuple[TaskSnapshot, ...]
-    interrupts: tuple[Interrupt, ...]
-
-
 @dataclass
 class ThreadJournal:
     scope: ThreadScope
-    checkpoint_id: UUID
+    checkpoint: Checkpoint
     step: int
     pending: Sequence[PendingWrite]
+
+    @property
+    def checkpoint_id(self) -> UUID:
+        return self.checkpoint.id
 
     @property
     def ns(self) -> tuple[str, ...]:
@@ -401,9 +385,13 @@ class ThreadJournal:
         return str(uuid5(self.checkpoint_id, f"{self.scope.checkpoint_ns}|{self.step}|{name_task(task)}"))
 
     async def save(self, position: Position, source: CheckpointSource) -> None:
-        self.checkpoint_id = await self.scope.put(position, self.step, source, self.checkpoint_id, self.checkpoint_id)
+        self.checkpoint = await self.scope.put(position, self.step, source, self.checkpoint_id, self.checkpoint_id)
         self.step += 1
         self.pending = ()
+
+    async def read_snapshot(self) -> StateSnapshot:
+        saved = CheckpointTuple(checkpoint=self.checkpoint, pending_writes=tuple(self.pending))
+        return await self.scope.read_snapshot(saved, subgraphs=False)
 
     def make_task_ns(self, task: TaskRef) -> str:
         parent_ns = f"{self.scope.checkpoint_ns}|" if self.scope.checkpoint_ns else ""
@@ -605,6 +593,28 @@ class PersistentGraph[StateT, InputT, OutputT]:
         input: InputT | Command[str] | None,
         *,
         thread_id: str,
+        stream_mode: Literal[StreamMode.tasks],
+        subgraphs: bool = False,
+        checkpoint_id: UUID | None = None,
+        step_limit: int | None = None,
+    ) -> AsyncGenerator[TaskStartPart | TaskResultPart]: ...
+    @overload
+    def astream(
+        self,
+        input: InputT | Command[str] | None,
+        *,
+        thread_id: str,
+        stream_mode: Literal[StreamMode.checkpoints],
+        subgraphs: bool = False,
+        checkpoint_id: UUID | None = None,
+        step_limit: int | None = None,
+    ) -> AsyncGenerator[CheckpointPart]: ...
+    @overload
+    def astream(
+        self,
+        input: InputT | Command[str] | None,
+        *,
+        thread_id: str,
         stream_mode: Collection[StreamMode],
         subgraphs: bool = False,
         checkpoint_id: UUID | None = None,
@@ -665,6 +675,28 @@ class PersistentGraph[StateT, InputT, OutputT]:
         checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> Iterator[CustomPart]: ...
+    @overload
+    def stream(
+        self,
+        input: InputT | Command[str] | None,
+        *,
+        thread_id: str,
+        stream_mode: Literal[StreamMode.tasks],
+        subgraphs: bool = False,
+        checkpoint_id: UUID | None = None,
+        step_limit: int | None = None,
+    ) -> Iterator[TaskStartPart | TaskResultPart]: ...
+    @overload
+    def stream(
+        self,
+        input: InputT | Command[str] | None,
+        *,
+        thread_id: str,
+        stream_mode: Literal[StreamMode.checkpoints],
+        subgraphs: bool = False,
+        checkpoint_id: UUID | None = None,
+        step_limit: int | None = None,
+    ) -> Iterator[CheckpointPart]: ...
     @overload
     def stream(
         self,
@@ -773,7 +805,8 @@ class PersistentGraph[StateT, InputT, OutputT]:
         updated = apply_writes(
             position, [PullTask(node, ())], [graph.read_writes(node, values)], [], graph.trigger_keys
         )
-        return await scope.put(updated, step + 1, CheckpointSource.update, parent_id, newest_id)
+        saved = await scope.put(updated, step + 1, CheckpointSource.update, parent_id, newest_id)
+        return saved.id
 
     async def aupdate_state(
         self,

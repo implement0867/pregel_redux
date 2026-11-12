@@ -4,12 +4,15 @@ from dataclasses import dataclass
 from enum import StrEnum
 
 from pregel_redux.interrupts import Interrupt
+from pregel_redux.snapshots import StateSnapshot
 
 
 class StreamMode(StrEnum):
     values = "values"
     updates = "updates"
     custom = "custom"
+    checkpoints = "checkpoints"
+    tasks = "tasks"
 
 
 @dataclass(frozen=True)
@@ -38,7 +41,32 @@ class CustomPart:
     data: object
 
 
-type StreamPart = ValuesPart | UpdatesPart | InterruptsPart | CustomPart
+@dataclass(frozen=True)
+class CheckpointPart:
+    ns: tuple[str, ...]
+    state: StateSnapshot
+
+
+@dataclass(frozen=True)
+class TaskStartPart:
+    ns: tuple[str, ...]
+    id: str
+    name: str
+    input: object
+
+
+@dataclass(frozen=True)
+class TaskResultPart:
+    ns: tuple[str, ...]
+    id: str
+    name: str
+    update: Mapping[str, object]
+    interrupts: tuple[Interrupt, ...]
+
+
+type StreamPart = (
+    ValuesPart | UpdatesPart | InterruptsPart | CustomPart | CheckpointPart | TaskStartPart | TaskResultPart
+)
 
 
 @dataclass(frozen=True)

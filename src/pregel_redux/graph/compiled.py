@@ -9,6 +9,7 @@ from dataclasses import dataclass
 from functools import cached_property
 from queue import SimpleQueue
 from typing import Literal, Never, Protocol, assert_never, overload
+from uuid import NAMESPACE_OID, uuid5
 
 from pydantic import JsonValue, TypeAdapter
 
@@ -53,12 +54,16 @@ from pregel_redux.pregel import (
     plan_tasks,
 )
 from pregel_redux.settings import RunSettings
+from pregel_redux.snapshots import StateSnapshot
 from pregel_redux.streams import (
+    CheckpointPart,
     CustomPart,
     InterruptsPart,
     Stream,
     StreamMode,
     StreamPart,
+    TaskResultPart,
+    TaskStartPart,
     UpdatesPart,
     ValuesPart,
     current_stream_writer,
@@ -130,16 +135,35 @@ class Journal(Protocol):
         self, task: TaskRef, interrupts: Sequence[Interrupt], resume: Sequence[JsonValue]
     ) -> None: ...
     def find_writes(self, task: TaskRef) -> TaskWrites | None: ...
+    def make_task_id(self, task: TaskRef) -> str: ...
+    async def read_snapshot(self) -> StateSnapshot | None: ...
     def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad: ...
     async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> ChildEntry: ...
 
 
-@dataclass(frozen=True)
+def name_task(task: TaskRef) -> str:
+    match task.node:
+        case Endpoint.start:
+            return "start"
+        case str() as node:
+            return f"pull|{node}" if task.send_index is None else f"push|{node}|{task.send_index}"
+        case _:
+            assert_never(task.node)
+
+
+@dataclass
 class NoJournal:
     ns: tuple[str, ...]
+    step: int
 
     async def save(self, position: Position, source: CheckpointSource) -> None:
-        pass
+        self.step += 1
+
+    def make_task_id(self, task: TaskRef) -> str:
+        return str(uuid5(NAMESPACE_OID, f"{'|'.join(self.ns)}|{self.step}|{name_task(task)}"))
+
+    async def read_snapshot(self) -> None:
+        return None
 
     async def record(self, task: TaskRef, writes: TaskWrites) -> None:
         pass
@@ -157,7 +181,7 @@ class NoJournal:
 
     async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> ChildEntry:
         start = child.feed(child.open(extract_writes(call.node_input)), {})
-        return ChildEntry(start, NoJournal((*self.ns, str(call.task.node))), resumed=False)
+        return ChildEntry(start, NoJournal((*self.ns, str(call.task.node)), 0), resumed=False)
 
 
 def refer_task(task: Task) -> TaskRef:
@@ -234,7 +258,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
 
     async def run_without_thread(self, input: InputT, step_limit: int | None, stream: Stream) -> OutputT:
         start = self.feed(self.open({}), extract_writes(input))
-        result = await self.run(start, step_limit, NoJournal(()), ResumeInput([], {}), stream, resumed=False)
+        result = await self.run(start, step_limit, NoJournal((), 0), ResumeInput([], {}), stream, resumed=False)
         match result:
             case Finished():
                 return result.output
@@ -292,6 +316,15 @@ class CompiledGraph[StateT, InputT, OutputT]:
         self,
         input: InputT,
         *,
+        stream_mode: Literal[StreamMode.tasks],
+        subgraphs: bool = False,
+        step_limit: int | None = None,
+    ) -> AsyncGenerator[TaskStartPart | TaskResultPart]: ...
+    @overload
+    def astream(
+        self,
+        input: InputT,
+        *,
         stream_mode: Collection[StreamMode],
         subgraphs: bool = False,
         step_limit: int | None = None,
@@ -336,6 +369,15 @@ class CompiledGraph[StateT, InputT, OutputT]:
         subgraphs: bool = False,
         step_limit: int | None = None,
     ) -> Iterator[CustomPart]: ...
+    @overload
+    def stream(
+        self,
+        input: InputT,
+        *,
+        stream_mode: Literal[StreamMode.tasks],
+        subgraphs: bool = False,
+        step_limit: int | None = None,
+    ) -> Iterator[TaskStartPart | TaskResultPart]: ...
     @overload
     def stream(
         self,
@@ -427,6 +469,8 @@ class CompiledGraph[StateT, InputT, OutputT]:
         position = start
         steps = 0
         skip_interrupt_before = resumed
+        if not resumed:
+            await self.send_checkpoint(run, journal)
         while tasks := plan_tasks(position, self.triggers):
             calls = [self.build_call(task, position) for task in tasks]
             names = {call.task.node for call in calls}
@@ -447,11 +491,18 @@ class CompiledGraph[StateT, InputT, OutputT]:
                 writes = [result for result in results if isinstance(result, TaskWrites)]
                 position = apply_writes(position, tasks, writes, [], self.trigger_keys)
                 await journal.save(position, CheckpointSource.loop)
+                await self.send_checkpoint(run, journal)
             run.stream.send(StreamMode.values, ValuesPart(journal.ns, position.channels.read_values(), ()))
             if not names.isdisjoint(self.interrupt_after):
                 return self.stop(position, run, journal, ())
         values = position.channels.read_values()
         return Finished(self.output_schema(**{name: values[name] for name in self.output_fields if name in values}))
+
+    async def send_checkpoint(self, run: Run, journal: Journal) -> None:
+        if StreamMode.checkpoints in run.stream.modes:
+            snapshot = await journal.read_snapshot()
+            if snapshot is not None:
+                run.stream.send(StreamMode.checkpoints, CheckpointPart(journal.ns, snapshot))
 
     def stop(self, position: Position, run: Run, journal: Journal, interrupts: tuple[Interrupt, ...]) -> Interrupted:
         run.stream.send(StreamMode.values, ValuesPart(journal.ns, position.channels.read_values(), interrupts))
@@ -479,14 +530,20 @@ class CompiledGraph[StateT, InputT, OutputT]:
         scratchpad = journal.open_scratchpad(call.task, run.resume)
         current_scratchpad.set(scratchpad)
         current_stream_writer.set(lambda data: run.stream.send(StreamMode.custom, CustomPart(journal.ns, data)))
+        name = call.task.node
+        task_id = journal.make_task_id(call.task)
+        if isinstance(name, str):
+            run.stream.send(StreamMode.tasks, TaskStartPart(journal.ns, task_id, name, call.node_input))
         try:
             writes = await self.run_node(call, run, journal, step_exits)
         except GraphInterrupt as stop:
             await finish_despite_cancellation(journal.record_interrupt(call.task, stop.interrupts, scratchpad.resume))
+            run.stream.send(StreamMode.tasks, TaskResultPart(journal.ns, task_id, str(name), {}, stop.interrupts))
             return Interrupted(stop.interrupts)
         await finish_despite_cancellation(journal.record(call.task, writes))
-        if isinstance(call.task.node, str):
-            run.stream.send(StreamMode.updates, UpdatesPart(journal.ns, call.task.node, writes.fields))
+        if isinstance(name, str):
+            run.stream.send(StreamMode.updates, UpdatesPart(journal.ns, name, writes.fields))
+            run.stream.send(StreamMode.tasks, TaskResultPart(journal.ns, task_id, name, writes.fields, ()))
         return writes
 
     async def run_node(self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack) -> TaskWrites:
