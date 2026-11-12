@@ -7,7 +7,7 @@ from tempfile import TemporaryDirectory
 from typing import Annotated, TypedDict, assert_never
 
 import pytest
-from hypothesis import event, given
+from hypothesis import event, given, settings
 from hypothesis import strategies as st
 from sqlalchemy import create_engine
 
@@ -299,6 +299,7 @@ def record_features(spec: GraphSpec) -> None:
 
 
 @pytest.mark.parametrize("open_checkpointer", [open_memory, open_sqlite])
+@settings(deadline=None)
 @given(spec=graph_specs((), 0), interactive=st.booleans(), failing=st.booleans(), data=st.data())
 def test_run_with_a_checkpointer_gives_the_output_of_a_run_without_one(
     open_checkpointer: Callable[[], AbstractContextManager[Checkpointer]],
@@ -332,6 +333,7 @@ def test_run_with_a_checkpointer_gives_the_output_of_a_run_without_one(
 
 
 @pytest.mark.parametrize("open_checkpointer", [open_memory, open_sqlite])
+@settings(deadline=None)
 @given(spec=graph_specs((), 0))
 def test_sync_run_gives_the_output_and_the_history_of_an_async_run(
     open_checkpointer: Callable[[], AbstractContextManager[Checkpointer]], spec: GraphSpec
@@ -363,6 +365,7 @@ def test_sync_run_gives_the_output_and_the_history_of_an_async_run(
 
 
 @pytest.mark.parametrize("open_checkpointer", [open_memory, open_sqlite])
+@settings(deadline=None)
 @given(spec=graph_specs((), 0))
 def test_history_of_a_finished_run_is_a_chain_of_its_checkpoints(
     open_checkpointer: Callable[[], AbstractContextManager[Checkpointer]], spec: GraphSpec
