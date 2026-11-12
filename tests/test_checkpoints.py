@@ -20,7 +20,7 @@ from pregel_redux import (
     Send,
     StateGraph,
 )
-from pregel_redux.checkpoints import CheckpointTuple, PendingWrite
+from pregel_redux.checkpoints import PendingWrite
 from tests.conftest import join_lists
 
 
@@ -119,7 +119,7 @@ def test_thread_holds_a_checkpoint_for_the_input_and_for_each_step(topics: list[
 
     asyncio.run(graph.ainvoke({"topics": topics}, {"thread_id": "thread"}))
 
-    actual = len(checkpointer.threads["thread"][""])
+    actual = len(list(checkpointer.list("thread", "", before=None, limit=None)))
     assert actual == steps + 2, f"Expected {steps + 2} checkpoints, got {actual}."
 
 
@@ -541,9 +541,7 @@ def test_checkpoints_of_a_thread_form_a_chain_in_the_order_of_their_ids(runs: in
     for _ in range(runs):
         asyncio.run(graph.ainvoke({"topics": ["cats"]}, {"thread_id": "thread"}))
 
-    stored = [
-        CheckpointTuple.model_validate_json(record).checkpoint for record in checkpointer.threads["thread"][""].values()
-    ]
+    stored = [saved.checkpoint for saved in checkpointer.list("thread", "", before=None, limit=None)][::-1]
     ids = [checkpoint.id for checkpoint in stored]
     parents = [checkpoint.parent_id for checkpoint in stored]
     versions = {checkpoint.v for checkpoint in stored}
@@ -554,20 +552,27 @@ def test_checkpoints_of_a_thread_form_a_chain_in_the_order_of_their_ids(runs: in
 
 def test_latest_checkpoint_is_the_one_with_the_greatest_id() -> None:
     """
-    Arrange: a thread of a run that failed, whose records the storage holds in the reverse order.
+    Arrange: a thread of a run that failed, whose records a checkpointer received from the newest to the oldest.
     Act: run the thread again without an input.
     Assert: the run continues from the checkpoint with the greatest id, so only the node that failed runs.
     """
     expected = asyncio.run(
         build_joke_graph(InMemoryCheckpointer(), [], []).ainvoke({"topics": ["cats"]}, {"thread_id": "thread"})
     )
-    checkpointer = InMemoryCheckpointer()
-    calls: list[str] = []
-    graph = build_joke_graph(checkpointer, [ConnectionError("no network")], calls)
+    source = InMemoryCheckpointer()
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke({"topics": ["cats"]}, {"thread_id": "thread"}))
-    checkpointer.threads["thread"][""] = dict(reversed(checkpointer.threads["thread"][""].items()))
-    calls.clear()
+        asyncio.run(
+            build_joke_graph(source, [ConnectionError("no network")], []).ainvoke(
+                {"topics": ["cats"]}, {"thread_id": "thread"}
+            )
+        )
+    checkpointer = InMemoryCheckpointer()
+    for saved in source.list("thread", "", before=None, limit=None):
+        checkpointer.put("thread", saved.checkpoint)
+        for write in saved.pending_writes:
+            checkpointer.put_writes("thread", "", saved.checkpoint.id, write)
+    calls: list[str] = []
+    graph = build_joke_graph(checkpointer, [], calls)
 
     actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
 

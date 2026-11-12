@@ -78,6 +78,8 @@ class StateGraph[StateT, InputT, OutputT]:
     ) -> None:
         if name in self.nodes or name in self.child_graphs:
             raise ValueError(f"node {name!r} is already in this graph")
+        if name == "__start__":
+            raise ValueError(f"node name {name!r} is the name of the start task in a state snapshot")
         reserved = sorted(set(name) & {"|", ":"})
         if reserved:
             raise ValueError(f"node name {name!r} has {reserved!r}, which separate the parts of a checkpoint namespace")

@@ -10,6 +10,7 @@ from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Annotated, TypedDict, assert_never
 
+import pytest
 from hypothesis import event, find, settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
@@ -136,6 +137,7 @@ class Trace:
     faults: dict[tuple[int, ...], Phase] = field(default_factory=dict)
     consumed: set[str] = field(default_factory=set)
     given: dict[str, str] = field(default_factory=dict)
+    plain: str | None = None
     fired: int = 0
     era: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
@@ -211,7 +213,9 @@ def find_reached_nodes(nodes: Sequence[NodeSpec], entries: Sequence[int]) -> lis
 
 @st.composite
 def graph_specs(draw: st.DrawFn, known_names: tuple[str, ...], depth: int) -> GraphSpec:
-    text = st.text(st.characters(exclude_categories=["Cs"], exclude_characters="|:"))
+    text = st.text(st.characters(exclude_categories=["Cs"], exclude_characters="|:")).filter(
+        lambda name: name != "__start__"
+    )
     name = st.one_of(st.sampled_from(known_names), text) if known_names else text
     names = list(dict.fromkeys(draw(st.lists(name, min_size=1, max_size=5))))
     nodes: list[NodeSpec] = []
@@ -277,6 +281,10 @@ def build_function(
                 for index in range(questions if build.interactive else 0):
                     question = json.dumps([list(path), execution.origin, execution.clock, index])
                     answer = interrupt(question, response_schema=str)
+                    with trace.lock:
+                        if answer == trace.plain and question not in trace.consumed:
+                            trace.given[question] = answer
+                            trace.plain = None
                     execution.given.append(trace.given.get(question))
                     execution.received.append(answer)
                     trace.consumed.add(question)
@@ -657,12 +665,26 @@ class ThreadMachine(RuleBasedStateMachine):
         self.thread.trace.given.update({read_question(item): answers[item.id] for item in chosen})
         self.deliver(Command(resume_by_interrupt_id=answers), self.config, delivery)
 
-    @precondition(lambda self: len(self.waiting()) == 1)
+    @precondition(is_started)
     @rule(delivery=deliveries(), text=st.text())
     def answer_plainly(self, delivery: Delivery, text: str) -> None:
-        answer = self.thread.make_text(text)
-        self.thread.trace.given[read_question(self.waiting()[0])] = answer
-        self.deliver(Command(resume=answer), self.config, delivery)
+        thread = self.thread
+        answer = thread.make_text(text)
+        event(f"plain answer for waiting interrupts: {min(len(self.waiting()), 2)}")
+        match self.waiting():
+            case []:
+                thread.trace.plain = answer
+                self.deliver(Command(resume=answer), self.config, delivery)
+                thread.trace.plain = None
+            case [waiting]:
+                thread.trace.given[read_question(waiting)] = answer
+                self.deliver(Command(resume=answer), self.config, delivery)
+            case _:
+                before = self.runner.run(thread.graph.aget_state(self.config))
+                with pytest.raises(ValueError):
+                    self.deliver(Command(resume=answer), self.config, delivery)
+                after = self.runner.run(thread.graph.aget_state(self.config))
+                assert after == before, f"Expected a refused answer to leave the state {before}, got {after}."
 
     @precondition(is_started)
     @rule(delivery=deliveries(), texts=st.lists(st.text()))
@@ -677,21 +699,37 @@ class ThreadMachine(RuleBasedStateMachine):
     def run_with_a_goto(self, delivery: Delivery, data: st.DataObject) -> None:
         thread = self.thread
         index = data.draw(st.sampled_from(range(len(thread.spec.nodes))))
-        name = thread.spec.nodes[index].name
+        node = thread.spec.nodes[index]
+        tag = thread.make_text("") if data.draw(st.booleans()) else None
         snapshot = thread.snapshot
         finished = snapshot is not None and any(
-            task.name == name and task.result is not None for task in snapshot.tasks
+            task.name == node.name and task.result is not None for task in snapshot.tasks
         )
         started = sum(execution.path[0] == index for execution in list(thread.trace.executions.values()))
         thread.diverged = True
         thread.steered = True
         thread.trace.start_era()
+        event(f"goto of a command with a send: {tag is not None}")
 
-        result = self.deliver(Command(goto=name), self.config, delivery)
+        target: str | Send = node.name
+        if tag is not None:
+            match node.work:
+                case FunctionSpec():
+                    target = Send(node.name, State(origin=tag))
+                case ChildSpec():
+                    target = Send(node.name, ChildInput(origin=tag, clock=0))
+                case _:
+                    assert_never(node.work)
+        result = self.deliver(Command(goto=target), self.config, delivery)
 
-        now = sum(execution.path[0] == index for execution in list(thread.trace.executions.values()))
-        if result is not None and not finished and not thread.spec.nodes[index].defer:
-            assert now > started, f"Expected the node {name!r} to run after a goto to it."
+        executions = list(thread.trace.executions.values())
+        now = sum(execution.path[0] == index for execution in executions)
+        if result is not None and tag is not None:
+            received = [execution.path for execution in executions if execution.origin == tag]
+            assert received, f"Expected the node {node.name!r} to run with the payload of the send."
+            assert all(path[0] == index for path in received), f"Expected the payload only in {node.name!r}."
+        elif result is not None and not finished and not node.defer:
+            assert now > started, f"Expected the node {node.name!r} to run after a goto to it."
 
     @precondition(lambda self: bool(self.thread.history))
     @rule(delivery=deliveries(), data=st.data())
@@ -711,12 +749,17 @@ class ThreadMachine(RuleBasedStateMachine):
         thread = self.thread
         graph = thread.graph
         snapshot = self.runner.run(graph.aget_state(self.config, subgraphs=True))
-        before = data.draw(st.sampled_from([snapshot, *find_namespaces(snapshot)]))
-        config = ThreadConfig(thread_id="thread", checkpoint_ns=before.checkpoint_ns)
+        before = data.draw(st.sampled_from([snapshot, *find_namespaces(snapshot), *thread.history]))
+        config = (
+            ThreadConfig(thread_id="thread", checkpoint_id=before.checkpoint_id)
+            if before in thread.history
+            else ThreadConfig(thread_id="thread", checkpoint_ns=before.checkpoint_ns)
+        )
         spec = find_spec(thread.spec, before.checkpoint_ns)
         node = data.draw(st.one_of(st.none(), st.sampled_from(spec.nodes)))
         notes = [thread.make_text(text) for text in texts]
         values = State(visits=notes)
+        event(f"state update at an older checkpoint: {before in thread.history[1:]}")
         as_node = None if node is None else node.name
         writer = node
         if node is None and len(spec.nodes) == 1:
@@ -736,6 +779,8 @@ class ThreadMachine(RuleBasedStateMachine):
         thread.steered = True
         thread.result = None
 
+        newest_config = ThreadConfig(thread_id="thread", checkpoint_ns=before.checkpoint_ns)
+        newest = self.runner.run(graph.aget_state(newest_config))
         updated = True
         try:
             match mode if thread.sync_allowed else CallMode.asynchronous:
@@ -751,11 +796,14 @@ class ThreadMachine(RuleBasedStateMachine):
             assert writer is None, f"Expected the update as the node {writer!r} to be accepted."
             updated = False
 
-        after = self.runner.run(graph.aget_state(config))
-        expected = [*read_visits(before.values), *(notes if updated else [])]
+        after = self.runner.run(graph.aget_state(newest_config))
+        if not updated:
+            assert after == newest, f"Expected a refused update to leave the state {newest}, got {after}."
+            return
+        expected = [*read_visits(before.values), *notes]
         assert read_visits(after.values) == expected, f"Expected the visits {expected}, got {after.values}."
         assert after.values.get("clock") == before.values.get("clock"), "Expected the clock to stay as it was."
-        if updated and writer is not None:
+        if writer is not None:
             targets = {spec.nodes[target].name for target in writer.targets if not spec.nodes[target].defer}
             assert targets <= set(after.next), f"Expected {targets} among the next nodes, got {after.next}."
 

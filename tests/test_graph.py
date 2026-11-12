@@ -409,6 +409,18 @@ def test_node_name_with_a_namespace_separator_is_rejected(
         parallel_builder.add_node(name, lambda state: None)
 
 
+def test_node_with_the_name_of_the_start_task_is_rejected(
+    parallel_builder: StateGraph[State[int], State[int], State[int]],
+) -> None:
+    """
+    Arrange: a graph builder.
+    Act: add a node with the name that a state snapshot gives to the start task.
+    Assert: the builder rejects the name.
+    """
+    with pytest.raises(ValueError):
+        parallel_builder.add_node("__start__", lambda state: None)
+
+
 @pytest.mark.parametrize("name", ["first", "second"])
 def test_duplicate_node_name_is_rejected(
     parallel_builder: StateGraph[State[int], State[int], State[int]], name: str

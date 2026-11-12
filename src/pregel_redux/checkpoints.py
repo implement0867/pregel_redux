@@ -5,7 +5,7 @@ from enum import Enum, StrEnum
 from typing import Annotated, Literal, Protocol
 from uuid import UUID
 
-from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue
+from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
 from pregel_redux.interrupts import Interrupt
 
@@ -179,27 +179,32 @@ class ThreadedCheckpointer:
 @dataclass
 class InMemoryCheckpointer:
     threads: dict[str, dict[str, dict[UUID, str]]] = field(default_factory=dict)
+    pending: dict[tuple[str, str, UUID], dict[tuple[str, str], str]] = field(default_factory=dict)
 
     def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
-        saved = CheckpointTuple(checkpoint=checkpoint, pending_writes=())
-        self.threads.setdefault(thread_id, {}).setdefault(checkpoint.checkpoint_ns, {})[checkpoint.id] = (
-            saved.model_dump_json()
-        )
+        records = self.threads.setdefault(thread_id, {}).setdefault(checkpoint.checkpoint_ns, {})
+        records[checkpoint.id] = checkpoint.model_dump_json()
 
     def put_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
-        records = self.threads[thread_id][checkpoint_ns]
-        saved = CheckpointTuple.model_validate_json(records[checkpoint_id])
-        kept = tuple(item for item in saved.pending_writes if (item.kind, item.task_id) != (write.kind, write.task_id))
-        records[checkpoint_id] = CheckpointTuple(
-            checkpoint=saved.checkpoint, pending_writes=(*kept, write)
-        ).model_dump_json()
+        if checkpoint_id not in self.threads[thread_id][checkpoint_ns]:
+            raise KeyError(checkpoint_id)
+        records = self.pending.setdefault((thread_id, checkpoint_ns, checkpoint_id), {})
+        records[(write.kind.value, write.task_id or "")] = write.model_dump_json()
+
+    def read_tuple(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID) -> CheckpointTuple:
+        adapter = TypeAdapter[PendingWrite](PendingWrite)
+        writes = sorted(self.pending.get((thread_id, checkpoint_ns, checkpoint_id), {}).items())
+        return CheckpointTuple(
+            checkpoint=Checkpoint.model_validate_json(self.threads[thread_id][checkpoint_ns][checkpoint_id]),
+            pending_writes=tuple(adapter.validate_json(write) for _, write in writes),
+        )
 
     def get_tuple(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None) -> CheckpointTuple | None:
         records = self.threads.get(thread_id, {}).get(checkpoint_ns, {})
         found = max(records, default=None) if checkpoint_id is None else checkpoint_id
         if found is None or found not in records:
             return None
-        return CheckpointTuple.model_validate_json(records[found])
+        return self.read_tuple(thread_id, checkpoint_ns, found)
 
     def list(
         self, thread_id: str, checkpoint_ns: str, *, before: UUID | None, limit: int | None
@@ -207,10 +212,12 @@ class InMemoryCheckpointer:
         records = self.threads.get(thread_id, {}).get(checkpoint_ns, {})
         found = sorted((key for key in records if before is None or key < before), reverse=True)
         for key in found[:limit]:
-            yield CheckpointTuple.model_validate_json(records[key])
+            yield self.read_tuple(thread_id, checkpoint_ns, key)
 
     def delete_thread(self, thread_id: str) -> None:
         self.threads.pop(thread_id, None)
+        for key in [key for key in tuple(self.pending) if key[0] == thread_id]:
+            self.pending.pop(key, None)
 
     async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
         self.put(thread_id, checkpoint)

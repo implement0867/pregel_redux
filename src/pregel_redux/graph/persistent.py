@@ -482,9 +482,13 @@ class ThreadJournal:
         given = command.resume_by_interrupt_id or {}
         if command.resume is not None:
             waiting = [interrupt.id for interrupt in (await self.read_snapshot()).interrupts]
-            if len(waiting) > 1:
-                raise ValueError(f"the interrupts {waiting!r} wait for an answer, so give resume_by_interrupt_id")
-            return ResumeInput([command.resume], given)
+            match waiting:
+                case []:
+                    return ResumeInput([command.resume], given)
+                case [interrupt_id]:
+                    return ResumeInput([], {**given, interrupt_id: command.resume})
+                case _:
+                    raise ValueError(f"the interrupts {waiting!r} wait for an answer, so give resume_by_interrupt_id")
         return ResumeInput([], given)
 
     async def record_command(self, writes: TaskWrites) -> None:
