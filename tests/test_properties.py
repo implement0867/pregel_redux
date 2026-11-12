@@ -365,6 +365,23 @@ def canonize(trace: Trace, visits: Sequence[str]) -> tuple[list[object], Counter
     )
 
 
+def find_unfired_joins(spec: GraphSpec, trace: Trace) -> list[JoinSpec]:
+    current = {
+        label: execution
+        for label, execution in list(trace.executions.items())
+        if execution.completed and execution.era == trace.era and len(execution.path) == 1
+    }
+    unfired: list[JoinSpec] = []
+    for join in spec.joins:
+        seen = {
+            visit for execution in current.values() if execution.path == (join.target,) for visit in execution.observed
+        }
+        arrived = {execution.path[0] for label, execution in current.items() if label not in seen}
+        if join.target is not None and arrived >= set(join.sources):
+            unfired.append(join)
+    return unfired
+
+
 def run_plain(spec: GraphSpec, origin: str) -> tuple[Trace, State]:
     trace = Trace()
     graph = build_graph(spec, Build(interactive=False, async_nodes=True, trace=trace)).compile()
@@ -459,6 +476,7 @@ class Thread:
     promised: list[str] = field(default_factory=list)
     serial: int = 0
     diverged: bool = False
+    steered: bool = False
     result: Finished[State] | Interrupted | None = None
     snapshot: StateSnapshot | None = None
     history: list[StateSnapshot] = field(default_factory=list)
@@ -469,6 +487,7 @@ class Thread:
 
     def diverge(self) -> None:
         self.diverged = True
+        self.steered = False
         self.promised.clear()
         self.trace.start_era()
 
@@ -634,6 +653,7 @@ class ThreadMachine(RuleBasedStateMachine):
         )
         started = sum(execution.path[0] == index for execution in list(thread.trace.executions.values()))
         thread.diverged = True
+        thread.steered = True
         thread.trace.start_era()
 
         result = self.deliver(Command(goto=name), self.config, delivery)
@@ -668,6 +688,7 @@ class ThreadMachine(RuleBasedStateMachine):
         values = State(visits=notes)
         as_node = None if node is None else node.name
         thread.diverge()
+        thread.steered = True
         thread.result = None
 
         updated = True
@@ -712,6 +733,8 @@ class ThreadMachine(RuleBasedStateMachine):
             assert now != progress, f"Expected a run with all answers to change the thread, got {result} again."
 
         visits = result.output.get("visits", [])
+        unfired = [] if thread.steered else find_unfired_joins(thread.spec, thread.trace)
+        assert not unfired, f"Expected the target of each join to run after all its sources, got none for {unfired}."
         for note in thread.promised:
             assert visits.count(note) == 1, f"Expected the note {note!r} of a command one time in {visits}."
         if not thread.diverged:
