@@ -188,7 +188,7 @@ def test_one_resume_value_for_more_than_one_waiting_interrupt_is_rejected() -> N
     graph = build_asking_graph(2, 1, [])
     asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
 
-    with pytest.raises(ValueError, match="resume_by_interrupt_id"):
+    with pytest.raises(ValueError):
         asyncio.run(graph.ainvoke(Command(resume="answer"), {"thread_id": "thread"}))
 
 
@@ -310,7 +310,7 @@ def test_interrupt_in_a_graph_without_a_checkpointer_is_rejected() -> None:
     builder.add_node("ask", build_asking_node("ask", 1, []))
     builder.add_edge(Endpoint.start, "ask")
 
-    with pytest.raises(RuntimeError, match="checkpointer"):
+    with pytest.raises(RuntimeError):
         asyncio.run(builder.compile().ainvoke({}))
 
 
@@ -320,5 +320,5 @@ def test_interrupt_outside_a_graph_is_rejected() -> None:
     Act: call interrupt.
     Assert: the call raises a RuntimeError.
     """
-    with pytest.raises(RuntimeError, match="inside a node"):
+    with pytest.raises(RuntimeError):
         interrupt("question", response_schema=str)

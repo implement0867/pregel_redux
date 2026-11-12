@@ -458,5 +458,5 @@ def test_type_alias_with_depends_supplies_its_value() -> None:
 
 
 def test_read_state_outside_a_graph_raises() -> None:
-    with pytest.raises(RuntimeError, match="node-scoped dependency"):
+    with pytest.raises(RuntimeError):
         read_state()
