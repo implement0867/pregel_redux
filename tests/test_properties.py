@@ -34,6 +34,7 @@ from pregel_redux import (
     interrupt,
 )
 from pregel_redux.checkpoints import CheckpointSource
+from pregel_redux.snapshots import PullPath, TaskSnapshot
 from pregel_redux.sqlite import SqliteCheckpointer
 from pregel_redux.streams import StreamPart, ValuesPart
 from tests.conftest import collect, join_lists
@@ -717,6 +718,20 @@ class ThreadMachine(RuleBasedStateMachine):
         notes = [thread.make_text(text) for text in texts]
         values = State(visits=notes)
         as_node = None if node is None else node.name
+        writer = node
+        if node is None and len(spec.nodes) == 1:
+            writer = spec.nodes[0]
+        elif node is None and before.source is CheckpointSource.loop and before.parent_id is not None:
+            parent = self.runner.run(
+                graph.aget_state(
+                    ThreadConfig(thread_id="thread", checkpoint_ns=before.checkpoint_ns, checkpoint_id=before.parent_id)
+                )
+            )
+            match parent.tasks:
+                case [TaskSnapshot(name=name, path=PullPath())]:
+                    writer = next((candidate for candidate in spec.nodes if candidate.name == name), None)
+                case _:
+                    pass
         thread.diverge()
         thread.steered = True
         thread.result = None
@@ -733,15 +748,15 @@ class ThreadMachine(RuleBasedStateMachine):
                 case _ as unknown:
                     assert_never(unknown)
         except ValueError:
-            assert as_node is None, f"Expected the update as the node {as_node!r} to be accepted."
+            assert writer is None, f"Expected the update as the node {writer!r} to be accepted."
             updated = False
 
         after = self.runner.run(graph.aget_state(config))
         expected = [*read_visits(before.values), *(notes if updated else [])]
         assert read_visits(after.values) == expected, f"Expected the visits {expected}, got {after.values}."
         assert after.values.get("clock") == before.values.get("clock"), "Expected the clock to stay as it was."
-        if updated and node is not None:
-            targets = {spec.nodes[target].name for target in node.targets if not spec.nodes[target].defer}
+        if updated and writer is not None:
+            targets = {spec.nodes[target].name for target in writer.targets if not spec.nodes[target].defer}
             assert targets <= set(after.next), f"Expected {targets} among the next nodes, got {after.next}."
 
     @precondition(is_started)

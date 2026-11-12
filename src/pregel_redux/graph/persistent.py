@@ -506,10 +506,9 @@ def infer_writer(graph: AnyGraph, versions_seen: Mapping[str, TriggerVersions]) 
     if len(graph.nodes) == 1:
         return next(iter(graph.nodes))
     last_seen = sorted(
-        (version, node)
+        (max(versions), node)
         for node, seen in versions_seen.items()
-        if node in graph.nodes
-        for version in (*seen.branches.values(), *(join.version for join in seen.joins))
+        if node in graph.nodes and (versions := [*seen.branches.values(), *(join.version for join in seen.joins)])
     )
     if len(last_seen) == 1 or (len(last_seen) > 1 and last_seen[-1][0] != last_seen[-2][0]):
         return last_seen[-1][1]

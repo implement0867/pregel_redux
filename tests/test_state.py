@@ -251,6 +251,31 @@ def test_state_update_without_a_clear_node_is_rejected(as_node: str | None, *, s
         graph.update_state({"thread_id": "thread"}, {"notes": ["edit"]}, as_node=as_node)
 
 
+def test_state_update_infers_a_node_that_ran_after_an_edge_and_a_join() -> None:
+    """
+    Arrange: a thread in which the last node ran after an edge and a join that arrived in the same step.
+    Act: update the state with no node name.
+    Assert: the update counts as the output of the last node, so the node after it is next.
+    """
+    builder = StateGraph(State, output_schema=Output)
+    for name in ("left", "right", "both", "last"):
+        builder.add_node(name, build_writer(name, []))
+    builder.add_edge(Endpoint.start, "left")
+    builder.add_edge(Endpoint.start, "right")
+    builder.add_edge("left", "both")
+    builder.add_edge(("left", "right"), "both")
+    builder.add_edge("both", "last")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer(), interrupt_after=("both",))
+    graph.invoke({}, {"thread_id": "thread"})
+
+    graph.update_state({"thread_id": "thread"}, {"notes": ["edit"]})
+
+    state = graph.get_state({"thread_id": "thread"})
+    summary = (state.values, state.next)
+    expected = ({"notes": ["left", "right", "both", "edit"]}, ("last",))
+    assert summary == expected, f"Expected {expected}, got {summary}."
+
+
 def test_state_update_from_an_earlier_checkpoint_becomes_the_newest_state() -> None:
     """
     Arrange: a thread of a run that finished, and the id of the state before the third node.
