@@ -368,18 +368,23 @@ def test_child_graph_stops_before_its_named_node_and_continues() -> None:
     assert isinstance(actual, Finished), f"Expected a finished run, got {actual}."
 
 
-def test_unknown_node_in_interrupt_before_is_rejected() -> None:
+@pytest.mark.parametrize(
+    ("interrupt_before", "interrupt_after"), [(["missing"], []), ([], ["missing"])], ids=["before", "after"]
+)
+def test_unknown_node_in_an_interrupt_list_is_rejected(interrupt_before: list[str], interrupt_after: list[str]) -> None:
     """
     Arrange: a builder with one node.
-    Act: compile it with interrupt_after that names another node.
+    Act: compile it with interrupt_before or interrupt_after that names another node.
     Assert: compile raises ValueError that names the node.
     """
     builder = StateGraph(State, output_schema=Output)
     builder.add_node("first", build_writer("first", []))
     builder.add_edge(Endpoint.start, "first")
 
-    with pytest.raises(ValueError):
-        builder.compile(checkpointer=InMemoryCheckpointer(), interrupt_after=["missing"])
+    with pytest.raises(ValueError, match="missing"):
+        builder.compile(
+            checkpointer=InMemoryCheckpointer(), interrupt_before=interrupt_before, interrupt_after=interrupt_after
+        )
 
 
 def test_resume_value_continues_a_thread_that_stopped_before_a_node() -> None:

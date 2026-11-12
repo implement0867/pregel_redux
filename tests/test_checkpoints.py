@@ -171,19 +171,29 @@ def test_resume_starts_at_the_step_that_failed(topics: list[str]) -> None:
 
 def test_resume_of_a_pending_send_starts_its_node_with_the_stored_payload() -> None:
     """
-    Arrange: a thread whose latest checkpoint is the one after the step that made the sends.
-    Act: resume the thread.
-    Assert: the output has one joke for each stored payload.
+    Arrange: a thread whose run failed in the node that a send started, and a new graph on the same checkpointer.
+    Act: resume the thread on the new graph.
+    Assert: the node runs with the stored payload.
     """
     checkpointer = InMemoryCheckpointer()
-    graph = build_joke_graph(checkpointer, [], [])
-    asyncio.run(graph.ainvoke({"topics": ["cats", "dogs"]}, {"thread_id": "thread"}))
-    checkpointer.threads["thread"][""] = dict(sorted(checkpointer.threads["thread"][""].items())[:3])
+
+    def fail(request: DictRequest) -> str:
+        raise ConnectionError(request["topic"])
+
+    with pytest.raises(ConnectionError):
+        asyncio.run(
+            build_joke_graph(checkpointer, [], [], read_topic=fail).ainvoke(
+                {"topics": ["cats"]}, {"thread_id": "thread"}
+            )
+        )
+    calls: list[str] = []
+    graph = build_joke_graph(checkpointer, [], calls)
 
     actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
 
-    expected = Finished({"jokes": ["joke about cats", "joke about dogs", "review"]})
+    expected = Finished({"jokes": ["joke about cats", "review"]})
     assert actual == expected, f"Expected {expected}, got {actual}."
+    assert calls == ["write", "review"], f"Expected the calls ['write', 'review'], got {calls}."
 
 
 def test_resume_keeps_the_sources_of_a_join_that_finished_before_the_failure() -> None:
