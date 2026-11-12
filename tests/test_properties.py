@@ -1,14 +1,19 @@
 import asyncio
-from collections.abc import Callable, Generator, Iterator, Sequence
-from contextlib import AbstractContextManager, contextmanager, suppress
-from dataclasses import dataclass
+import json
+import threading
+from collections import Counter
+from collections.abc import AsyncGenerator, Callable, Generator, Iterator, Mapping, Sequence
+from contextlib import AbstractContextManager, ExitStack, aclosing, closing, contextmanager, suppress
+from dataclasses import dataclass, field
+from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
 from typing import Annotated, TypedDict, assert_never
 
-import pytest
-from hypothesis import event, given, settings
+from hypothesis import event, find, settings
 from hypothesis import strategies as st
+from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
+from pydantic import TypeAdapter
 from sqlalchemy import create_engine
 
 from pregel_redux import (
@@ -17,24 +22,36 @@ from pregel_redux import (
     Endpoint,
     Finished,
     InMemoryCheckpointer,
+    Interrupt,
     Interrupted,
+    PersistentGraph,
     Reducer,
     Send,
     StateGraph,
+    StateSnapshot,
+    StreamMode,
     ThreadConfig,
     interrupt,
 )
+from pregel_redux.checkpoints import CheckpointSource
 from pregel_redux.sqlite import SqliteCheckpointer
+from pregel_redux.streams import StreamPart, ValuesPart
 from tests.conftest import collect, join_lists
+
+
+def add_numbers(current: int, update: int) -> int:
+    return current + update
 
 
 class State(TypedDict, total=False):
     origin: str
+    clock: Annotated[int, Reducer(add_numbers, initial_factory=int)]
     visits: Annotated[list[str], Reducer(join_lists, initial_factory=list)]
 
 
-class Origin(TypedDict, total=False):
+class ChildInput(TypedDict, total=False):
     origin: str
+    clock: Annotated[int, Reducer(add_numbers, initial_factory=int)]
 
 
 class Visits(TypedDict, total=False):
@@ -63,7 +80,7 @@ class RouterSpec:
 class FunctionSpec:
     action: WriterSpec | AskerSpec | RouterSpec
     is_async: bool
-    fails: bool
+    pauses: int
 
 
 @dataclass(frozen=True)
@@ -93,11 +110,62 @@ class GraphSpec:
     joins: tuple[JoinSpec, ...]
 
 
+class Phase(Enum):
+    start = "start"
+    end = "end"
+
+
+@dataclass
+class Execution:
+    path: tuple[int, ...]
+    era: int
+    origin: str | None
+    clock: int
+    observed: tuple[str, ...]
+    given: list[str | None] = field(default_factory=list)
+    received: list[str | None] = field(default_factory=list)
+    completed: bool = False
+
+
+@dataclass
+class Trace:
+    executions: dict[str, Execution] = field(default_factory=dict)
+    tags: dict[str, tuple[str, int]] = field(default_factory=dict)
+    faults: dict[tuple[int, ...], Phase] = field(default_factory=dict)
+    consumed: set[str] = field(default_factory=set)
+    given: dict[str, str] = field(default_factory=dict)
+    fired: int = 0
+    era: int = 0
+    lock: threading.Lock = field(default_factory=threading.Lock)
+
+    def begin(self, execution: Execution) -> str:
+        with self.lock:
+            label = f"#{len(self.executions)}"
+            self.executions[label] = execution
+            return label
+
+    def fail(self, path: tuple[int, ...], phase: Phase) -> None:
+        with self.lock:
+            armed = self.faults.get(path) is phase
+            if armed:
+                del self.faults[path]
+                self.fired += 1
+        if armed:
+            raise ConnectionError(path)
+
+    def start_era(self) -> None:
+        self.era += 1
+        self.consumed.clear()
+
+    def completed(self) -> list[Execution]:
+        return [execution for execution in list(self.executions.values()) if execution.completed]
+
+
 @dataclass(frozen=True)
 class Build:
     interactive: bool
     async_nodes: bool
-    failed: set[tuple[int, ...]] | None
+    trace: Trace
 
 
 def pick_some(items: Sequence[int]) -> st.SearchStrategy[tuple[int, ...]]:
@@ -132,10 +200,7 @@ def graph_specs(draw: st.DrawFn, known_names: tuple[str, ...], depth: int) -> Gr
             ),
         )
         function = st.builds(
-            FunctionSpec,
-            action=action,
-            is_async=st.booleans(),
-            fails=st.booleans(),
+            FunctionSpec, action=action, is_async=st.booleans(), pauses=st.integers(min_value=0, max_value=3)
         )
         child = st.builds(ChildSpec, graph=graph_specs((*known_names, *names), depth + 1))
         work = draw(function if depth == 2 else st.one_of(function, child))
@@ -146,51 +211,63 @@ def graph_specs(draw: st.DrawFn, known_names: tuple[str, ...], depth: int) -> Gr
 
 
 def build_function(
-    spec: GraphSpec, node: NodeSpec, work: FunctionSpec, path: tuple[int, ...], build: Build
+    spec: GraphSpec, work: FunctionSpec, path: tuple[int, ...], build: Build
 ) -> Callable[[State], object]:
-    name = node.name
+    trace = build.trace
 
-    def send(index: int, visits: list[str]) -> Send:
+    def send(position: int, index: int, label: str, execution: Execution) -> Send:
+        tag = f"{label}>{position}"
+        trace.tags[tag] = (label, position)
         target = spec.nodes[index]
         match target.work:
             case FunctionSpec():
-                return Send(target.name, State(visits=visits))
+                return Send(target.name, State(visits=[*execution.observed, label, tag], clock=execution.clock))
             case ChildSpec():
-                return Send(target.name, Origin(origin=name))
+                return Send(target.name, ChildInput(origin=tag, clock=execution.clock))
             case _:
                 assert_never(target.work)
 
     def act(state: State) -> object:
-        visits = state.get("visits", [])
-        label = f"{name}|{state.get('origin')}|{len(visits)}"
-        result: object
+        execution = Execution(
+            path, trace.era, state.get("origin"), state.get("clock", 0), tuple(state.get("visits", []))
+        )
+        label = trace.begin(execution)
+        trace.fail(path, Phase.start)
+        update = State(visits=[label], clock=1)
+        result: object = update
         match work.action:
             case WriterSpec():
-                result = State(visits=[label])
+                pass
             case AskerSpec(questions=questions):
-                asked = [f"{name} {index}" for index in range(questions)]
-                answers = [
-                    interrupt(question, response_schema=str) if build.interactive else f"answer to {question}"
-                    for question in asked
-                ]
-                result = State(visits=[label, *answers])
+                for index in range(questions if build.interactive else 0):
+                    question = json.dumps(
+                        [list(path), execution.origin, execution.clock, list(execution.observed), index]
+                    )
+                    answer = interrupt(question, response_schema=str)
+                    execution.given.append(trace.given.get(question))
+                    execution.received.append(answer)
+                    trace.consumed.add(question)
             case RouterSpec() as router:
-                back = router.back if sum(visit.startswith(f"{name}|") for visit in visits) < router.rounds else ()
+                rounds = sum(
+                    visit in trace.executions and trace.executions[visit].path == path for visit in execution.observed
+                )
+                back = router.back if rounds < router.rounds else ()
                 result = Command[str](
-                    update=State(visits=[label]),
+                    update=update,
                     goto=[
                         *(spec.nodes[index].name for index in (*router.forward, *back)),
-                        *(send(index, visits) for index in router.sends),
+                        *(send(position, index, label, execution) for position, index in enumerate(router.sends)),
                     ],
                 )
             case _:
                 assert_never(work.action)
-        if work.fails and build.failed is not None and path not in build.failed:
-            build.failed.add(path)
-            raise ConnectionError(name)
+        trace.fail(path, Phase.end)
+        execution.completed = True
         return result
 
     async def act_async(state: State) -> object:
+        for _ in range(work.pauses):
+            await asyncio.sleep(0)
         return act(state)
 
     return act_async if work.is_async and build.async_nodes else act
@@ -203,9 +280,9 @@ def add_nodes[InputT, OutputT](
     for index, node in enumerate(spec.nodes):
         match node.work:
             case FunctionSpec() as work:
-                builder.add_node(node.name, build_function(spec, node, work, (*path, index), build), defer=node.defer)
+                builder.add_node(node.name, build_function(spec, work, (*path, index), build), defer=node.defer)
             case ChildSpec(graph=graph):
-                child = StateGraph(State, input_schema=Origin, output_schema=Visits)
+                child = StateGraph(State, input_schema=ChildInput, output_schema=Visits)
                 add_nodes(child, graph, (*path, index), build)
                 builder.add_node(node.name, child, defer=node.defer)
             case _:
@@ -227,24 +304,69 @@ def build_graph(spec: GraphSpec, build: Build) -> StateGraph[State, State, State
     return builder
 
 
-def run_to_the_end(invoke: Callable[[State | Command[str] | None], Finished[State] | Interrupted]) -> State:
-    def attempt(run_input: State | Command[str] | None) -> Finished[State] | Interrupted | None:
-        result: Finished[State] | Interrupted | None = None
-        with suppress(ConnectionError):
-            result = invoke(run_input)
-        return result
+def walk_graphs(spec: GraphSpec, path: tuple[int, ...]) -> Iterator[tuple[tuple[int, ...], GraphSpec]]:
+    yield path, spec
+    for index, node in enumerate(spec.nodes):
+        match node.work:
+            case ChildSpec(graph=graph):
+                yield from walk_graphs(graph, (*path, index))
+            case FunctionSpec():
+                pass
+            case _:
+                assert_never(node.work)
 
-    next_input: State | Command[str] | None = State(origin="input")
-    while True:
-        match attempt(next_input):
-            case Finished(output=output):
-                return output
-            case None | Interrupted(interrupts=()):
-                next_input = None
-            case Interrupted(interrupts=interrupts):
-                next_input = Command(resume_by_interrupt_id={item.id: f"answer to {item.value}" for item in interrupts})
-            case _ as unknown:
-                assert_never(unknown)
+
+def find_function_paths(spec: GraphSpec) -> list[tuple[int, ...]]:
+    return [
+        (*path, index)
+        for path, graph in walk_graphs(spec, ())
+        for index, node in enumerate(graph.nodes)
+        if isinstance(node.work, FunctionSpec)
+    ]
+
+
+def has_async_function(spec: GraphSpec) -> bool:
+    return any(
+        isinstance(node.work, FunctionSpec) and node.work.is_async
+        for _, graph in walk_graphs(spec, ())
+        for node in graph.nodes
+    )
+
+
+def find_spec(spec: GraphSpec, checkpoint_ns: str) -> GraphSpec:
+    found = spec
+    for part in checkpoint_ns.split("|") if checkpoint_ns else ():
+        name = part.rsplit(":", 1)[0]
+        work = next(node.work for node in found.nodes if node.name == name)
+        if not isinstance(work, ChildSpec):
+            raise TypeError(f"Expected the namespace {checkpoint_ns!r} to name child graphs, got {name!r}.")
+        found = work.graph
+    return found
+
+
+def canonize(trace: Trace, visits: Sequence[str]) -> tuple[list[object], Counter[object]]:
+    names: dict[str, object] = {}
+
+    def name(label: str) -> object:
+        if label in names:
+            return names[label]
+        if label in trace.tags:
+            sender, position = trace.tags[label]
+            return ("send", name(sender), position)
+        return ("unknown", label)
+
+    for label, execution in list(trace.executions.items()):
+        origin = None if execution.origin is None else name(execution.origin)
+        names[label] = hash((execution.path, origin, execution.clock, tuple(name(seen) for seen in execution.observed)))
+    return [name(visit) for visit in visits], Counter(
+        names[label] for label, execution in trace.executions.items() if execution.completed
+    )
+
+
+def run_plain(spec: GraphSpec, origin: str) -> tuple[Trace, State]:
+    trace = Trace()
+    graph = build_graph(spec, Build(interactive=False, async_nodes=True, trace=trace)).compile()
+    return trace, asyncio.run(graph.ainvoke(State(origin=origin), step_limit=1000))
 
 
 @contextmanager
@@ -262,138 +384,510 @@ def open_sqlite() -> Generator[Checkpointer]:
         engine.dispose()
 
 
-def walk_graphs(spec: GraphSpec) -> Iterator[GraphSpec]:
-    yield spec
-    for node in spec.nodes:
-        match node.work:
-            case ChildSpec(graph=graph):
-                yield from walk_graphs(graph)
-            case FunctionSpec():
-                pass
+class CallMode(Enum):
+    asynchronous = "asynchronous"
+    sync = "sync"
+    sync_in_loop = "sync_in_loop"
+
+
+@dataclass(frozen=True)
+class StreamPlan:
+    modes: frozenset[StreamMode]
+    subgraphs: bool
+    stop_after: int | None
+
+
+@dataclass(frozen=True)
+class Delivery:
+    mode: CallMode
+    stream: StreamPlan | None
+
+
+def deliveries() -> st.SearchStrategy[Delivery]:
+    plan = st.builds(
+        StreamPlan,
+        modes=st.frozensets(st.sampled_from(StreamMode)),
+        subgraphs=st.booleans(),
+        stop_after=st.one_of(st.none(), st.integers(min_value=0)),
+    )
+    return st.builds(Delivery, mode=st.sampled_from(CallMode), stream=st.one_of(st.none(), plan))
+
+
+async def take(parts: AsyncGenerator[StreamPart], count: int | None) -> list[StreamPart]:
+    taken: list[StreamPart] = []
+    async with aclosing(parts):
+        async for part in parts:
+            if len(taken) == count:
+                break
+            taken.append(part)
+    return taken
+
+
+async def call_in_loop[ResultT](function: Callable[[], ResultT]) -> ResultT:
+    return function()
+
+
+def read_question(waiting: Interrupt) -> str:
+    match waiting.value:
+        case str() as question:
+            return question
+        case _:
+            raise AssertionError(f"Expected a question text as the value of the interrupt, got {waiting.value!r}.")
+
+
+def read_visits(values: Mapping[str, object]) -> list[str]:
+    return TypeAdapter(list[str]).validate_python(values.get("visits", []))
+
+
+def find_namespaces(snapshot: StateSnapshot) -> Iterator[StateSnapshot]:
+    for task in snapshot.tasks:
+        if task.state is not None:
+            yield task.state
+            yield from find_namespaces(task.state)
+
+
+@dataclass
+class Thread:
+    spec: GraphSpec
+    graph: PersistentGraph[State, State, State]
+    trace: Trace
+    origin: str
+    expected: tuple[list[object], Counter[object]]
+    sync_allowed: bool
+    promised: list[str] = field(default_factory=list)
+    serial: int = 0
+    diverged: bool = False
+    result: Finished[State] | Interrupted | None = None
+    snapshot: StateSnapshot | None = None
+    history: list[StateSnapshot] = field(default_factory=list)
+
+    def make_text(self, text: str) -> str:
+        self.serial += 1
+        return f"{self.serial} {text}"
+
+    def diverge(self) -> None:
+        self.diverged = True
+        self.promised.clear()
+        self.trace.start_era()
+
+
+class ThreadMachine(RuleBasedStateMachine):
+    def __init__(self) -> None:
+        super().__init__()
+        self.exits = ExitStack()
+        self.runner = self.exits.enter_context(asyncio.Runner())
+        self.checkpointer = self.exits.enter_context(self.open_checkpointer())
+        self.config = ThreadConfig(thread_id="thread")
+        self.threads: list[Thread] = []
+
+    def open_checkpointer(self) -> AbstractContextManager[Checkpointer]:
+        raise NotImplementedError
+
+    @property
+    def thread(self) -> Thread:
+        return self.threads[0]
+
+    def teardown(self) -> None:
+        self.exits.close()
+
+    @initialize(spec=graph_specs((), 0), origin=st.text(), async_nodes=st.booleans(), data=st.data())
+    def build(self, spec: GraphSpec, origin: str, data: st.DataObject, *, async_nodes: bool) -> None:
+        names = [node.name for node in spec.nodes]
+        stops = st.one_of(st.just("*"), st.lists(st.sampled_from(names), unique=True))
+        plain_trace, output = run_plain(spec, origin)
+        trace = Trace()
+        graph = build_graph(spec, Build(interactive=True, async_nodes=async_nodes, trace=trace)).compile(
+            checkpointer=self.checkpointer,
+            interrupt_before=data.draw(stops, label="interrupt_before"),
+            interrupt_after=data.draw(stops, label="interrupt_after"),
+        )
+        self.threads.append(
+            Thread(
+                spec,
+                graph,
+                trace,
+                origin,
+                canonize(plain_trace, output.get("visits", [])),
+                sync_allowed=not (async_nodes and has_async_function(spec)),
+            )
+        )
+
+    def collect_stream(
+        self, run_input: State | Command[str] | None, config: ThreadConfig, mode: CallMode, plan: StreamPlan
+    ) -> list[StreamPart]:
+        graph = self.thread.graph
+
+        def collect_sync() -> list[StreamPart]:
+            taken: list[StreamPart] = []
+            parts = graph.stream(run_input, config, stream_mode=plan.modes, subgraphs=plan.subgraphs, step_limit=1000)
+            with closing(parts):
+                for part in parts:
+                    if len(taken) == plan.stop_after:
+                        break
+                    taken.append(part)
+            return taken
+
+        match mode:
+            case CallMode.asynchronous:
+                parts = graph.astream(
+                    run_input, config, stream_mode=plan.modes, subgraphs=plan.subgraphs, step_limit=1000
+                )
+                return self.runner.run(take(parts, plan.stop_after))
+            case CallMode.sync:
+                return collect_sync()
+            case CallMode.sync_in_loop:
+                return self.runner.run(call_in_loop(collect_sync))
             case _:
-                assert_never(node.work)
+                assert_never(mode)
 
+    def check_stream(self, parts: Sequence[StreamPart], plan: StreamPlan) -> None:
+        graph = self.thread.graph
+        namespaces = {part.ns for part in parts}
+        assert plan.subgraphs or namespaces <= {()}, f"Expected parts of the root graph only, got {namespaces}."
+        for namespace in namespaces:
+            config = ThreadConfig(thread_id="thread", checkpoint_ns="|".join(namespace))
+            found = self.runner.run(graph.aget_state(config))
+            assert found.checkpoint_ns == config.get("checkpoint_ns"), f"Expected the state of {namespace}."
+        if plan.stop_after is None and StreamMode.values in plan.modes:
+            values = [part.values for part in parts if isinstance(part, ValuesPart) and not part.ns]
+            newest = self.runner.run(graph.aget_state(self.config)).values
+            assert not values or values[-1] == newest, f"Expected the last values part {newest}, got {values[-1]}."
 
-def record_features(spec: GraphSpec) -> None:
-    graphs = list(walk_graphs(spec))
-    nodes = [node for graph in graphs for node in graph.nodes]
-    routers = [
-        node.work.action
-        for node in nodes
-        if isinstance(node.work, FunctionSpec) and isinstance(node.work.action, RouterSpec)
-    ]
-    child_counts = [sum(isinstance(node.work, ChildSpec) for node in graph.nodes) for graph in graphs]
-    child_names = {node.name for graph in graphs[1:] for node in graph.nodes}
-    event(f"graph with three or more children: {max(child_counts) > 2}")
-    event(
-        f"levels: {1 + max(child_counts[0] and 1, *(2 for graph in graphs[1:] if any(isinstance(n.work, ChildSpec) for n in graph.nodes)), 0)}"
-    )
-    event(f"name collision between levels: {bool({node.name for node in spec.nodes} & child_names)}")
-    event(f"join: {any(graph.joins for graph in graphs)}")
-    event(f"send: {any(router.sends for router in routers)}")
-    event(f"route back: {any(router.back and router.rounds for router in routers)}")
-    event(
-        f"interrupt: {any(isinstance(node.work, FunctionSpec) and isinstance(node.work.action, AskerSpec) for node in nodes)}"
-    )
-    event(f"deferred node: {any(node.defer for node in nodes)}")
+    def deliver(
+        self, run_input: State | Command[str] | None, config: ThreadConfig, delivery: Delivery
+    ) -> Finished[State] | Interrupted | None:
+        graph = self.thread.graph
+        mode = delivery.mode if self.thread.sync_allowed else CallMode.asynchronous
+        result: Finished[State] | Interrupted | None = None
+        parts: list[StreamPart] | None = None
+        with suppress(ConnectionError):
+            if delivery.stream is not None:
+                parts = self.collect_stream(run_input, config, mode, delivery.stream)
+            else:
+                match mode:
+                    case CallMode.asynchronous:
+                        result = self.runner.run(graph.ainvoke(run_input, config, step_limit=1000))
+                    case CallMode.sync:
+                        result = graph.invoke(run_input, config, step_limit=1000)
+                    case CallMode.sync_in_loop:
+                        result = self.runner.run(call_in_loop(lambda: graph.invoke(run_input, config, step_limit=1000)))
+                    case _:
+                        assert_never(mode)
+        if parts is not None and delivery.stream is not None:
+            self.check_stream(parts, delivery.stream)
+        self.thread.result = result
+        return result
 
+    def is_started(self) -> bool:
+        return self.thread.snapshot is not None
 
-@pytest.mark.parametrize("open_checkpointer", [open_memory, open_sqlite])
-@settings(deadline=None)
-@given(spec=graph_specs((), 0), interactive=st.booleans(), failing=st.booleans(), data=st.data())
-def test_run_with_a_checkpointer_gives_the_output_of_a_run_without_one(
-    open_checkpointer: Callable[[], AbstractContextManager[Checkpointer]],
-    spec: GraphSpec,
-    data: st.DataObject,
-    *,
-    interactive: bool,
-    failing: bool,
-) -> None:
-    """
-    Arrange: a generated graph, with and without a checkpointer, whose nodes can fail one time and can ask questions.
-    Act: run the graph without a checkpointer, and run it with the checkpointer until it finishes.
-    Assert: the two runs give the same output.
-    """
-    record_features(spec)
-    names = [node.name for node in spec.nodes]
-    interrupt_before = data.draw(st.lists(st.sampled_from(names), unique=True))
-    interrupt_after = data.draw(st.lists(st.sampled_from(names), unique=True))
-    plain = build_graph(spec, Build(interactive=False, async_nodes=True, failed=None)).compile()
+    def waiting(self) -> tuple[Interrupt, ...]:
+        return () if self.thread.snapshot is None else self.thread.snapshot.interrupts
 
-    with open_checkpointer() as checkpointer, asyncio.Runner() as runner:
-        expected = runner.run(plain.ainvoke(State(origin="input"), step_limit=1000))
-        graph = build_graph(
-            spec, Build(interactive=interactive, async_nodes=True, failed=set() if failing else None)
-        ).compile(checkpointer=checkpointer, interrupt_before=interrupt_before, interrupt_after=interrupt_after)
-        actual = run_to_the_end(
-            lambda run_input: runner.run(graph.ainvoke(run_input, {"thread_id": "thread"}, step_limit=1000))
+    @rule(delivery=deliveries(), origin=st.text())
+    def send_input(self, delivery: Delivery, origin: str) -> None:
+        if self.is_started():
+            self.thread.diverge()
+            self.deliver(State(origin=origin), self.config, delivery)
+        else:
+            self.deliver(State(origin=self.thread.origin), self.config, delivery)
+
+    @precondition(is_started)
+    @rule(delivery=deliveries())
+    def resume(self, delivery: Delivery) -> None:
+        self.deliver(None, self.config, delivery)
+
+    @precondition(lambda self: bool(self.waiting()))
+    @rule(delivery=deliveries(), data=st.data())
+    def answer(self, delivery: Delivery, data: st.DataObject) -> None:
+        chosen = data.draw(st.lists(st.sampled_from(self.waiting()), min_size=1, unique_by=lambda item: item.id))
+        answers = {item.id: self.thread.make_text(data.draw(st.text())) for item in chosen}
+        self.thread.trace.given.update({read_question(item): answers[item.id] for item in chosen})
+        self.deliver(Command(resume_by_interrupt_id=answers), self.config, delivery)
+
+    @precondition(lambda self: len(self.waiting()) == 1)
+    @rule(delivery=deliveries(), text=st.text())
+    def answer_plainly(self, delivery: Delivery, text: str) -> None:
+        answer = self.thread.make_text(text)
+        self.thread.trace.given[read_question(self.waiting()[0])] = answer
+        self.deliver(Command(resume=answer), self.config, delivery)
+
+    @precondition(is_started)
+    @rule(delivery=deliveries(), texts=st.lists(st.text()))
+    def run_with_an_update(self, delivery: Delivery, texts: list[str]) -> None:
+        notes = [self.thread.make_text(text) for text in texts]
+        self.thread.diverged = True
+        self.thread.promised.extend(notes)
+        self.deliver(Command(update=State(visits=notes)), self.config, delivery)
+
+    @precondition(is_started)
+    @rule(delivery=deliveries(), data=st.data())
+    def run_with_a_goto(self, delivery: Delivery, data: st.DataObject) -> None:
+        thread = self.thread
+        index = data.draw(st.sampled_from(range(len(thread.spec.nodes))))
+        name = thread.spec.nodes[index].name
+        snapshot = thread.snapshot
+        finished = snapshot is not None and any(
+            task.name == name and task.result is not None for task in snapshot.tasks
         )
+        started = sum(execution.path[0] == index for execution in list(thread.trace.executions.values()))
+        thread.diverged = True
 
-    assert actual == expected, f"Expected {expected}, got {actual}, for {spec}."
+        result = self.deliver(Command(goto=name), self.config, delivery)
 
+        now = sum(execution.path[0] == index for execution in list(thread.trace.executions.values()))
+        if result is not None and not finished:
+            assert now > started, f"Expected the node {name!r} to run after a goto to it."
 
-@pytest.mark.parametrize("open_checkpointer", [open_memory, open_sqlite])
-@settings(deadline=None)
-@given(spec=graph_specs((), 0))
-def test_sync_run_gives_the_output_and_the_history_of_an_async_run(
-    open_checkpointer: Callable[[], AbstractContextManager[Checkpointer]], spec: GraphSpec
-) -> None:
-    """
-    Arrange: a generated graph of sync nodes that can fail one time and can ask questions.
-    Act: run the graph to its end with the async function and with the sync function, each in its own thread.
-    Assert: the two runs give the same output, and their histories have the same steps and values.
-    """
-    with open_checkpointer() as checkpointer, asyncio.Runner() as runner:
-        graph = build_graph(spec, Build(interactive=True, async_nodes=True, failed=set())).compile(
-            checkpointer=checkpointer
-        )
-        expected = run_to_the_end(
-            lambda run_input: runner.run(graph.ainvoke(run_input, {"thread_id": "async"}, step_limit=1000))
-        )
-        sync_graph = build_graph(spec, Build(interactive=True, async_nodes=False, failed=set())).compile(
-            checkpointer=checkpointer
-        )
+    @precondition(lambda self: bool(self.thread.history))
+    @rule(delivery=deliveries(), data=st.data())
+    def run_from_an_older_checkpoint(self, delivery: Delivery, data: st.DataObject) -> None:
+        checkpoint_id = data.draw(st.sampled_from([snapshot.checkpoint_id for snapshot in self.thread.history]))
+        self.thread.diverge()
+        self.deliver(None, ThreadConfig(thread_id="thread", checkpoint_id=checkpoint_id), delivery)
 
-        actual = run_to_the_end(lambda run_input: sync_graph.invoke(run_input, {"thread_id": "sync"}, step_limit=1000))
+    @rule(data=st.data(), phase=st.sampled_from(Phase))
+    def arm_a_fault(self, data: st.DataObject, phase: Phase) -> None:
+        path = data.draw(st.sampled_from(find_function_paths(self.thread.spec)))
+        self.thread.trace.faults[path] = phase
 
-        histories = [
-            [(snapshot.step, snapshot.values, snapshot.next) for snapshot in graph.get_state_history(config)]
-            for config in (ThreadConfig(thread_id="async"), ThreadConfig(thread_id="sync"))
-        ]
-    assert actual == expected, f"Expected {expected}, got {actual}, for {spec}."
-    assert histories[1] == histories[0], f"Expected the history {histories[0]}, got {histories[1]}, for {spec}."
+    @precondition(is_started)
+    @rule(data=st.data(), mode=st.sampled_from(CallMode), texts=st.lists(st.text()))
+    def update_state(self, data: st.DataObject, mode: CallMode, texts: list[str]) -> None:
+        thread = self.thread
+        graph = thread.graph
+        snapshot = self.runner.run(graph.aget_state(self.config, subgraphs=True))
+        before = data.draw(st.sampled_from([snapshot, *find_namespaces(snapshot)]))
+        config = ThreadConfig(thread_id="thread", checkpoint_ns=before.checkpoint_ns)
+        spec = find_spec(thread.spec, before.checkpoint_ns)
+        node = data.draw(st.one_of(st.none(), st.sampled_from(spec.nodes)))
+        notes = [thread.make_text(text) for text in texts]
+        values = State(visits=notes)
+        as_node = None if node is None else node.name
+        thread.diverge()
+        thread.result = None
 
+        updated = True
+        try:
+            match mode if thread.sync_allowed else CallMode.asynchronous:
+                case CallMode.asynchronous:
+                    self.runner.run(graph.aupdate_state(config, values, as_node=as_node))
+                case CallMode.sync:
+                    graph.update_state(config, values, as_node=as_node)
+                case CallMode.sync_in_loop:
+                    self.runner.run(call_in_loop(lambda: graph.update_state(config, values, as_node=as_node)))
+                case _ as unknown:
+                    assert_never(unknown)
+        except ValueError:
+            assert as_node is None, f"Expected the update as the node {as_node!r} to be accepted."
+            updated = False
 
-@pytest.mark.parametrize("open_checkpointer", [open_memory, open_sqlite])
-@settings(deadline=None)
-@given(spec=graph_specs((), 0))
-def test_history_of_a_finished_run_is_a_chain_of_its_checkpoints(
-    open_checkpointer: Callable[[], AbstractContextManager[Checkpointer]], spec: GraphSpec
-) -> None:
-    """
-    Arrange: a generated graph that ran to its end, with interrupts and failures.
-    Act: read the history of the thread, and read each state of the history by its checkpoint id.
-    Assert: the newest state has the output, each state has the next older state as parent, and each read is equal.
-    """
-    config = ThreadConfig(thread_id="thread")
-    with open_checkpointer() as checkpointer, asyncio.Runner() as runner:
-        graph = build_graph(spec, Build(interactive=True, async_nodes=True, failed=set())).compile(
-            checkpointer=checkpointer
-        )
-        output = run_to_the_end(lambda run_input: runner.run(graph.ainvoke(run_input, config, step_limit=1000)))
+        after = self.runner.run(graph.aget_state(config))
+        expected = [*read_visits(before.values), *(notes if updated else [])]
+        assert read_visits(after.values) == expected, f"Expected the visits {expected}, got {after.values}."
+        assert after.values.get("clock") == before.values.get("clock"), "Expected the clock to stay as it was."
+        if updated and node is not None:
+            targets = {spec.nodes[target].name for target in node.targets if not spec.nodes[target].defer}
+            assert targets <= set(after.next), f"Expected {targets} among the next nodes, got {after.next}."
 
-        history = runner.run(collect(graph.aget_state_history(config)))
+    @precondition(is_started)
+    @rule()
+    def finish(self) -> None:
+        thread = self.thread
+        delivery = Delivery(CallMode.asynchronous, None)
+        result = thread.result if isinstance(thread.result, Finished) and not thread.trace.faults else None
+        while not isinstance(result, Finished):
+            snapshot = self.runner.run(thread.graph.aget_state(self.config))
+            progress = (snapshot.checkpoint_id, snapshot.interrupts, thread.trace.fired, len(thread.trace.consumed))
+            answers = {item.id: thread.make_text("") for item in snapshot.interrupts}
+            thread.trace.given.update({read_question(item): answers[item.id] for item in snapshot.interrupts})
+            result = self.deliver(Command(resume_by_interrupt_id=answers) if answers else None, self.config, delivery)
+            if isinstance(result, Finished):
+                break
+            snapshot = self.runner.run(thread.graph.aget_state(self.config))
+            now = (snapshot.checkpoint_id, snapshot.interrupts, thread.trace.fired, len(thread.trace.consumed))
+            assert now != progress, f"Expected a run with all answers to change the thread, got {result} again."
+
+        visits = result.output.get("visits", [])
+        for note in thread.promised:
+            assert visits.count(note) == 1, f"Expected the note {note!r} of a command one time in {visits}."
+        if not thread.diverged:
+            actual = canonize(thread.trace, visits)
+            assert actual[0] == thread.expected[0], "Expected the visits of the run without a checkpointer."
+            assert actual[1] == thread.expected[1], "Expected the node executions of the run without a checkpointer."
+        history = self.runner.run(collect(thread.graph.aget_state_history(self.config)))
         found = [
-            runner.run(graph.aget_state(ThreadConfig(thread_id="thread", checkpoint_id=snapshot.checkpoint_id)))
+            self.runner.run(
+                thread.graph.aget_state(ThreadConfig(thread_id="thread", checkpoint_id=snapshot.checkpoint_id))
+            )
             for snapshot in history
         ]
+        assert found == history, (
+            "Expected each state read by its checkpoint id to be equal to the state of the history."
+        )
+        self.record_features()
 
-    steps = [snapshot.step for snapshot in history]
-    parents = [snapshot.parent_id for snapshot in history]
-    expected_parents = [*(snapshot.checkpoint_id for snapshot in history[1:]), None]
-    expected_steps = list(range(len(history) - 2, -2, -1))
-    assert history[0].values == output, f"Expected the newest state {output}, got {history[0].values}."
-    assert history[0].next == (), f"Expected no next node after the end, got {history[0].next}."
-    assert steps == expected_steps, f"Expected the steps {expected_steps}, got {steps}."
-    assert parents == expected_parents, f"Expected the parents {expected_parents}, got {parents}."
-    assert found == history, "Expected each state read by its checkpoint id to be equal to the state of the history."
+    def record_features(self) -> None:
+        thread = self.thread
+        completed = thread.trace.completed()
+        paths = Counter((execution.path, execution.era) for execution in completed)
+        graphs = dict(walk_graphs(thread.spec, ()))
+
+        def ran(select: Callable[[GraphSpec], Sequence[int]]) -> bool:
+            return any(
+                (*path, index) in {item.path for item in completed}
+                for path, graph in graphs.items()
+                for index in select(graph)
+            )
+
+        event(f"ran a node two or more times: {any(count > 1 for count in paths.values())}")
+        event(
+            f"ran a node from a send: {any(visit in thread.trace.tags for item in completed for visit in (*item.observed, item.origin))}"
+        )
+        event(f"ran a node of a child graph: {any(len(item.path) > 1 for item in completed)}")
+        event(f"ran a node two levels down: {any(len(item.path) > 2 for item in completed)}")
+        event(
+            f"ran the target of a join: {ran(lambda graph: [join.target for join in graph.joins if join.target is not None])}"
+        )
+        event(
+            f"ran a deferred node: {ran(lambda graph: [index for index, node in enumerate(graph.nodes) if node.defer])}"
+        )
+        event(f"received an answer: {any(item.received for item in completed)}")
+        event(f"failed a node: {thread.trace.fired > 0}")
+        event(f"diverged from the plain run: {thread.diverged}")
+
+    @invariant()
+    def thread_is_consistent(self) -> None:
+        thread = self.thread
+        graph = thread.graph
+        history = self.runner.run(collect(graph.aget_state_history(self.config)))
+        thread.history = history
+        if not history:
+            return
+        snapshot = self.runner.run(graph.aget_state(self.config, subgraphs=True))
+        thread.snapshot = snapshot
+        newest = self.runner.run(graph.aget_state(self.config))
+        assert history[0] == newest, "Expected the newest state of the history to be the state of the thread."
+
+        ids = [item.checkpoint_id for item in history]
+        steps = {item.checkpoint_id: item.step for item in history}
+        assert ids == sorted(ids, reverse=True), f"Expected the history from the newest checkpoint, got {ids}."
+        for item in history:
+            if item.parent_id is None:
+                expected_step = -1 if item.source is CheckpointSource.input else 0
+            else:
+                assert item.parent_id in steps, f"Expected the parent {item.parent_id} in the history."
+                expected_step = steps[item.parent_id] + (0 if item.source is CheckpointSource.fork else 1)
+            assert item.step == expected_step, f"Expected step {expected_step} for {item.source}, got {item.step}."
+
+        match thread.result:
+            case Finished(output=output):
+                assert snapshot.next == (), f"Expected no next node after the end, got {snapshot.next}."
+                assert snapshot.values == output, f"Expected the output {output}, got {snapshot.values}."
+            case Interrupted(interrupts=interrupts, values=values):
+                assert snapshot.values == values, f"Expected the values {values}, got {snapshot.values}."
+                assert {item.id for item in snapshot.interrupts} == {item.id for item in interrupts}, (
+                    f"Expected the interrupts {interrupts}, got {snapshot.interrupts}."
+                )
+            case None:
+                pass
+            case _ as unknown:
+                assert_never(unknown)
+
+        for child in find_namespaces(snapshot):
+            config = ThreadConfig(thread_id="thread", checkpoint_ns=child.checkpoint_ns)
+            found = self.runner.run(graph.aget_state(config, subgraphs=True))
+            assert found == child, f"Expected the state of the child graph at {child.checkpoint_ns!r}."
+
+        for waiting in snapshot.interrupts:
+            assert read_question(waiting) not in thread.trace.consumed, (
+                f"Expected no second question for an answer that a node received, got {waiting}."
+            )
+        completed = thread.trace.completed()
+        keys = Counter((item.path, item.era, item.origin, item.clock, item.observed) for item in completed)
+        repeated = [key for key, count in keys.items() if count > 1]
+        assert not repeated, f"Expected each task to finish one time, got more for {repeated}."
+        for item in completed:
+            assert item.received == item.given, (
+                f"Expected the answers {item.given} for {item.path}, got {item.received}."
+            )
+
+
+class MemoryThreadMachine(ThreadMachine):
+    def open_checkpointer(self) -> AbstractContextManager[Checkpointer]:
+        return open_memory()
+
+
+class SqliteThreadMachine(ThreadMachine):
+    def open_checkpointer(self) -> AbstractContextManager[Checkpointer]:
+        return open_sqlite()
+
+
+MemoryThreadMachine.TestCase.settings = settings(deadline=None)
+SqliteThreadMachine.TestCase.settings = settings(deadline=None)
+TestThreadOnMemory = MemoryThreadMachine.TestCase
+TestThreadOnSqlite = SqliteThreadMachine.TestCase
+
+
+def has_join_as_the_only_way(spec: GraphSpec) -> bool:
+    trace, _ = run_plain(spec, "")
+    ran = {execution.path for execution in trace.completed()}
+    for path, graph in walk_graphs(spec, ()):
+        for join in graph.joins:
+            target = join.target
+            if target is None or (*path, target) not in ran or target in graph.entries:
+                continue
+            routed = any(
+                target in (*node.work.action.forward, *node.work.action.sends, *node.work.action.back)
+                for node in graph.nodes
+                if isinstance(node.work, FunctionSpec) and isinstance(node.work.action, RouterSpec)
+            )
+            if not routed and not any(target in node.targets for node in graph.nodes):
+                return True
+    return False
+
+
+def runs_a_deferred_node(spec: GraphSpec) -> bool:
+    trace, _ = run_plain(spec, "")
+    ran = {execution.path for execution in trace.completed()}
+    return any(
+        node.defer and (*path, index) in ran
+        for path, graph in walk_graphs(spec, ())
+        for index, node in enumerate(graph.nodes)
+    )
+
+
+def runs_a_node_again(spec: GraphSpec) -> bool:
+    trace, _ = run_plain(spec, "")
+    return any(count > 1 for count in Counter(execution.path for execution in trace.completed()).values())
+
+
+def runs_a_send(spec: GraphSpec) -> bool:
+    trace, _ = run_plain(spec, "")
+    return any(
+        execution.origin in trace.tags or set(execution.observed) & set(trace.tags) for execution in trace.completed()
+    )
+
+
+def runs_two_levels_down(spec: GraphSpec) -> bool:
+    trace, _ = run_plain(spec, "")
+    return any(len(execution.path) > 2 for execution in trace.completed())
+
+
+def test_generator_reaches_each_way_to_run_a_node() -> None:
+    """
+    Arrange: the strategy for graphs, and one condition on a run for each way to run a node.
+    Act: search the strategy for a graph whose run meets each condition.
+    Assert: the search finds a graph for each condition.
+    """
+    conditions = [
+        has_join_as_the_only_way,
+        runs_a_deferred_node,
+        runs_a_node_again,
+        runs_a_send,
+        runs_two_levels_down,
+    ]
+
+    found = [find(graph_specs((), 0), condition) for condition in conditions]
+
+    assert len(found) == len(conditions), "Expected a graph for each condition."
