@@ -366,17 +366,15 @@ def canonize(trace: Trace, visits: Sequence[str]) -> tuple[list[object], Counter
 
 
 def find_unfired_joins(spec: GraphSpec, trace: Trace) -> list[JoinSpec]:
-    current = {
-        label: execution
-        for label, execution in list(trace.executions.items())
-        if execution.completed and execution.era == trace.era and len(execution.path) == 1
-    }
+    current = [
+        (order, execution.path[0])
+        for order, execution in enumerate(list(trace.executions.values()))
+        if execution.completed and execution.era == trace.era
+    ]
     unfired: list[JoinSpec] = []
     for join in spec.joins:
-        seen = {
-            visit for execution in current.values() if execution.path == (join.target,) for visit in execution.observed
-        }
-        arrived = {execution.path[0] for label, execution in current.items() if label not in seen}
+        last_run = max((order for order, node in current if node == join.target), default=-1)
+        arrived = {node for order, node in current if order > last_run}
         if join.target is not None and arrived >= set(join.sources):
             unfired.append(join)
     return unfired
@@ -516,6 +514,8 @@ class ThreadMachine(RuleBasedStateMachine):
         names = [node.name for node in spec.nodes]
         stops = st.one_of(st.just("*"), st.lists(st.sampled_from(names), unique=True))
         plain_trace, output = run_plain(spec, origin)
+        unfired = find_unfired_joins(spec, plain_trace)
+        assert not unfired, f"Expected the target of each join to run after all its sources, not {unfired}."
         trace = Trace()
         graph = build_graph(spec, Build(interactive=True, async_nodes=async_nodes, trace=trace)).compile(
             checkpointer=self.checkpointer,
@@ -733,8 +733,6 @@ class ThreadMachine(RuleBasedStateMachine):
             assert now != progress, f"Expected a run with all answers to change the thread, got {result} again."
 
         visits = result.output.get("visits", [])
-        unfired = [] if thread.steered else find_unfired_joins(thread.spec, thread.trace)
-        assert not unfired, f"Expected the target of each join to run after all its sources, got none for {unfired}."
         for note in thread.promised:
             assert visits.count(note) == 1, f"Expected the note {note!r} of a command one time in {visits}."
         if not thread.diverged:
@@ -808,6 +806,8 @@ class ThreadMachine(RuleBasedStateMachine):
 
         match thread.result:
             case Finished(output=output):
+                unfired = [] if thread.steered else find_unfired_joins(thread.spec, thread.trace)
+                assert not unfired, f"Expected the target of each join to run after all its sources, not {unfired}."
                 assert snapshot.next == (), f"Expected no next node after the end, got {snapshot.next}."
                 assert snapshot.values == output, f"Expected the output {output}, got {snapshot.values}."
             case Interrupted(interrupts=interrupts, values=values):
