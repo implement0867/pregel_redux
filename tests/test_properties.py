@@ -734,7 +734,8 @@ class ThreadMachine(RuleBasedStateMachine):
     @precondition(lambda self: bool(self.thread.history))
     @rule(delivery=deliveries(), data=st.data())
     def run_from_an_older_checkpoint(self, delivery: Delivery, data: st.DataObject) -> None:
-        checkpoint_id = data.draw(st.sampled_from([snapshot.checkpoint_id for snapshot in self.thread.history]))
+        history = self.thread.history
+        checkpoint_id = history[data.draw(st.integers(min_value=0)) % len(history)].checkpoint_id
         self.thread.diverge()
         self.deliver(None, ThreadConfig(thread_id="thread", checkpoint_id=checkpoint_id), delivery)
 
@@ -749,7 +750,8 @@ class ThreadMachine(RuleBasedStateMachine):
         thread = self.thread
         graph = thread.graph
         snapshot = self.runner.run(graph.aget_state(self.config, subgraphs=True))
-        before = data.draw(st.sampled_from([snapshot, *find_namespaces(snapshot), *thread.history]))
+        candidates = [snapshot, *find_namespaces(snapshot), *thread.history]
+        before = candidates[data.draw(st.integers(min_value=0)) % len(candidates)]
         config = (
             ThreadConfig(thread_id="thread", checkpoint_id=before.checkpoint_id)
             if before in thread.history
