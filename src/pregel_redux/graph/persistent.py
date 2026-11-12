@@ -369,13 +369,20 @@ class ThreadScope:
         task_id = journal.make_task_id(task)
         name = str(task.node) if isinstance(task.node, str) else "__start__"
         writes = journal.find_writes(task)
+        child = await self.read_child_snapshot(journal, task) if subgraphs or writes is None else None
+        if writes is not None:
+            waiting: tuple[Interrupt, ...] = ()
+        elif child is not None:
+            waiting = child.interrupts
+        else:
+            waiting = interrupts.get(task_id, ())
         return TaskSnapshot(
             id=task_id,
             name=name,
             path=PullPath(name) if task.send_index is None else PushPath(task.send_index),
-            interrupts=interrupts.get(task_id, ()) if writes is None else (),
+            interrupts=waiting,
             result=None if writes is None else writes.fields,
-            state=await self.read_child_snapshot(journal, task) if subgraphs else None,
+            state=child if subgraphs else None,
         )
 
     async def read_snapshot(self, saved: CheckpointTuple, *, subgraphs: bool) -> "StateSnapshot":
@@ -469,18 +476,12 @@ class ThreadJournal:
         ]
         return Scratchpad(self.make_task_ns(task), saved, resume, 0)
 
-    def read_resume(self, command: Command[str] | None) -> ResumeInput:
+    async def read_resume(self, command: Command[str] | None) -> ResumeInput:
         if command is None:
             return ResumeInput([], {})
         given = command.resume_by_interrupt_id or {}
         if command.resume is not None:
-            finished = {write.task_id for write in self.pending if isinstance(write, TaskWritesRecord)}
-            waiting = [
-                interrupt.id
-                for write in self.pending
-                if isinstance(write, TaskInterruptRecord) and write.task_id not in finished
-                for interrupt in write.interrupts
-            ]
+            waiting = [interrupt.id for interrupt in (await self.read_snapshot()).interrupts]
             if len(waiting) > 1:
                 raise ValueError(f"the interrupts {waiting!r} wait for an answer, so give resume_by_interrupt_id")
             return ResumeInput([command.resume], given)
@@ -557,7 +558,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
                 if loaded is None:
                     raise LookupError(f"thread {thread_id!r} has no checkpoint, so the run needs an input")
                 position, journal = loaded
-                resume = journal.read_resume(input)
+                resume = await journal.read_resume(input)
                 writes = None if input is None else read_command_writes(self.graph, input)
                 if writes is not None and (writes.fields or writes.branches or writes.sends):
                     await journal.record_command(writes)

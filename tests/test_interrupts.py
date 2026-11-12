@@ -406,3 +406,43 @@ def test_failure_of_a_child_graph_after_an_answer_keeps_the_answer() -> None:
     expected = Finished(State(notes=["yes"]))
     assert waiting == (), f"Expected no waiting interrupt after the answer, got {waiting}."
     assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+def test_cancelled_child_graph_after_an_answer_has_no_waiting_interrupt() -> None:
+    """
+    Arrange: a child graph whose node waits after it got its answer, next to a node that fails in the second run.
+    Act: run the thread, answer the question by its id so the failure cancels the child graph, and read the state.
+    Assert: the state has no waiting interrupt, because the node of the child graph received its answer.
+    """
+    runs: list[str] = []
+
+    async def ask(state: State) -> State:
+        answer = interrupt("question", response_schema=str)
+        await asyncio.sleep(60)
+        return State(notes=[answer])
+
+    def fail_later(state: State) -> State:
+        runs.append("run")
+        if len(runs) == 2:
+            raise ConnectionError
+        return State(notes=[interrupt("other question", response_schema=str)])
+
+    child = StateGraph(State)
+    child.add_node("ask", ask)
+    child.add_edge(Endpoint.start, "ask")
+    builder = StateGraph(State)
+    builder.add_node("child", child)
+    builder.add_node("sibling", fail_later)
+    builder.add_edge(Endpoint.start, "child")
+    builder.add_edge(Endpoint.start, "sibling")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    stopped = asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    asked = (
+        [item for item in stopped.interrupts if item.value == "question"] if isinstance(stopped, Interrupted) else []
+    )
+    with pytest.raises(ConnectionError):
+        asyncio.run(graph.ainvoke(Command(resume_by_interrupt_id={asked[0].id: "yes"}), {"thread_id": "thread"}))
+
+    waiting = [item.value for item in asyncio.run(graph.aget_state({"thread_id": "thread"})).interrupts]
+
+    assert waiting == [], f"Expected no waiting interrupt after the answer, got {waiting}."
