@@ -322,3 +322,29 @@ def test_interrupt_outside_a_graph_is_rejected() -> None:
     """
     with pytest.raises(RuntimeError):
         interrupt("question", response_schema=str)
+
+
+@pytest.mark.parametrize(
+    ("command", "note", "count"),
+    [
+        (Command[str](resume="yes", update={"notes": ["edit"]}), "edit", 1),
+        (Command[str](update={"notes": ["edit"]}), "edit", 1),
+        (Command[str](resume="yes", goto="sibling"), "sibling", 2),
+        (Command[str](goto="sibling"), "sibling", 2),
+    ],
+    ids=["update-with-resume", "update-alone", "goto-with-resume", "goto-alone"],
+)
+def test_run_with_a_command_applies_its_update_and_its_goto(command: Command[str], note: str, count: int) -> None:
+    """
+    Arrange: a thread that stopped at an interrupt, in a step in which the node "sibling" finished.
+    Act: run the thread with a Command that has an update or a goto, with or without a resume value.
+    Assert: the state has the note of the update, or a second note of the node that goto names.
+    """
+    graph = build_asking_graph(1, 1, [])
+    asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+
+    asyncio.run(graph.ainvoke(command, {"thread_id": "thread"}))
+
+    notes = asyncio.run(graph.aget_state({"thread_id": "thread"})).values["notes"]
+    assert isinstance(notes, list), f"Expected a list of notes, got {notes}."
+    assert notes.count(note) == count, f"Expected the note {note!r} {count} time(s), got {notes}."
