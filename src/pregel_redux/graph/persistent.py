@@ -67,7 +67,7 @@ from pregel_redux.pregel import (
     apply_writes,
     plan_tasks,
 )
-from pregel_redux.snapshots import StateSnapshot, TaskSnapshot
+from pregel_redux.snapshots import PullPath, PushPath, StateSnapshot, TaskSnapshot
 from pregel_redux.streams import (
     CheckpointPart,
     CustomPart,
@@ -327,6 +327,26 @@ class ThreadScope:
         saved = await self.checkpointer.aget_tuple(scope.thread_id, scope.checkpoint_ns, None)
         return None if saved is None else await scope.read_snapshot(saved, subgraphs=True)
 
+    async def read_task_snapshot(
+        self,
+        journal: "ThreadJournal",
+        task: TaskRef,
+        interrupts: Mapping[str, tuple[Interrupt, ...]],
+        *,
+        subgraphs: bool,
+    ) -> TaskSnapshot:
+        task_id = journal.make_task_id(task)
+        name = str(task.node) if isinstance(task.node, str) else "__start__"
+        writes = journal.find_writes(task)
+        return TaskSnapshot(
+            id=task_id,
+            name=name,
+            path=PullPath(name) if task.send_index is None else PushPath(task.send_index),
+            interrupts=interrupts.get(task_id, ()) if writes is None else (),
+            result=None if writes is None else writes.fields,
+            state=await self.read_child_snapshot(journal, task) if subgraphs else None,
+        )
+
     async def read_snapshot(self, saved: CheckpointTuple, *, subgraphs: bool) -> "StateSnapshot":
         position = load_position(self.graph, saved.checkpoint)
         journal = self.open_journal(saved)
@@ -334,18 +354,7 @@ class ThreadScope:
         interrupts = {
             write.task_id: write.interrupts for write in saved.pending_writes if isinstance(write, TaskInterruptRecord)
         }
-        tasks = tuple(
-            [
-                TaskSnapshot(
-                    id=journal.make_task_id(ref),
-                    name=str(ref.node) if isinstance(ref.node, str) else "__start__",
-                    interrupts=() if journal.find_writes(ref) else interrupts.get(journal.make_task_id(ref), ()),
-                    finished=journal.find_writes(ref) is not None,
-                    state=await self.read_child_snapshot(journal, ref) if subgraphs else None,
-                )
-                for ref in refs
-            ]
-        )
+        tasks = tuple([await self.read_task_snapshot(journal, ref, interrupts, subgraphs=subgraphs) for ref in refs])
         return StateSnapshot(
             values=position.channels.read_values(),
             next=tuple(task.name for task in tasks),

@@ -12,11 +12,13 @@ from pregel_redux import (
     Interrupted,
     PersistentGraph,
     Reducer,
+    Send,
     StateGraph,
     StateSnapshot,
     interrupt,
 )
 from pregel_redux.checkpoints import CheckpointSource
+from pregel_redux.snapshots import PullPath, PushPath
 from tests.conftest import collect, join_lists
 
 
@@ -306,7 +308,7 @@ def test_new_input_on_a_stopped_thread_stops_before_the_named_node_again() -> No
 
     actual = graph.invoke({"notes": ["more"]}, thread_id="thread")
 
-    assert actual == Interrupted(()), f"Expected a stop, got {actual}."
+    assert actual == Interrupted((), {"notes": ["first", "more", "first"]}), f"Expected a stop, got {actual}."
     assert calls == ["first", "first"], f"Expected the first node to run two times, got {calls}."
 
 
@@ -330,7 +332,7 @@ def test_child_graph_stops_before_its_named_node_and_continues() -> None:
     stopped = [graph.invoke({}, thread_id="thread")]
     actual = graph.invoke(None, thread_id="thread")
 
-    assert stopped == [Interrupted(())], f"Expected one stop, got {stopped}."
+    assert stopped == [Interrupted((), {"notes": []})], f"Expected one stop, got {stopped}."
     assert calls == ["first", "second"], f"Expected each node to run one time, got {calls}."
     assert isinstance(actual, Finished), f"Expected a finished run, got {actual}."
 
@@ -365,7 +367,7 @@ def test_resume_value_continues_a_thread_that_stopped_before_a_node() -> None:
     third = graph.invoke(Command(resume="answer"), thread_id="thread")
 
     values = [item.value for item in second.interrupts] if isinstance(second, Interrupted) else None
-    assert first == Interrupted(()), f"Expected a stop without a value, got {first}."
+    assert first == Interrupted((), {"notes": []}), f"Expected a stop without a value, got {first}."
     assert values == ["question"], f"Expected the value of the interrupt, got {second}."
     assert third == Finished(Output(notes=["answer"])), f"Expected the answer, got {third}."
 
@@ -446,3 +448,66 @@ def test_update_of_the_state_of_a_child_graph_is_in_the_output() -> None:
 
     expected = Finished(Output(notes=["first", "update", "answer"]))
     assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+@pytest.mark.parametrize(
+    ("stop_before", "notes"), [("second", ["input", "first"]), ("third", ["input", "first", "second"])]
+)
+def test_interrupted_result_has_the_values_at_the_stop(stop_before: str, notes: list[str]) -> None:
+    """
+    Arrange: a chain of nodes that stops before a named node.
+    Act: run a thread with an input.
+    Assert: the result has no interrupt and the values that the nodes before the stop wrote.
+    """
+    graph = build_chain([], interrupt_before=(stop_before,))
+    expected = Interrupted((), {"notes": notes})
+
+    actual = graph.invoke({"notes": ["input"]}, thread_id="thread")
+
+    assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+def test_state_tasks_have_the_result_of_a_finished_task_and_the_path() -> None:
+    """
+    Arrange: a thread whose step has one node that finished and one node that stopped at an interrupt.
+    Act: read the state of the thread.
+    Assert: the finished task has its update as result, the other task has no result, and each path names the node.
+    """
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("write", build_writer("write", []))
+    builder.add_node("ask", ask)
+    builder.add_edge(Endpoint.start, "write")
+    builder.add_edge(Endpoint.start, "ask")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    graph.invoke({}, thread_id="thread")
+    expected = {"write": (PullPath("write"), {"notes": ["write"]}), "ask": (PullPath("ask"), None)}
+
+    actual = graph.get_state("thread")
+
+    summary = {task.name: (task.path, task.result) for task in actual.tasks}
+    assert summary == expected, f"Expected {expected}, got {summary}."
+
+
+@pytest.mark.parametrize("sends", [1, 2, 3])
+def test_state_task_of_a_send_has_the_index_of_the_send_as_path(sends: int) -> None:
+    """
+    Arrange: a thread whose node sent a number of inputs to a node that stops at an interrupt.
+    Act: read the state of the thread.
+    Assert: the path of each task has the index of its send.
+    """
+
+    def fan_out(state: State) -> Command[str]:
+        return Command(goto=[Send("ask", {}) for _ in range(sends)])
+
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("fan_out", fan_out)
+    builder.add_node("ask", ask)
+    builder.add_edge(Endpoint.start, "fan_out")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    graph.invoke({}, thread_id="thread")
+    expected = [PushPath(index) for index in range(sends)]
+
+    actual = graph.get_state("thread")
+
+    paths = [task.path for task in actual.tasks]
+    assert paths == expected, f"Expected the paths {expected}, got {paths}."

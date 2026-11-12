@@ -121,6 +121,11 @@ class NodeCall:
 
 
 @dataclass(frozen=True)
+class TaskInterrupted:
+    interrupts: tuple[Interrupt, ...]
+
+
+@dataclass(frozen=True)
 class ChildEntry:
     position: Position
     journal: "Journal"
@@ -503,9 +508,9 @@ class CompiledGraph[StateT, InputT, OutputT]:
             async with AsyncExitStack() as step_exits:
                 results = await self.run_step(calls, run, journal, step_exits)
                 interrupts = [
-                    item for result in results if isinstance(result, Interrupted) for item in result.interrupts
+                    item for result in results if isinstance(result, TaskInterrupted) for item in result.interrupts
                 ]
-                if any(isinstance(result, Interrupted) for result in results):
+                if any(isinstance(result, TaskInterrupted) for result in results):
                     return self.stop(position, run, journal, tuple(interrupts))
                 writes = [result for result in results if isinstance(result, TaskWrites)]
                 position = apply_writes(position, tasks, writes, [], self.trigger_keys)
@@ -524,13 +529,14 @@ class CompiledGraph[StateT, InputT, OutputT]:
                 run.stream.send(StreamMode.checkpoints, CheckpointPart(journal.ns, snapshot))
 
     def stop(self, position: Position, run: Run, journal: Journal, interrupts: tuple[Interrupt, ...]) -> Interrupted:
-        run.stream.send(StreamMode.values, ValuesPart(journal.ns, position.channels.read_values(), interrupts))
+        values = position.channels.read_values()
+        run.stream.send(StreamMode.values, ValuesPart(journal.ns, values, interrupts))
         run.stream.send(StreamMode.updates, InterruptsPart(journal.ns, interrupts))
-        return Interrupted(interrupts)
+        return Interrupted(interrupts, values)
 
     async def run_step(
         self, calls: Sequence[NodeCall], run: Run, journal: Journal, step_exits: AsyncExitStack
-    ) -> list[TaskWrites | Interrupted]:
+    ) -> list[TaskWrites | TaskInterrupted]:
         try:
             async with asyncio.TaskGroup() as group:
                 tasks = [group.create_task(self.run_task(call, run, journal, step_exits)) for call in calls]
@@ -542,7 +548,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
 
     async def run_task(
         self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack
-    ) -> TaskWrites | Interrupted:
+    ) -> TaskWrites | TaskInterrupted:
         saved = journal.find_writes(call.task)
         if saved is not None:
             return saved
@@ -558,7 +564,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         except GraphInterrupt as stop:
             await finish_despite_cancellation(journal.record_interrupt(call.task, stop.interrupts, scratchpad.resume))
             run.stream.send(StreamMode.tasks, TaskResultPart(journal.ns, task_id, str(name), {}, stop.interrupts))
-            return Interrupted(stop.interrupts)
+            return TaskInterrupted(stop.interrupts)
         await finish_despite_cancellation(journal.record(call.task, writes))
         if isinstance(name, str):
             run.stream.send(StreamMode.updates, UpdatesPart(journal.ns, name, writes.fields))

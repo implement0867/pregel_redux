@@ -28,6 +28,7 @@ class Finished[OutputT]:
 @dataclass(frozen=True)
 class Interrupted:
     interrupts: tuple[Interrupt, ...]
+    values: Mapping[str, object]
 
 
 @dataclass

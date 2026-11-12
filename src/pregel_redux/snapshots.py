@@ -8,11 +8,22 @@ from pregel_redux.interrupts import Interrupt
 
 
 @dataclass(frozen=True)
+class PullPath:
+    node: str
+
+
+@dataclass(frozen=True)
+class PushPath:
+    index: int
+
+
+@dataclass(frozen=True)
 class TaskSnapshot:
     id: str
     name: str
+    path: PullPath | PushPath
     interrupts: tuple[Interrupt, ...]
-    finished: bool
+    result: Mapping[str, object] | None
     state: "StateSnapshot | None"
 
 
