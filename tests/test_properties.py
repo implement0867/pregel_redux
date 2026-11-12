@@ -54,7 +54,8 @@ class ChildInput(TypedDict, total=False):
     clock: Annotated[int, Reducer(add_numbers, initial_factory=int)]
 
 
-class Visits(TypedDict, total=False):
+class ChildOutput(TypedDict, total=False):
+    clock: Annotated[int, Reducer(add_numbers, initial_factory=int)]
     visits: Annotated[list[str], Reducer(join_lists, initial_factory=list)]
 
 
@@ -222,7 +223,9 @@ def build_function(
         target = spec.nodes[index]
         match target.work:
             case FunctionSpec():
-                return Send(target.name, State(visits=[*execution.observed, label, tag], clock=execution.clock))
+                return Send(
+                    target.name, State(origin=tag, visits=[*execution.observed, label, tag], clock=execution.clock)
+                )
             case ChildSpec():
                 return Send(target.name, ChildInput(origin=tag, clock=execution.clock))
             case _:
@@ -241,9 +244,7 @@ def build_function(
                 pass
             case AskerSpec(questions=questions):
                 for index in range(questions if build.interactive else 0):
-                    question = json.dumps(
-                        [list(path), execution.origin, execution.clock, list(execution.observed), index]
-                    )
+                    question = json.dumps([list(path), execution.origin, execution.clock, index])
                     answer = interrupt(question, response_schema=str)
                     execution.given.append(trace.given.get(question))
                     execution.received.append(answer)
@@ -283,7 +284,7 @@ def add_nodes[InputT, OutputT](
             case FunctionSpec() as work:
                 builder.add_node(node.name, build_function(spec, work, (*path, index), build), defer=node.defer)
             case ChildSpec(graph=graph):
-                child = StateGraph(State, input_schema=ChildInput, output_schema=Visits)
+                child = StateGraph(State, input_schema=ChildInput, output_schema=ChildOutput)
                 add_nodes(child, graph, (*path, index), build)
                 builder.add_node(node.name, child, defer=node.defer)
             case _:
@@ -638,7 +639,7 @@ class ThreadMachine(RuleBasedStateMachine):
         result = self.deliver(Command(goto=name), self.config, delivery)
 
         now = sum(execution.path[0] == index for execution in list(thread.trace.executions.values()))
-        if result is not None and not finished:
+        if result is not None and not finished and not thread.spec.nodes[index].defer:
             assert now > started, f"Expected the node {name!r} to run after a goto to it."
 
     @precondition(lambda self: bool(self.thread.history))
@@ -806,7 +807,7 @@ class ThreadMachine(RuleBasedStateMachine):
                 f"Expected no second question for an answer that a node received, got {waiting}."
             )
         completed = thread.trace.completed()
-        keys = Counter((item.path, item.era, item.origin, item.clock, item.observed) for item in completed)
+        keys = Counter((item.path, item.era, item.origin, item.clock) for item in completed)
         repeated = [key for key, count in keys.items() if count > 1]
         assert not repeated, f"Expected each task to finish one time, got more for {repeated}."
         for item in completed:

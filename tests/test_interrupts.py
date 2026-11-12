@@ -354,20 +354,22 @@ def test_run_with_a_command_applies_its_update_and_its_goto(command: Command[str
 @pytest.mark.parametrize("interrupt_before", [[], ["late"]], ids=["finished-thread", "thread-before-the-node"])
 def test_goto_of_a_command_runs_a_deferred_node(interrupt_before: list[str]) -> None:
     """
-    Arrange: a thread of a graph with one deferred node, which finished or which stopped before the node.
+    Arrange: a thread of a graph with two deferred nodes, which finished or which stopped before the nodes.
     Act: run the thread with a Command whose goto names the deferred node.
-    Assert: the node ran one more time than before the command, and the node that waited did run.
+    Assert: a finished thread runs the node one more time, and a stopped thread runs the two nodes in one step.
     """
     builder = StateGraph(State)
     builder.add_node("late", build_writer("late", []), defer=True)
+    builder.add_node("other", build_writer("other", []), defer=True)
     builder.add_edge(Endpoint.start, "late")
+    builder.add_edge(Endpoint.start, "other")
     graph = builder.compile(checkpointer=InMemoryCheckpointer(), interrupt_before=interrupt_before)
     asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
     before = asyncio.run(graph.aget_state({"thread_id": "thread"})).values.get("notes", [])
 
     actual = asyncio.run(graph.ainvoke(Command(goto="late"), {"thread_id": "thread"}))
 
-    expected = Finished(State(notes=["late", "late"] if before else ["late"]))
+    expected = Finished(State(notes=["late", "other", "late"] if before else ["late", "other"]))
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 

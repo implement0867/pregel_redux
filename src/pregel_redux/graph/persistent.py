@@ -292,7 +292,8 @@ def read_command_writes(graph: AnyGraph, command: Command[str]) -> TaskWrites:
 
 def apply_command(graph: AnyGraph, position: Position, writes: TaskWrites) -> Position:
     sends = (*position.channels.tasks.values, *writes.sends) if writes.sends else ()
-    applied = apply_writes(position, [], [replace(writes, sends=sends)], [], graph.trigger_keys)
+    branches = frozenset(node for node in writes.branches if not position.channels.branches[node].is_available())
+    applied = apply_writes(position, [], [replace(writes, branches=branches, sends=sends)], [], graph.trigger_keys)
     return applied if plan_tasks(applied, graph.triggers) else finish_channels(applied)
 
 
