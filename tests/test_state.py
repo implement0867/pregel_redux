@@ -13,6 +13,7 @@ from pregel_redux import (
     PersistentGraph,
     Reducer,
     StateGraph,
+    StateSnapshot,
     interrupt,
 )
 from pregel_redux.checkpoints import CheckpointSource
@@ -367,3 +368,81 @@ def test_resume_value_continues_a_thread_that_stopped_before_a_node() -> None:
     assert first == Interrupted(()), f"Expected a stop without a value, got {first}."
     assert values == ["question"], f"Expected the value of the interrupt, got {second}."
     assert third == Finished(Output(notes=["answer"])), f"Expected the answer, got {third}."
+
+
+def build_parent_of_asking_child(depth: int) -> PersistentGraph[State, State, Output]:
+    graph = StateGraph(State, output_schema=State)
+    graph.add_node("first", build_writer("first", []))
+    graph.add_node("ask", ask)
+    graph.add_edge(Endpoint.start, "first")
+    graph.add_edge("first", "ask")
+    for _ in range(depth - 1):
+        parent = StateGraph(State, output_schema=State)
+        parent.add_node("child", graph)
+        parent.add_edge(Endpoint.start, "child")
+        graph = parent
+    root = StateGraph(State, output_schema=Output)
+    root.add_node("child", graph)
+    root.add_edge(Endpoint.start, "child")
+    return root.compile(checkpointer=InMemoryCheckpointer())
+
+
+def read_deepest_state(snapshot: StateSnapshot) -> StateSnapshot:
+    children = [task.state for task in snapshot.tasks if task.state is not None]
+    return read_deepest_state(children[0]) if children else snapshot
+
+
+@pytest.mark.parametrize("depth", [1, 2])
+def test_state_with_subgraphs_has_the_state_of_a_child_graph_that_stopped(depth: int) -> None:
+    """
+    Arrange: a thread that stopped at an interrupt in a child graph at a given depth.
+    Act: read the state with subgraphs and without subgraphs.
+    Assert: the state with subgraphs has the values, next node and interrupt of the deepest child graph.
+    """
+    graph = build_parent_of_asking_child(depth)
+    graph.invoke({}, thread_id="thread")
+
+    with_children = graph.get_state("thread", subgraphs=True)
+    without_children = asyncio.run(graph.aget_state("thread"))
+
+    actual = read_deepest_state(with_children)
+    values = [item.value for item in actual.interrupts]
+    assert len(actual.checkpoint_ns.split("|")) == depth, f"Expected a namespace of depth {depth}, got {actual}."
+    assert actual.values == {"notes": ["first"]}, f"Expected the note of the first node, got {actual.values}."
+    assert actual.next == ("ask",), f"Expected the next node ask, got {actual.next}."
+    assert values == ["question"], f"Expected the interrupt of the child graph, got {values}."
+    assert [task.state for task in without_children.tasks] == [None], "Expected no child state without subgraphs."
+
+
+def test_state_of_a_child_graph_is_read_by_its_namespace() -> None:
+    """
+    Arrange: a thread that stopped in a grandchild graph, and the state of the thread with subgraphs.
+    Act: read the state with the namespace of the grandchild graph, and with a namespace that names no child graph.
+    Assert: the state equals the state of the grandchild graph, and the unknown namespace raises LookupError.
+    """
+    graph = build_parent_of_asking_child(2)
+    graph.invoke({}, thread_id="thread")
+    expected = read_deepest_state(graph.get_state("thread", subgraphs=True))
+
+    actual = graph.get_state("thread", checkpoint_ns=expected.checkpoint_ns)
+
+    assert actual == expected, f"Expected {expected}, got {actual}."
+    with pytest.raises(LookupError, match="missing"):
+        graph.get_state("thread", checkpoint_ns="missing:1")
+
+
+def test_update_of_the_state_of_a_child_graph_is_in_the_output() -> None:
+    """
+    Arrange: a thread that stopped at an interrupt in a child graph.
+    Act: update the state of the child graph as its first node, then resume the thread.
+    Assert: the output has the note of the first node, the update and the answer.
+    """
+    graph = build_parent_of_asking_child(1)
+    graph.invoke({}, thread_id="thread")
+    child = read_deepest_state(graph.get_state("thread", subgraphs=True))
+    graph.update_state("thread", {"notes": ["update"]}, as_node="first", checkpoint_ns=child.checkpoint_ns)
+
+    actual = graph.invoke(Command(resume="answer"), thread_id="thread")
+
+    expected = Finished(Output(notes=["first", "update", "answer"]))
+    assert actual == expected, f"Expected {expected}, got {actual}."

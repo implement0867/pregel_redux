@@ -316,7 +316,15 @@ class ThreadScope:
         fork_id = await self.put(position, step, CheckpointSource.fork, checkpoint_id, loaded.newest_id)
         return position, ThreadJournal(self, fork_id, step + 1, ())
 
-    def read_snapshot(self, saved: CheckpointTuple) -> "StateSnapshot":
+    async def read_child_snapshot(self, journal: "ThreadJournal", task: TaskRef) -> "StateSnapshot | None":
+        child = self.graph.nodes[task.node].action if isinstance(task.node, str) else None
+        if not isinstance(child, CompiledGraph):
+            return None
+        scope = ThreadScope(child, self.checkpointer, self.thread_id, journal.make_task_ns(task))
+        saved = await self.checkpointer.aget_tuple(scope.thread_id, scope.checkpoint_ns, None)
+        return None if saved is None else await scope.read_snapshot(saved, subgraphs=True)
+
+    async def read_snapshot(self, saved: CheckpointTuple, *, subgraphs: bool) -> "StateSnapshot":
         position = load_position(self.graph, saved.checkpoint)
         journal = self.open_journal(saved)
         refs = [refer_task(task) for task in plan_tasks(position, self.graph.triggers)]
@@ -324,17 +332,21 @@ class ThreadScope:
             write.task_id: write.interrupts for write in saved.pending_writes if isinstance(write, TaskInterruptRecord)
         }
         tasks = tuple(
-            TaskSnapshot(
-                id=journal.make_task_id(ref),
-                name=str(ref.node) if isinstance(ref.node, str) else "__start__",
-                interrupts=() if journal.find_writes(ref) else interrupts.get(journal.make_task_id(ref), ()),
-                finished=journal.find_writes(ref) is not None,
-            )
-            for ref in refs
+            [
+                TaskSnapshot(
+                    id=journal.make_task_id(ref),
+                    name=str(ref.node) if isinstance(ref.node, str) else "__start__",
+                    interrupts=() if journal.find_writes(ref) else interrupts.get(journal.make_task_id(ref), ()),
+                    finished=journal.find_writes(ref) is not None,
+                    state=await self.read_child_snapshot(journal, ref) if subgraphs else None,
+                )
+                for ref in refs
+            ]
         )
         return StateSnapshot(
             values=position.channels.read_values(),
             next=tuple(task.name for task in tasks),
+            checkpoint_ns=self.checkpoint_ns,
             checkpoint_id=saved.checkpoint.id,
             parent_id=saved.checkpoint.parent_id,
             created_at=saved.checkpoint.ts,
@@ -357,12 +369,14 @@ class TaskSnapshot:
     name: str
     interrupts: tuple[Interrupt, ...]
     finished: bool
+    state: "StateSnapshot | None"
 
 
 @dataclass(frozen=True)
 class StateSnapshot:
     values: Mapping[str, object]
     next: tuple[str, ...]
+    checkpoint_ns: str
     checkpoint_id: UUID
     parent_id: UUID | None
     created_at: datetime
@@ -464,6 +478,18 @@ def infer_writer(graph: AnyGraph, versions_seen: Mapping[str, TriggerVersions]) 
     if len(last_seen) == 1 or (len(last_seen) > 1 and last_seen[-1][0] != last_seen[-2][0]):
         return last_seen[-1][1]
     raise ValueError("the node that made the last update is not clear, so give as_node")
+
+
+def find_graph(graph: AnyGraph, checkpoint_ns: str) -> AnyGraph:
+    found = graph
+    for part in checkpoint_ns.split("|") if checkpoint_ns else ():
+        name = part.rsplit(":", 1)[0]
+        match found.nodes[name].action if name in found.nodes else None:
+            case CompiledGraph() as child:
+                found = child
+            case _:
+                raise LookupError(f"the namespace {checkpoint_ns!r} names {name!r}, which is not a child graph")
+    return found
 
 
 @dataclass(frozen=True)
@@ -677,27 +703,39 @@ class PersistentGraph[StateT, InputT, OutputT]:
         )
 
     async def read_state(
-        self, checkpointer: AsyncCheckpointer, thread_id: str, checkpoint_id: UUID | None
+        self,
+        checkpointer: AsyncCheckpointer,
+        thread_id: str,
+        checkpoint_id: UUID | None,
+        checkpoint_ns: str,
+        *,
+        subgraphs: bool,
     ) -> StateSnapshot:
-        scope = ThreadScope(self.graph, checkpointer, thread_id, "")
-        saved = await checkpointer.aget_tuple(thread_id, "", checkpoint_id)
+        scope = ThreadScope(find_graph(self.graph, checkpoint_ns), checkpointer, thread_id, checkpoint_ns)
+        saved = await checkpointer.aget_tuple(thread_id, checkpoint_ns, checkpoint_id)
         if saved is None:
             raise LookupError(f"thread {thread_id!r} has no such checkpoint")
-        return scope.read_snapshot(saved)
+        return await scope.read_snapshot(saved, subgraphs=subgraphs)
 
-    async def aget_state(self, thread_id: str, *, checkpoint_id: UUID | None = None) -> StateSnapshot:
-        return await self.read_state(self.checkpointer, thread_id, checkpoint_id)
+    async def aget_state(
+        self, thread_id: str, *, checkpoint_id: UUID | None = None, checkpoint_ns: str = "", subgraphs: bool = False
+    ) -> StateSnapshot:
+        return await self.read_state(self.checkpointer, thread_id, checkpoint_id, checkpoint_ns, subgraphs=subgraphs)
 
-    def get_state(self, thread_id: str, *, checkpoint_id: UUID | None = None) -> StateSnapshot:
+    def get_state(
+        self, thread_id: str, *, checkpoint_id: UUID | None = None, checkpoint_ns: str = "", subgraphs: bool = False
+    ) -> StateSnapshot:
         checkpointer = ThreadedCheckpointer(self.checkpointer)
-        return run_in_new_loop(lambda: self.read_state(checkpointer, thread_id, checkpoint_id))
+        return run_in_new_loop(
+            lambda: self.read_state(checkpointer, thread_id, checkpoint_id, checkpoint_ns, subgraphs=subgraphs)
+        )
 
     async def read_state_history(
         self, checkpointer: AsyncCheckpointer, thread_id: str, before: UUID | None, limit: int | None
     ) -> AsyncIterator[StateSnapshot]:
         scope = ThreadScope(self.graph, checkpointer, thread_id, "")
         async for saved in checkpointer.alist(thread_id, "", before=before, limit=limit):
-            yield scope.read_snapshot(saved)
+            yield await scope.read_snapshot(saved, subgraphs=False)
 
     def aget_state_history(
         self, thread_id: str, *, before: UUID | None = None, limit: int | None = None
@@ -717,9 +755,10 @@ class PersistentGraph[StateT, InputT, OutputT]:
         values: object,
         as_node: str | None,
         checkpoint_id: UUID | None,
+        checkpoint_ns: str,
     ) -> UUID:
-        graph = self.graph
-        scope = ThreadScope(graph, checkpointer, thread_id, "")
+        graph = find_graph(self.graph, checkpoint_ns)
+        scope = ThreadScope(graph, checkpointer, thread_id, checkpoint_ns)
         loaded = await scope.find(checkpoint_id)
         if loaded is None:
             node = as_node or infer_writer(graph, {})
@@ -737,12 +776,26 @@ class PersistentGraph[StateT, InputT, OutputT]:
         return await scope.put(updated, step + 1, CheckpointSource.update, parent_id, newest_id)
 
     async def aupdate_state(
-        self, thread_id: str, values: object, *, as_node: str | None = None, checkpoint_id: UUID | None = None
+        self,
+        thread_id: str,
+        values: object,
+        *,
+        as_node: str | None = None,
+        checkpoint_id: UUID | None = None,
+        checkpoint_ns: str = "",
     ) -> UUID:
-        return await self.write_update(self.checkpointer, thread_id, values, as_node, checkpoint_id)
+        return await self.write_update(self.checkpointer, thread_id, values, as_node, checkpoint_id, checkpoint_ns)
 
     def update_state(
-        self, thread_id: str, values: object, *, as_node: str | None = None, checkpoint_id: UUID | None = None
+        self,
+        thread_id: str,
+        values: object,
+        *,
+        as_node: str | None = None,
+        checkpoint_id: UUID | None = None,
+        checkpoint_ns: str = "",
     ) -> UUID:
         checkpointer = ThreadedCheckpointer(self.checkpointer)
-        return run_in_new_loop(lambda: self.write_update(checkpointer, thread_id, values, as_node, checkpoint_id))
+        return run_in_new_loop(
+            lambda: self.write_update(checkpointer, thread_id, values, as_node, checkpoint_id, checkpoint_ns)
+        )
