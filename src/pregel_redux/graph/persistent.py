@@ -31,6 +31,8 @@ from pregel_redux.checkpoints import (
     TriggerVersions,
 )
 from pregel_redux.commands import Command, Endpoint, Send
+from pregel_redux.configs import ThreadConfig, read_config
+from pregel_redux.dependencies import Depends, Scope
 from pregel_redux.graph.compiled import (
     ChildEntry,
     CompiledGraph,
@@ -506,9 +508,12 @@ class PersistentGraph[StateT, InputT, OutputT]:
         self,
         checkpointer: AsyncCheckpointer,
         input: InputT | Command[str] | None,
-        thread_id: str,
-        checkpoint_id: UUID | None,
+        config: ThreadConfig,
     ) -> RunStart:
+        if config.get("checkpoint_ns"):
+            raise ValueError("a run starts at the root graph, so its config cannot have a checkpoint_ns")
+        thread_id = config["thread_id"]
+        checkpoint_id = config.get("checkpoint_id")
         scope = ThreadScope(self.graph, checkpointer, thread_id, "")
         loaded = await scope.load(checkpoint_id)
         match input:
@@ -529,114 +534,105 @@ class PersistentGraph[StateT, InputT, OutputT]:
         self,
         checkpointer: AsyncCheckpointer,
         input: InputT | Command[str] | None,
-        thread_id: str,
-        checkpoint_id: UUID | None,
+        config: ThreadConfig,
         step_limit: int | None,
         stream: Stream,
     ) -> Finished[OutputT] | Interrupted:
-        start = await self.start(checkpointer, input, thread_id, checkpoint_id)
+        start = await self.start(checkpointer, input, config)
+        provided: dict[Depends, object] = {Depends(read_config, scope=scope): config for scope in Scope}
         return await self.graph.run(
-            start.position, step_limit, start.journal, start.resume, stream, resumed=start.resumed
+            start.position, step_limit, start.journal, start.resume, stream, provided, resumed=start.resumed
         )
 
     async def ainvoke(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> Finished[OutputT] | Interrupted:
         stream = Stream(frozenset(), subgraphs=False, emit=lambda part: None)
-        return await self.run(self.checkpointer, input, thread_id, checkpoint_id, step_limit, stream)
+        return await self.run(self.checkpointer, input, config, step_limit, stream)
 
     def invoke(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> Finished[OutputT] | Interrupted:
         self.graph.reject_async_nodes("ainvoke")
         stream = Stream(frozenset(), subgraphs=False, emit=lambda part: None)
         checkpointer = ThreadedCheckpointer(self.checkpointer)
-        return run_in_new_loop(lambda: self.run(checkpointer, input, thread_id, checkpoint_id, step_limit, stream))
+        return run_in_new_loop(lambda: self.run(checkpointer, input, config, step_limit, stream))
 
     @overload
     def astream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: Literal[StreamMode.values],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> AsyncGenerator[ValuesPart]: ...
     @overload
     def astream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: Literal[StreamMode.updates],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> AsyncGenerator[UpdatesPart | InterruptsPart]: ...
     @overload
     def astream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: Literal[StreamMode.custom],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> AsyncGenerator[CustomPart]: ...
     @overload
     def astream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: Literal[StreamMode.tasks],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> AsyncGenerator[TaskStartPart | TaskResultPart]: ...
     @overload
     def astream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: Literal[StreamMode.checkpoints],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> AsyncGenerator[CheckpointPart]: ...
     @overload
     def astream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: Collection[StreamMode],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> AsyncGenerator[StreamPart]: ...
     def astream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: StreamMode | Collection[StreamMode],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> AsyncGenerator[StreamPart]:
         modes = frozenset([stream_mode] if isinstance(stream_mode, StreamMode) else stream_mode)
@@ -644,8 +640,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
             lambda emit: self.run(
                 self.checkpointer,
                 input,
-                thread_id,
-                checkpoint_id,
+                config,
                 step_limit,
                 Stream(modes, subgraphs=subgraphs, emit=emit),
             )
@@ -655,76 +650,69 @@ class PersistentGraph[StateT, InputT, OutputT]:
     def stream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: Literal[StreamMode.values],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> Generator[ValuesPart]: ...
     @overload
     def stream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: Literal[StreamMode.updates],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> Generator[UpdatesPart | InterruptsPart]: ...
     @overload
     def stream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: Literal[StreamMode.custom],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> Generator[CustomPart]: ...
     @overload
     def stream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: Literal[StreamMode.tasks],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> Generator[TaskStartPart | TaskResultPart]: ...
     @overload
     def stream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: Literal[StreamMode.checkpoints],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> Generator[CheckpointPart]: ...
     @overload
     def stream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: Collection[StreamMode],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> Generator[StreamPart]: ...
     def stream(
         self,
         input: InputT | Command[str] | None,
+        config: ThreadConfig,
         *,
-        thread_id: str,
         stream_mode: StreamMode | Collection[StreamMode],
         subgraphs: bool = False,
-        checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
     ) -> Generator[StreamPart]:
         self.graph.reject_async_nodes("astream")
@@ -735,8 +723,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
                 lambda emit: self.run(
                     checkpointer,
                     input,
-                    thread_id,
-                    checkpoint_id,
+                    config,
                     step_limit,
                     Stream(modes, subgraphs=subgraphs, emit=emit),
                 )
@@ -744,63 +731,55 @@ class PersistentGraph[StateT, InputT, OutputT]:
         )
 
     async def read_state(
-        self,
-        checkpointer: AsyncCheckpointer,
-        thread_id: str,
-        checkpoint_id: UUID | None,
-        checkpoint_ns: str,
-        *,
-        subgraphs: bool,
+        self, checkpointer: AsyncCheckpointer, config: ThreadConfig, *, subgraphs: bool
     ) -> StateSnapshot:
+        thread_id = config["thread_id"]
+        checkpoint_ns = config.get("checkpoint_ns", "")
         scope = ThreadScope(find_graph(self.graph, checkpoint_ns), checkpointer, thread_id, checkpoint_ns)
-        saved = await checkpointer.aget_tuple(thread_id, checkpoint_ns, checkpoint_id)
+        saved = await checkpointer.aget_tuple(thread_id, checkpoint_ns, config.get("checkpoint_id"))
         if saved is None:
             raise LookupError(f"thread {thread_id!r} has no such checkpoint")
         return await scope.read_snapshot(saved, subgraphs=subgraphs)
 
-    async def aget_state(
-        self, thread_id: str, *, checkpoint_id: UUID | None = None, checkpoint_ns: str = "", subgraphs: bool = False
-    ) -> StateSnapshot:
-        return await self.read_state(self.checkpointer, thread_id, checkpoint_id, checkpoint_ns, subgraphs=subgraphs)
+    async def aget_state(self, config: ThreadConfig, *, subgraphs: bool = False) -> StateSnapshot:
+        return await self.read_state(self.checkpointer, config, subgraphs=subgraphs)
 
-    def get_state(
-        self, thread_id: str, *, checkpoint_id: UUID | None = None, checkpoint_ns: str = "", subgraphs: bool = False
-    ) -> StateSnapshot:
+    def get_state(self, config: ThreadConfig, *, subgraphs: bool = False) -> StateSnapshot:
         checkpointer = ThreadedCheckpointer(self.checkpointer)
-        return run_in_new_loop(
-            lambda: self.read_state(checkpointer, thread_id, checkpoint_id, checkpoint_ns, subgraphs=subgraphs)
-        )
+        return run_in_new_loop(lambda: self.read_state(checkpointer, config, subgraphs=subgraphs))
 
     async def read_state_history(
-        self, checkpointer: AsyncCheckpointer, thread_id: str, before: UUID | None, limit: int | None
+        self, checkpointer: AsyncCheckpointer, config: ThreadConfig, before: UUID | None, limit: int | None
     ) -> AsyncIterator[StateSnapshot]:
-        scope = ThreadScope(self.graph, checkpointer, thread_id, "")
-        async for saved in checkpointer.alist(thread_id, "", before=before, limit=limit):
+        thread_id = config["thread_id"]
+        checkpoint_ns = config.get("checkpoint_ns", "")
+        scope = ThreadScope(find_graph(self.graph, checkpoint_ns), checkpointer, thread_id, checkpoint_ns)
+        if "checkpoint_id" in config:
+            saved = await checkpointer.aget_tuple(thread_id, checkpoint_ns, config["checkpoint_id"])
+            if saved is not None and (before is None or saved.checkpoint.id < before) and limit != 0:
+                yield await scope.read_snapshot(saved, subgraphs=False)
+            return
+        async for saved in checkpointer.alist(thread_id, checkpoint_ns, before=before, limit=limit):
             yield await scope.read_snapshot(saved, subgraphs=False)
 
     def aget_state_history(
-        self, thread_id: str, *, before: UUID | None = None, limit: int | None = None
+        self, config: ThreadConfig, *, before: UUID | None = None, limit: int | None = None
     ) -> AsyncIterator[StateSnapshot]:
-        return self.read_state_history(self.checkpointer, thread_id, before, limit)
+        return self.read_state_history(self.checkpointer, config, before, limit)
 
     def get_state_history(
-        self, thread_id: str, *, before: UUID | None = None, limit: int | None = None
+        self, config: ThreadConfig, *, before: UUID | None = None, limit: int | None = None
     ) -> Iterator[StateSnapshot]:
         checkpointer = ThreadedCheckpointer(self.checkpointer)
-        return iterate_in_new_loop(lambda: self.read_state_history(checkpointer, thread_id, before, limit))
+        return iterate_in_new_loop(lambda: self.read_state_history(checkpointer, config, before, limit))
 
     async def write_update(
-        self,
-        checkpointer: AsyncCheckpointer,
-        thread_id: str,
-        values: object,
-        as_node: str | None,
-        checkpoint_id: UUID | None,
-        checkpoint_ns: str,
+        self, checkpointer: AsyncCheckpointer, config: ThreadConfig, values: object, as_node: str | None
     ) -> UUID:
+        checkpoint_ns = config.get("checkpoint_ns", "")
         graph = find_graph(self.graph, checkpoint_ns)
-        scope = ThreadScope(graph, checkpointer, thread_id, checkpoint_ns)
-        loaded = await scope.find(checkpoint_id)
+        scope = ThreadScope(graph, checkpointer, config["thread_id"], checkpoint_ns)
+        loaded = await scope.find(config.get("checkpoint_id"))
         if loaded is None:
             node = as_node or infer_writer(graph, {})
             position, step, parent_id, newest_id = graph.open({}), -1, None, None
@@ -817,27 +796,9 @@ class PersistentGraph[StateT, InputT, OutputT]:
         saved = await scope.put(updated, step + 1, CheckpointSource.update, parent_id, newest_id)
         return saved.id
 
-    async def aupdate_state(
-        self,
-        thread_id: str,
-        values: object,
-        *,
-        as_node: str | None = None,
-        checkpoint_id: UUID | None = None,
-        checkpoint_ns: str = "",
-    ) -> UUID:
-        return await self.write_update(self.checkpointer, thread_id, values, as_node, checkpoint_id, checkpoint_ns)
+    async def aupdate_state(self, config: ThreadConfig, values: object, *, as_node: str | None = None) -> UUID:
+        return await self.write_update(self.checkpointer, config, values, as_node)
 
-    def update_state(
-        self,
-        thread_id: str,
-        values: object,
-        *,
-        as_node: str | None = None,
-        checkpoint_id: UUID | None = None,
-        checkpoint_ns: str = "",
-    ) -> UUID:
+    def update_state(self, config: ThreadConfig, values: object, *, as_node: str | None = None) -> UUID:
         checkpointer = ThreadedCheckpointer(self.checkpointer)
-        return run_in_new_loop(
-            lambda: self.write_update(checkpointer, thread_id, values, as_node, checkpoint_id, checkpoint_ns)
-        )
+        return run_in_new_loop(lambda: self.write_update(checkpointer, config, values, as_node))

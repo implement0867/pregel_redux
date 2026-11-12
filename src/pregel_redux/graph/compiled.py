@@ -282,7 +282,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
 
     async def run_without_thread(self, input: InputT, step_limit: int | None, stream: Stream) -> OutputT:
         start = self.feed(self.open({}), extract_writes(input))
-        result = await self.run(start, step_limit, NoJournal((), 0), ResumeInput([], {}), stream, resumed=False)
+        result = await self.run(start, step_limit, NoJournal((), 0), ResumeInput([], {}), stream, {}, resumed=False)
         match result:
             case Finished():
                 return result.output
@@ -300,12 +300,13 @@ class CompiledGraph[StateT, InputT, OutputT]:
         journal: Journal,
         resume: ResumeInput,
         stream: Stream,
+        provided: dict[Depends, object],
         *,
         resumed: bool,
     ) -> Finished[OutputT] | Interrupted:
         limit = RunSettings().step_limit if step_limit is None else step_limit
         async with AsyncExitStack() as run_exits:
-            run = Run({}, run_exits, asyncio.Lock(), limit, resume, stream)
+            run = Run(provided, run_exits, asyncio.Lock(), limit, resume, stream)
             return await self.run_steps(position, run, journal, resumed=resumed)
 
     @overload

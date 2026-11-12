@@ -1,21 +1,27 @@
 import asyncio
 from collections.abc import Callable
 from typing import Annotated, TypedDict
+from uuid import uuid4
 
 import pytest
 
 from pregel_redux import (
     Command,
+    Depends,
     Endpoint,
     Finished,
     InMemoryCheckpointer,
     Interrupted,
     PersistentGraph,
     Reducer,
+    Scope,
     Send,
     StateGraph,
     StateSnapshot,
+    StreamMode,
+    ThreadConfig,
     interrupt,
+    read_config,
 )
 from pregel_redux.checkpoints import CheckpointSource
 from pregel_redux.snapshots import PullPath, PushPath
@@ -77,10 +83,10 @@ def test_state_of_a_finished_thread_has_its_values_and_no_next_node() -> None:
     Assert: the state has the values of the output, no next node, and the step of the last node.
     """
     graph = build_chain([])
-    graph.invoke({"notes": ["input"]}, thread_id="thread")
+    graph.invoke({"notes": ["input"]}, {"thread_id": "thread"})
 
-    actual = graph.get_state("thread")
-    from_async = asyncio.run(graph.aget_state("thread"))
+    actual = graph.get_state({"thread_id": "thread"})
+    from_async = asyncio.run(graph.aget_state({"thread_id": "thread"}))
 
     summary = (actual.values, actual.next, actual.step, actual.source)
     expected = ({"notes": ["input", "first", "second", "third"]}, (), 3, CheckpointSource.loop)
@@ -95,9 +101,9 @@ def test_state_of_a_thread_at_an_interrupt_has_the_node_and_the_interrupt() -> N
     Assert: the next node is the node that called interrupt, and the state has the value of the interrupt.
     """
     graph = build_asking_graph()
-    graph.invoke({}, thread_id="thread")
+    graph.invoke({}, {"thread_id": "thread"})
 
-    actual = graph.get_state("thread")
+    actual = graph.get_state({"thread_id": "thread"})
 
     values = [item.value for item in actual.interrupts]
     assert actual.next == ("ask",), f"Expected the next node 'ask', got {actual.next}."
@@ -113,7 +119,7 @@ def test_state_of_a_thread_without_a_checkpoint_is_rejected() -> None:
     graph = build_chain([])
 
     with pytest.raises(LookupError, match="thread 'missing'"):
-        graph.get_state("missing")
+        graph.get_state({"thread_id": "missing"})
 
 
 @pytest.mark.parametrize(("skipped", "limit"), [(0, None), (2, None), (0, 2), (1, 1)])
@@ -124,11 +130,11 @@ def test_state_history_gives_the_states_before_an_id_with_the_newest_first(skipp
     Assert: the history has the older states with the newest first, and each state names the node that runs next.
     """
     graph = build_chain([])
-    graph.invoke({}, thread_id="thread")
-    history = list(graph.get_state_history("thread"))
+    graph.invoke({}, {"thread_id": "thread"})
+    history = list(graph.get_state_history({"thread_id": "thread"}))
     before = None if skipped == 0 else history[skipped - 1].checkpoint_id
 
-    actual = asyncio.run(collect(graph.aget_state_history("thread", before=before, limit=limit)))
+    actual = asyncio.run(collect(graph.aget_state_history({"thread_id": "thread"}, before=before, limit=limit)))
 
     nodes = [state.next for state in actual]
     expected = [(), ("third",), ("second",), ("first",), ("__start__",)][skipped:][:limit]
@@ -143,13 +149,13 @@ def test_run_from_an_earlier_checkpoint_runs_the_later_nodes_again() -> None:
     """
     calls: list[str] = []
     graph = build_chain(calls)
-    expected = graph.invoke({}, thread_id="thread")
-    earlier = next(state for state in graph.get_state_history("thread") if state.next == ("second",))
+    expected = graph.invoke({}, {"thread_id": "thread"})
+    earlier = next(state for state in graph.get_state_history({"thread_id": "thread"}) if state.next == ("second",))
     calls.clear()
 
-    actual = graph.invoke(None, thread_id="thread", checkpoint_id=earlier.checkpoint_id)
+    actual = graph.invoke(None, {"thread_id": "thread", "checkpoint_id": earlier.checkpoint_id})
 
-    history = list(graph.get_state_history("thread"))
+    history = list(graph.get_state_history({"thread_id": "thread"}))
     fork = next(state for state in history if state.source is CheckpointSource.fork)
     assert actual == expected, f"Expected {expected}, got {actual}."
     assert calls == ["second", "third"], f"Expected the calls ['second', 'third'], got {calls}."
@@ -164,12 +170,12 @@ def test_run_from_a_checkpoint_that_the_thread_does_not_have_is_rejected() -> No
     Assert: the run raises LookupError.
     """
     graph = build_chain([])
-    graph.invoke({}, thread_id="thread")
-    graph.invoke({}, thread_id="other")
-    other_id = graph.get_state("other").checkpoint_id
+    graph.invoke({}, {"thread_id": "thread"})
+    graph.invoke({}, {"thread_id": "other"})
+    other_id = graph.get_state({"thread_id": "other"}).checkpoint_id
 
     with pytest.raises(LookupError, match="no checkpoint"):
-        graph.invoke(None, thread_id="thread", checkpoint_id=other_id)
+        graph.invoke(None, {"thread_id": "thread", "checkpoint_id": other_id})
 
 
 @pytest.mark.parametrize("as_node", ["first", None])
@@ -181,14 +187,14 @@ def test_state_update_counts_as_the_output_of_a_node(as_node: str | None) -> Non
     """
     calls: list[str] = []
     graph = build_chain(calls, interrupt_before=("second",))
-    graph.invoke({}, thread_id="thread")
+    graph.invoke({}, {"thread_id": "thread"})
 
-    checkpoint_id = graph.update_state("thread", {"notes": ["edit"]}, as_node=as_node)
+    checkpoint_id = graph.update_state({"thread_id": "thread"}, {"notes": ["edit"]}, as_node=as_node)
 
-    state = graph.get_state("thread")
+    state = graph.get_state({"thread_id": "thread"})
     summary = (state.checkpoint_id, state.values, state.next, state.source)
     expected = (checkpoint_id, {"notes": ["first", "edit"]}, ("second",), CheckpointSource.update)
-    actual = graph.invoke(None, thread_id="thread")
+    actual = graph.invoke(None, {"thread_id": "thread"})
     assert summary == expected, f"Expected {expected}, got {summary}."
     assert actual == Finished(Output(notes=["first", "edit", "second", "third"])), f"Got {actual}."
     assert calls == ["first", "second", "third"], f"Expected each node to run one time, got {calls}."
@@ -202,11 +208,11 @@ def test_state_update_as_a_later_node_skips_the_nodes_before_it() -> None:
     """
     calls: list[str] = []
     graph = build_chain(calls, interrupt_before=("second",))
-    graph.invoke({}, thread_id="thread")
+    graph.invoke({}, {"thread_id": "thread"})
 
-    asyncio.run(graph.aupdate_state("thread", {"notes": ["edit"]}, as_node="second"))
+    asyncio.run(graph.aupdate_state({"thread_id": "thread"}, {"notes": ["edit"]}, as_node="second"))
 
-    actual = graph.invoke(None, thread_id="thread")
+    actual = graph.invoke(None, {"thread_id": "thread"})
     assert actual == Finished(Output(notes=["first", "edit", "third"])), f"Got {actual}."
     assert calls == ["first", "third"], f"Expected the calls ['first', 'third'], got {calls}."
 
@@ -220,9 +226,9 @@ def test_state_update_of_a_new_thread_starts_the_thread() -> None:
     calls: list[str] = []
     graph = build_chain(calls)
 
-    graph.update_state("thread", {"notes": ["edit"]}, as_node="first")
+    graph.update_state({"thread_id": "thread"}, {"notes": ["edit"]}, as_node="first")
 
-    actual = graph.invoke(None, thread_id="thread")
+    actual = graph.invoke(None, {"thread_id": "thread"})
     assert actual == Finished(Output(notes=["edit", "second", "third"])), f"Got {actual}."
     assert calls == ["second", "third"], f"Expected the calls ['second', 'third'], got {calls}."
 
@@ -239,10 +245,10 @@ def test_state_update_without_a_clear_node_is_rejected(as_node: str | None, *, s
     """
     graph = build_chain([])
     if started:
-        graph.invoke({}, thread_id="thread")
+        graph.invoke({}, {"thread_id": "thread"})
 
     with pytest.raises(ValueError, match=message):
-        graph.update_state("thread", {"notes": ["edit"]}, as_node=as_node)
+        graph.update_state({"thread_id": "thread"}, {"notes": ["edit"]}, as_node=as_node)
 
 
 def test_state_update_from_an_earlier_checkpoint_becomes_the_newest_state() -> None:
@@ -253,13 +259,13 @@ def test_state_update_from_an_earlier_checkpoint_becomes_the_newest_state() -> N
     """
     calls: list[str] = []
     graph = build_chain(calls)
-    graph.invoke({}, thread_id="thread")
-    earlier = next(state for state in graph.get_state_history("thread") if state.next == ("third",))
+    graph.invoke({}, {"thread_id": "thread"})
+    earlier = next(state for state in graph.get_state_history({"thread_id": "thread"}) if state.next == ("third",))
     calls.clear()
 
-    graph.update_state("thread", {"notes": ["edit"]}, checkpoint_id=earlier.checkpoint_id)
+    graph.update_state({"thread_id": "thread", "checkpoint_id": earlier.checkpoint_id}, {"notes": ["edit"]})
 
-    actual = graph.invoke(None, thread_id="thread")
+    actual = graph.invoke(None, {"thread_id": "thread"})
     assert actual == Finished(Output(notes=["first", "second", "edit", "third"])), f"Got {actual}."
     assert calls == ["third"], f"Expected the calls ['third'], got {calls}."
 
@@ -286,11 +292,11 @@ def test_run_stops_before_and_after_the_named_nodes(
     graph = build_chain(calls, interrupt_before=before, interrupt_after=after)
     stops: list[list[str]] = []
 
-    result = graph.invoke({}, thread_id="thread")
+    result = graph.invoke({}, {"thread_id": "thread"})
     while isinstance(result, Interrupted):
         assert result.interrupts == (), f"Expected a stop without an interrupt value, got {result}."
         stops.append([*calls])
-        result = graph.invoke(None, thread_id="thread")
+        result = graph.invoke(None, {"thread_id": "thread"})
 
     assert stops == expected_stops, f"Expected the stops {expected_stops}, got {stops}."
     assert result == Finished(Output(notes=["first", "second", "third"])), f"Got {result}."
@@ -304,9 +310,9 @@ def test_new_input_on_a_stopped_thread_stops_before_the_named_node_again() -> No
     """
     calls: list[str] = []
     graph = build_chain(calls, interrupt_before=("second",))
-    graph.invoke({}, thread_id="thread")
+    graph.invoke({}, {"thread_id": "thread"})
 
-    actual = graph.invoke({"notes": ["more"]}, thread_id="thread")
+    actual = graph.invoke({"notes": ["more"]}, {"thread_id": "thread"})
 
     assert actual == Interrupted((), {"notes": ["first", "more", "first"]}), f"Expected a stop, got {actual}."
     assert calls == ["first", "first"], f"Expected the first node to run two times, got {calls}."
@@ -329,8 +335,8 @@ def test_child_graph_stops_before_its_named_node_and_continues() -> None:
     parent.add_edge(Endpoint.start, "child")
     graph = parent.compile(checkpointer=InMemoryCheckpointer(), interrupt_before=["child"])
 
-    stopped = [graph.invoke({}, thread_id="thread")]
-    actual = graph.invoke(None, thread_id="thread")
+    stopped = [graph.invoke({}, {"thread_id": "thread"})]
+    actual = graph.invoke(None, {"thread_id": "thread"})
 
     assert stopped == [Interrupted((), {"notes": []})], f"Expected one stop, got {stopped}."
     assert calls == ["first", "second"], f"Expected each node to run one time, got {calls}."
@@ -362,9 +368,9 @@ def test_resume_value_continues_a_thread_that_stopped_before_a_node() -> None:
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer(), interrupt_before=["ask"])
 
-    first = graph.invoke({}, thread_id="thread")
-    second = graph.invoke(None, thread_id="thread")
-    third = graph.invoke(Command(resume="answer"), thread_id="thread")
+    first = graph.invoke({}, {"thread_id": "thread"})
+    second = graph.invoke(None, {"thread_id": "thread"})
+    third = graph.invoke(Command(resume="answer"), {"thread_id": "thread"})
 
     values = [item.value for item in second.interrupts] if isinstance(second, Interrupted) else None
     assert first == Interrupted((), {"notes": []}), f"Expected a stop without a value, got {first}."
@@ -402,10 +408,10 @@ def test_state_with_subgraphs_has_the_state_of_a_child_graph_that_stopped(depth:
     Assert: the state with subgraphs has the values, next node and interrupt of the deepest child graph.
     """
     graph = build_parent_of_asking_child(depth)
-    graph.invoke({}, thread_id="thread")
+    graph.invoke({}, {"thread_id": "thread"})
 
-    with_children = graph.get_state("thread", subgraphs=True)
-    without_children = asyncio.run(graph.aget_state("thread"))
+    with_children = graph.get_state({"thread_id": "thread"}, subgraphs=True)
+    without_children = asyncio.run(graph.aget_state({"thread_id": "thread"}))
 
     actual = read_deepest_state(with_children)
     values = [item.value for item in actual.interrupts]
@@ -423,14 +429,14 @@ def test_state_of_a_child_graph_is_read_by_its_namespace() -> None:
     Assert: the state equals the state of the grandchild graph, and the unknown namespace raises LookupError.
     """
     graph = build_parent_of_asking_child(2)
-    graph.invoke({}, thread_id="thread")
-    expected = read_deepest_state(graph.get_state("thread", subgraphs=True))
+    graph.invoke({}, {"thread_id": "thread"})
+    expected = read_deepest_state(graph.get_state({"thread_id": "thread"}, subgraphs=True))
 
-    actual = graph.get_state("thread", checkpoint_ns=expected.checkpoint_ns)
+    actual = graph.get_state({"thread_id": "thread", "checkpoint_ns": expected.checkpoint_ns})
 
     assert actual == expected, f"Expected {expected}, got {actual}."
     with pytest.raises(LookupError, match="missing"):
-        graph.get_state("thread", checkpoint_ns="missing:1")
+        graph.get_state({"thread_id": "thread", "checkpoint_ns": "missing:1"})
 
 
 def test_update_of_the_state_of_a_child_graph_is_in_the_output() -> None:
@@ -440,11 +446,13 @@ def test_update_of_the_state_of_a_child_graph_is_in_the_output() -> None:
     Assert: the output has the note of the first node, the update and the answer.
     """
     graph = build_parent_of_asking_child(1)
-    graph.invoke({}, thread_id="thread")
-    child = read_deepest_state(graph.get_state("thread", subgraphs=True))
-    graph.update_state("thread", {"notes": ["update"]}, as_node="first", checkpoint_ns=child.checkpoint_ns)
+    graph.invoke({}, {"thread_id": "thread"})
+    child = read_deepest_state(graph.get_state({"thread_id": "thread"}, subgraphs=True))
+    graph.update_state(
+        {"thread_id": "thread", "checkpoint_ns": child.checkpoint_ns}, {"notes": ["update"]}, as_node="first"
+    )
 
-    actual = graph.invoke(Command(resume="answer"), thread_id="thread")
+    actual = graph.invoke(Command(resume="answer"), {"thread_id": "thread"})
 
     expected = Finished(Output(notes=["first", "update", "answer"]))
     assert actual == expected, f"Expected {expected}, got {actual}."
@@ -462,7 +470,7 @@ def test_interrupted_result_has_the_values_at_the_stop(stop_before: str, notes: 
     graph = build_chain([], interrupt_before=(stop_before,))
     expected = Interrupted((), {"notes": notes})
 
-    actual = graph.invoke({"notes": ["input"]}, thread_id="thread")
+    actual = graph.invoke({"notes": ["input"]}, {"thread_id": "thread"})
 
     assert actual == expected, f"Expected {expected}, got {actual}."
 
@@ -479,10 +487,10 @@ def test_state_tasks_have_the_result_of_a_finished_task_and_the_path() -> None:
     builder.add_edge(Endpoint.start, "write")
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    graph.invoke({}, thread_id="thread")
+    graph.invoke({}, {"thread_id": "thread"})
     expected = {"write": (PullPath("write"), {"notes": ["write"]}), "ask": (PullPath("ask"), None)}
 
-    actual = graph.get_state("thread")
+    actual = graph.get_state({"thread_id": "thread"})
 
     summary = {task.name: (task.path, task.result) for task in actual.tasks}
     assert summary == expected, f"Expected {expected}, got {summary}."
@@ -504,10 +512,150 @@ def test_state_task_of_a_send_has_the_index_of_the_send_as_path(sends: int) -> N
     builder.add_node("ask", ask)
     builder.add_edge(Endpoint.start, "fan_out")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    graph.invoke({}, thread_id="thread")
+    graph.invoke({}, {"thread_id": "thread"})
     expected = [PushPath(index) for index in range(sends)]
 
-    actual = graph.get_state("thread")
+    actual = graph.get_state({"thread_id": "thread"})
 
     paths = [task.path for task in actual.tasks]
     assert paths == expected, f"Expected the paths {expected}, got {paths}."
+
+
+def read_thread(state: State, config: Annotated[ThreadConfig, Depends(read_config)]) -> State:
+    return {"notes": [config["thread_id"]]}
+
+
+async def read_thread_async(state: State, config: Annotated[ThreadConfig, Depends(read_config)]) -> State:
+    return {"notes": [config["thread_id"]]}
+
+
+def provide_thread(config: Annotated[ThreadConfig, Depends(read_config, scope=Scope.run)]) -> str:
+    return config["thread_id"]
+
+
+def read_provided_thread(state: State, thread: Annotated[str, Depends(provide_thread, scope=Scope.run)]) -> State:
+    return {"notes": [thread]}
+
+
+@pytest.mark.parametrize("node", [read_thread, read_thread_async, read_provided_thread])
+@pytest.mark.parametrize("depth", [0, 1, 2], ids=["node-of-the-graph", "node-of-a-child", "node-of-a-grandchild"])
+@pytest.mark.parametrize("thread_id", ["first-thread", "second-thread"])
+def test_node_reads_the_thread_id_of_the_run(node: Callable[..., object], depth: int, thread_id: str) -> None:
+    """
+    Arrange: a graph with a checkpointer and a node, at a given depth of child graphs, that requests the config.
+    Act: run a thread.
+    Assert: the node wrote the thread id of the run.
+    """
+    graph = StateGraph(State, output_schema=State)
+    graph.add_node("read", node)
+    graph.add_edge(Endpoint.start, "read")
+    for _ in range(depth):
+        parent = StateGraph(State, output_schema=State)
+        parent.add_node("child", graph)
+        parent.add_edge(Endpoint.start, "child")
+        graph = parent
+    expected = Finished(State(notes=[thread_id]))
+
+    actual = asyncio.run(graph.compile(checkpointer=InMemoryCheckpointer()).ainvoke({}, {"thread_id": thread_id}))
+
+    assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+@pytest.mark.parametrize("node", [read_thread, read_thread_async, read_provided_thread])
+def test_node_of_a_graph_without_a_checkpointer_cannot_read_the_config(node: Callable[..., object]) -> None:
+    """
+    Arrange: a graph without a checkpointer and a node that requests the config.
+    Act: run the graph.
+    Assert: the run raises RuntimeError that names the checkpointer.
+    """
+    builder = StateGraph(State, output_schema=State)
+    builder.add_node("read", node)
+    builder.add_edge(Endpoint.start, "read")
+
+    with pytest.raises(RuntimeError, match="checkpointer"):
+        asyncio.run(builder.compile().ainvoke({}))
+
+
+def run_with_invoke(graph: PersistentGraph[State, State, Output], config: ThreadConfig) -> object:
+    return graph.invoke({}, config)
+
+
+def run_with_stream(graph: PersistentGraph[State, State, Output], config: ThreadConfig) -> object:
+    return list(graph.stream({}, config, stream_mode=StreamMode.values))
+
+
+@pytest.mark.parametrize("run", [run_with_invoke, run_with_stream])
+def test_run_with_a_namespace_in_the_config_is_rejected(
+    run: Callable[[PersistentGraph[State, State, Output], ThreadConfig], object],
+) -> None:
+    """
+    Arrange: a graph with a checkpointer and a config that has a checkpoint namespace.
+    Act: run a thread with the config.
+    Assert: the run raises ValueError that names checkpoint_ns, and no node ran.
+    """
+    calls: list[str] = []
+    graph = build_chain(calls)
+
+    with pytest.raises(ValueError, match="checkpoint_ns"):
+        run(graph, {"thread_id": "thread", "checkpoint_ns": "child:1"})
+
+    assert calls == [], f"Expected no node to run, got {calls}."
+
+
+def test_state_history_of_a_child_graph_is_read_by_its_namespace() -> None:
+    """
+    Arrange: a thread that stopped in a child graph, and the namespace of the child graph.
+    Act: read the history of the thread with the namespace.
+    Assert: the history has the states of the child graph with the newest first.
+    """
+    graph = build_parent_of_asking_child(1)
+    graph.invoke({}, {"thread_id": "thread"})
+    child = read_deepest_state(graph.get_state({"thread_id": "thread"}, subgraphs=True))
+    expected = [("ask",), ("first",), ("__start__",)]
+
+    actual = list(graph.get_state_history({"thread_id": "thread", "checkpoint_ns": child.checkpoint_ns}))
+
+    nodes = [state.next for state in actual]
+    assert nodes == expected, f"Expected the next nodes {expected}, got {nodes}."
+    assert actual[0] == child, f"Expected the newest state {child}, got {actual[0]}."
+
+
+@pytest.mark.parametrize(
+    ("before_index", "limit", "found"),
+    [(None, None, True), (1, None, True), (None, 1, True), (2, None, False), (3, None, False), (None, 0, False)],
+)
+def test_state_history_with_a_checkpoint_id_has_only_that_state(
+    before_index: int | None, limit: int | None, *, found: bool
+) -> None:
+    """
+    Arrange: a thread of a run that finished, and the id of the third newest state.
+    Act: read the history with that id in the config, before the id of another state, with a limit.
+    Assert: the history has only that state, or no state when the state is not before the given id or the limit is 0.
+    """
+    graph = build_chain([])
+    graph.invoke({}, {"thread_id": "thread"})
+    history = list(graph.get_state_history({"thread_id": "thread"}))
+    before = None if before_index is None else history[before_index].checkpoint_id
+    expected = [history[2]] if found else []
+
+    actual = list(
+        graph.get_state_history(
+            {"thread_id": "thread", "checkpoint_id": history[2].checkpoint_id}, before=before, limit=limit
+        )
+    )
+
+    assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+def test_state_history_with_an_unknown_checkpoint_id_is_empty() -> None:
+    """
+    Arrange: a thread of a run that finished.
+    Act: read the history with a checkpoint id that the thread does not have.
+    Assert: the history is empty.
+    """
+    graph = build_chain([])
+    graph.invoke({}, {"thread_id": "thread"})
+
+    actual = list(graph.get_state_history({"thread_id": "thread", "checkpoint_id": uuid4()}))
+
+    assert actual == [], f"Expected no state, got {actual}."
