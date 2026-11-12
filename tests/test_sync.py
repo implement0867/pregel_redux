@@ -6,7 +6,7 @@ from typing import Annotated, TypedDict
 
 import pytest
 
-from pregel_redux import Depends, Endpoint, Reducer, Scope, StateGraph
+from pregel_redux import Depends, Endpoint, Reducer, Scope, StateGraph, StreamMode
 from tests.conftest import Journal, join_lists
 
 
@@ -230,4 +230,39 @@ def test_sync_provider_that_opens_while_another_node_fails_is_closed(
     assert journal.events == expected, (
         f"Expected the events {expected}, got {journal.events}. "
         "A provider that finishes its open step after the cancellation must close, and its node must not run."
+    )
+
+
+@pytest.mark.parametrize("nodes_after_the_break", [1, 2])
+def test_stream_stops_the_run_when_the_reader_stops(journal: Journal, nodes_after_the_break: int) -> None:
+    """
+    Arrange: a chain of sync nodes, and a reader of stream that received the update of the first node.
+    Act: close the stream while the second node runs.
+    Assert: no node after the second node ran.
+    """
+    release = threading.Event()
+
+    def wait_in_node(state: State) -> None:
+        release.wait(timeout=1)
+        journal.events.append("second")
+
+    builder = StateGraph(State)
+    builder.add_node("first", lambda state: journal.events.append("first"))
+    builder.add_node("second", wait_in_node)
+    builder.add_edge(Endpoint.start, "first")
+    builder.add_edge("first", "second")
+    for index in range(nodes_after_the_break):
+        builder.add_node(f"later-{index}", lambda state: journal.events.append("later"))
+        builder.add_edge("second" if index == 0 else f"later-{index - 1}", f"later-{index}")
+    parts = builder.compile().stream({}, stream_mode=StreamMode.updates)
+    next(parts)
+    timer = threading.Timer(0.05, release.set)
+    expected = ["first", "second"]
+
+    timer.start()
+    parts.close()
+
+    assert journal.events == expected, (
+        f"Expected the events {expected}, got {journal.events}. "
+        "A reader that stops must stop the run after the nodes that run at that time."
     )

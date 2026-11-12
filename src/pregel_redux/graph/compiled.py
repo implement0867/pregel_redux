@@ -1,7 +1,8 @@
 import asyncio
 import inspect
+import threading
 from collections import ChainMap
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Coroutine, Iterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Coroutine, Generator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import AsyncExitStack
 from contextvars import copy_context
@@ -205,18 +206,36 @@ def run_in_new_loop[ResultT](start_run: Callable[[], Coroutine[object, object, R
         return executor.submit(copy_context().run, asyncio.run, start_run()).result()
 
 
-def iterate_in_new_loop[ItemT](start: Callable[[], AsyncIterator[ItemT]]) -> Iterator[ItemT]:
+def iterate_in_new_loop[ItemT](start: Callable[[], AsyncIterator[ItemT]]) -> Generator[ItemT]:
     items = SimpleQueue[Stored[ItemT] | None]()
+    lock = threading.Lock()
+    cancels: list[Callable[[], object]] = []
 
     async def pump() -> None:
         async for item in start():
             items.put(Stored(item))
 
+    async def supervise() -> None:
+        task = asyncio.ensure_future(pump())
+        loop = asyncio.get_running_loop()
+        cancels.append(lambda: loop.call_soon_threadsafe(task.cancel))
+        try:
+            await task
+        finally:
+            with lock:
+                cancels.clear()
+
     with ThreadPoolExecutor(max_workers=1) as executor:
-        work = executor.submit(copy_context().run, asyncio.run, pump())
+        work = executor.submit(copy_context().run, asyncio.run, supervise())
         work.add_done_callback(lambda _: items.put(None))
-        while (item := items.get()) is not None:
-            yield item.value
+        try:
+            while (item := items.get()) is not None:
+                yield item.value
+        except GeneratorExit:
+            with lock:
+                for cancel in cancels:
+                    cancel()
+            raise
         work.result()
 
 
@@ -350,7 +369,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.values],
         subgraphs: bool = False,
         step_limit: int | None = None,
-    ) -> Iterator[ValuesPart]: ...
+    ) -> Generator[ValuesPart]: ...
     @overload
     def stream(
         self,
@@ -359,7 +378,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.updates],
         subgraphs: bool = False,
         step_limit: int | None = None,
-    ) -> Iterator[UpdatesPart | InterruptsPart]: ...
+    ) -> Generator[UpdatesPart | InterruptsPart]: ...
     @overload
     def stream(
         self,
@@ -368,7 +387,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.custom],
         subgraphs: bool = False,
         step_limit: int | None = None,
-    ) -> Iterator[CustomPart]: ...
+    ) -> Generator[CustomPart]: ...
     @overload
     def stream(
         self,
@@ -377,7 +396,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.tasks],
         subgraphs: bool = False,
         step_limit: int | None = None,
-    ) -> Iterator[TaskStartPart | TaskResultPart]: ...
+    ) -> Generator[TaskStartPart | TaskResultPart]: ...
     @overload
     def stream(
         self,
@@ -386,7 +405,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         stream_mode: Collection[StreamMode],
         subgraphs: bool = False,
         step_limit: int | None = None,
-    ) -> Iterator[StreamPart]: ...
+    ) -> Generator[StreamPart]: ...
     def stream(
         self,
         input: InputT,
@@ -394,7 +413,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         stream_mode: StreamMode | Collection[StreamMode],
         subgraphs: bool = False,
         step_limit: int | None = None,
-    ) -> Iterator[StreamPart]:
+    ) -> Generator[StreamPart]:
         self.reject_async_nodes("astream")
         modes = frozenset([stream_mode] if isinstance(stream_mode, StreamMode) else stream_mode)
         return iterate_in_new_loop(

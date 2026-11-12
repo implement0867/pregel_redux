@@ -1,6 +1,6 @@
 import secrets
 import time
-from collections.abc import AsyncGenerator, AsyncIterator, Collection, Iterator, Mapping, Sequence
+from collections.abc import AsyncGenerator, AsyncIterator, Collection, Generator, Iterator, Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Literal, Never, assert_never, overload
@@ -652,7 +652,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         subgraphs: bool = False,
         checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
-    ) -> Iterator[ValuesPart]: ...
+    ) -> Generator[ValuesPart]: ...
     @overload
     def stream(
         self,
@@ -663,7 +663,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         subgraphs: bool = False,
         checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
-    ) -> Iterator[UpdatesPart | InterruptsPart]: ...
+    ) -> Generator[UpdatesPart | InterruptsPart]: ...
     @overload
     def stream(
         self,
@@ -674,7 +674,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         subgraphs: bool = False,
         checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
-    ) -> Iterator[CustomPart]: ...
+    ) -> Generator[CustomPart]: ...
     @overload
     def stream(
         self,
@@ -685,7 +685,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         subgraphs: bool = False,
         checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
-    ) -> Iterator[TaskStartPart | TaskResultPart]: ...
+    ) -> Generator[TaskStartPart | TaskResultPart]: ...
     @overload
     def stream(
         self,
@@ -696,7 +696,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         subgraphs: bool = False,
         checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
-    ) -> Iterator[CheckpointPart]: ...
+    ) -> Generator[CheckpointPart]: ...
     @overload
     def stream(
         self,
@@ -707,7 +707,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         subgraphs: bool = False,
         checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
-    ) -> Iterator[StreamPart]: ...
+    ) -> Generator[StreamPart]: ...
     def stream(
         self,
         input: InputT | Command[str] | None,
@@ -717,7 +717,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         subgraphs: bool = False,
         checkpoint_id: UUID | None = None,
         step_limit: int | None = None,
-    ) -> Iterator[StreamPart]:
+    ) -> Generator[StreamPart]:
         self.graph.reject_async_nodes("astream")
         modes = frozenset([stream_mode] if isinstance(stream_mode, StreamMode) else stream_mode)
         checkpointer = ThreadedCheckpointer(self.checkpointer)
