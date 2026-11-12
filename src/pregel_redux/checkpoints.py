@@ -1,4 +1,5 @@
-from collections.abc import AsyncIterator
+import asyncio
+from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
 from typing import Annotated, Literal, Protocol
@@ -123,7 +124,7 @@ class CheckpointTuple(Record):
     pending_writes: tuple[PendingWrite, ...]
 
 
-class Checkpointer(Protocol):
+class AsyncCheckpointer(Protocol):
     async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None: ...
     async def aput_writes(
         self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite
@@ -137,17 +138,55 @@ class Checkpointer(Protocol):
     async def adelete_thread(self, thread_id: str) -> None: ...
 
 
+class Checkpointer(AsyncCheckpointer, Protocol):
+    def put(self, thread_id: str, checkpoint: Checkpoint) -> None: ...
+    def put_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None: ...
+    def get_tuple(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None) -> CheckpointTuple | None: ...
+    def list(
+        self, thread_id: str, checkpoint_ns: str, *, before: UUID | None, limit: int | None
+    ) -> Iterator[CheckpointTuple]: ...
+    def delete_thread(self, thread_id: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class ThreadedCheckpointer:
+    checkpointer: Checkpointer
+
+    async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
+        await asyncio.to_thread(self.checkpointer.put, thread_id, checkpoint)
+
+    async def aput_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
+        await asyncio.to_thread(self.checkpointer.put_writes, thread_id, checkpoint_ns, checkpoint_id, write)
+
+    async def aget_tuple(
+        self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None
+    ) -> CheckpointTuple | None:
+        return await asyncio.to_thread(self.checkpointer.get_tuple, thread_id, checkpoint_ns, checkpoint_id)
+
+    async def alist(
+        self, thread_id: str, checkpoint_ns: str, *, before: UUID | None, limit: int | None
+    ) -> AsyncIterator[CheckpointTuple]:
+        found = await asyncio.to_thread(
+            lambda: tuple(self.checkpointer.list(thread_id, checkpoint_ns, before=before, limit=limit))
+        )
+        for saved in found:
+            yield saved
+
+    async def adelete_thread(self, thread_id: str) -> None:
+        await asyncio.to_thread(self.checkpointer.delete_thread, thread_id)
+
+
 @dataclass
 class InMemoryCheckpointer:
     threads: dict[str, dict[str, dict[UUID, str]]] = field(default_factory=dict)
 
-    async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
+    def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
         saved = CheckpointTuple(checkpoint=checkpoint, pending_writes=())
         self.threads.setdefault(thread_id, {}).setdefault(checkpoint.checkpoint_ns, {})[checkpoint.id] = (
             saved.model_dump_json()
         )
 
-    async def aput_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
+    def put_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
         records = self.threads[thread_id][checkpoint_ns]
         saved = CheckpointTuple.model_validate_json(records[checkpoint_id])
         kept = tuple(item for item in saved.pending_writes if (item.kind, item.task_id) != (write.kind, write.task_id))
@@ -155,22 +194,40 @@ class InMemoryCheckpointer:
             checkpoint=saved.checkpoint, pending_writes=(*kept, write)
         ).model_dump_json()
 
-    async def aget_tuple(
-        self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None
-    ) -> CheckpointTuple | None:
+    def get_tuple(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None) -> CheckpointTuple | None:
         records = self.threads.get(thread_id, {}).get(checkpoint_ns, {})
         found = max(records, default=None) if checkpoint_id is None else checkpoint_id
         if found is None or found not in records:
             return None
         return CheckpointTuple.model_validate_json(records[found])
 
-    async def alist(
+    def list(
         self, thread_id: str, checkpoint_ns: str, *, before: UUID | None, limit: int | None
-    ) -> AsyncIterator[CheckpointTuple]:
+    ) -> Iterator[CheckpointTuple]:
         records = self.threads.get(thread_id, {}).get(checkpoint_ns, {})
         found = sorted((key for key in records if before is None or key < before), reverse=True)
         for key in found[:limit]:
             yield CheckpointTuple.model_validate_json(records[key])
 
-    async def adelete_thread(self, thread_id: str) -> None:
+    def delete_thread(self, thread_id: str) -> None:
         self.threads.pop(thread_id, None)
+
+    async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
+        self.put(thread_id, checkpoint)
+
+    async def aput_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
+        self.put_writes(thread_id, checkpoint_ns, checkpoint_id, write)
+
+    async def aget_tuple(
+        self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None
+    ) -> CheckpointTuple | None:
+        return self.get_tuple(thread_id, checkpoint_ns, checkpoint_id)
+
+    async def alist(
+        self, thread_id: str, checkpoint_ns: str, *, before: UUID | None, limit: int | None
+    ) -> AsyncIterator[CheckpointTuple]:
+        for saved in self.list(thread_id, checkpoint_ns, before=before, limit=limit):
+            yield saved
+
+    async def adelete_thread(self, thread_id: str) -> None:
+        self.delete_thread(thread_id)

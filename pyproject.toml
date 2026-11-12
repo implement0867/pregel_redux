@@ -12,8 +12,7 @@ dependencies = [
 
 [project.optional-dependencies]
 sqlite = [
-    "aiosqlite>=0.22.1",
-    "sqlalchemy[asyncio]>=2.1.8",
+    "sqlalchemy>=2.1.8",
 ]
 
 [build-system]
@@ -22,12 +21,11 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
-    "aiosqlite>=0.22.1",
     "basedpyright>=1.40.2",
     "pytest>=9.2.0",
     "pytest-cov>=7.1.0",
     "ruff>=0.17.4",
-    "sqlalchemy[asyncio]>=2.1.8",
+    "sqlalchemy>=2.1.8",
 ]
 
 [tool.pytest.ini_options]

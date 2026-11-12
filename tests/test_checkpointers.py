@@ -1,12 +1,11 @@
 import asyncio
-from collections.abc import Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from pathlib import Path
 from typing import Annotated, TypedDict
 from uuid import UUID
 
 import pytest
-from sqlalchemy import NullPool
-from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy import create_engine
 
 from pregel_redux import (
     Checkpointer,
@@ -17,9 +16,10 @@ from pregel_redux import (
     PersistentGraph,
     Reducer,
     StateGraph,
+    StreamMode,
     interrupt,
 )
-from pregel_redux.checkpoints import RunResumeRecord
+from pregel_redux.checkpoints import Checkpoint, CheckpointTuple, PendingWrite, RunResumeRecord
 from pregel_redux.sqlite import SqliteCheckpointer
 from tests.conftest import collect, join_lists
 
@@ -32,16 +32,16 @@ class Output(TypedDict):
     notes: list[str]
 
 
-def build_sqlite_checkpointer(path: Path) -> SqliteCheckpointer:
-    engine = create_async_engine(f"sqlite+aiosqlite:///{path / 'checkpoints.sqlite'}", poolclass=NullPool)
-    checkpointer = SqliteCheckpointer(engine)
-    asyncio.run(checkpointer.setup())
-    return checkpointer
-
-
 @pytest.fixture(params=["memory", "sqlite"])
-def checkpointer(request: pytest.FixtureRequest, tmp_path: Path) -> Checkpointer:
-    return InMemoryCheckpointer() if request.param == "memory" else build_sqlite_checkpointer(tmp_path)
+def checkpointer(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Checkpointer]:
+    if request.param == "memory":
+        yield InMemoryCheckpointer()
+        return
+    engine = create_engine(f"sqlite:///{tmp_path / 'checkpoints.sqlite'}")
+    sqlite_checkpointer = SqliteCheckpointer(engine)
+    sqlite_checkpointer.setup()
+    yield sqlite_checkpointer
+    engine.dispose()
 
 
 def ask(state: State) -> State:
@@ -156,3 +156,78 @@ def test_deleted_thread_has_no_checkpoints(checkpointer: Checkpointer) -> None:
     kept = asyncio.run(collect(checkpointer.alist("kept", "", before=None, limit=None)))
     assert deleted == [], f"Expected no checkpoints, got {deleted}."
     assert len(kept) == 3, f"Expected 3 checkpoints, got {len(kept)}."
+
+
+class SyncOnlyCheckpointer(InMemoryCheckpointer):
+    async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
+        raise NotImplementedError
+
+    async def aput_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
+        raise NotImplementedError
+
+    async def aget_tuple(
+        self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None
+    ) -> CheckpointTuple | None:
+        raise NotImplementedError
+
+    def alist(
+        self, thread_id: str, checkpoint_ns: str, *, before: UUID | None, limit: int | None
+    ) -> AsyncIterator[CheckpointTuple]:
+        raise NotImplementedError
+
+    async def adelete_thread(self, thread_id: str) -> None:
+        raise NotImplementedError
+
+
+def test_sync_functions_of_the_graph_use_the_sync_functions_of_the_checkpointer() -> None:
+    """
+    Arrange: a graph with a checkpointer whose async functions raise NotImplementedError.
+    Act: run a thread to an interrupt, update its state, resume it and read its history, with the sync functions.
+    Assert: the run finishes with the notes of the nodes, the update and the answer, and the history has each step.
+    """
+    graph = build_graph(SyncOnlyCheckpointer())
+    stopped = list(graph.stream({}, thread_id="thread", stream_mode=StreamMode.updates))
+    graph.update_state("thread", {"notes": ["update"]}, as_node="first")
+
+    actual = graph.invoke(Command(resume="answer"), thread_id="thread")
+
+    steps = [snapshot.step for snapshot in graph.get_state_history("thread")]
+    expected = Finished(Output(notes=["first", "update", "answer", "last"]))
+    assert len(stopped) == 2, f"Expected a part for the first node and a part for the interrupt, got {stopped}."
+    assert actual == expected, f"Expected {expected}, got {actual}."
+    assert steps == [4, 3, 2, 1, 0, -1], f"Expected the steps from 4 to -1, got {steps}."
+    assert graph.get_state("thread").step == 4, "Expected the state of the last step."
+
+
+def test_sync_functions_of_the_checkpointer_give_the_stored_checkpoints(checkpointer: Checkpointer) -> None:
+    """
+    Arrange: a thread with a checkpoint for the input, the start and one node.
+    Act: read the newest checkpoint and the list with the sync functions, then delete the thread.
+    Assert: the newest checkpoint is the first of the list, and the deleted thread has no checkpoint.
+    """
+    graph = build_graph(checkpointer)
+    graph.invoke({}, thread_id="thread")
+
+    newest = checkpointer.get_tuple("thread", "", None)
+    listed = list(checkpointer.list("thread", "", before=None, limit=None))
+    checkpointer.delete_thread("thread")
+
+    steps = [saved.checkpoint.step for saved in listed]
+    assert steps == [1, 0, -1], f"Expected the steps [1, 0, -1], got {steps}."
+    assert newest == listed[0], f"Expected the newest checkpoint {listed[0]}, got {newest}."
+    assert checkpointer.get_tuple("thread", "", None) is None, "Expected no checkpoint after the deletion."
+
+
+def test_async_functions_of_the_graph_work_with_each_checkpointer(checkpointer: Checkpointer) -> None:
+    """
+    Arrange: a thread that stopped at an interrupt, made with the async function.
+    Act: resume the thread with the async function.
+    Assert: the output has the notes of all nodes and the answer.
+    """
+    graph = build_graph(checkpointer)
+    asyncio.run(graph.ainvoke({}, thread_id="thread"))
+
+    actual = asyncio.run(graph.ainvoke(Command(resume="answer"), thread_id="thread"))
+
+    expected = Finished(Output(notes=["first", "answer", "last"]))
+    assert actual == expected, f"Expected {expected}, got {actual}."
