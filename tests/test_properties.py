@@ -4,7 +4,7 @@ import threading
 from collections import Counter
 from collections.abc import AsyncGenerator, Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, aclosing, closing, contextmanager, suppress
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -176,10 +176,36 @@ def pick_some(items: Sequence[int]) -> st.SearchStrategy[tuple[int, ...]]:
 
 
 @st.composite
-def join_specs(draw: st.DrawFn, node_count: int) -> JoinSpec:
+def join_specs(draw: st.DrawFn, node_count: int, reached: Sequence[int]) -> JoinSpec:
     target = draw(st.one_of(st.none(), st.integers(min_value=2, max_value=node_count - 1)))
-    sources = draw(st.lists(st.sampled_from(range(node_count if target is None else target)), min_size=2, unique=True))
-    return JoinSpec(tuple(sorted(sources)), target)
+    limit = node_count if target is None else target
+    live = [index for index in reached if index < limit]
+    any_sources = st.lists(st.sampled_from(range(limit)), min_size=2, unique=True)
+    live_sources = st.lists(st.sampled_from(live), min_size=2, unique=True) if len(live) > 1 else any_sources
+    return JoinSpec(tuple(sorted(draw(st.one_of(live_sources, any_sources)))), target)
+
+
+def drop_ways(node: NodeSpec, alone: set[int]) -> NodeSpec:
+    def keep(indexes: tuple[int, ...]) -> tuple[int, ...]:
+        return tuple(index for index in indexes if index not in alone)
+
+    work = node.work
+    if isinstance(work, FunctionSpec) and isinstance(work.action, RouterSpec):
+        action = RouterSpec(
+            keep(work.action.forward), keep(work.action.sends), keep(work.action.back), work.action.rounds
+        )
+        work = replace(work, action=action)
+    return replace(node, work=work, targets=keep(node.targets))
+
+
+def find_reached_nodes(nodes: Sequence[NodeSpec], entries: Sequence[int]) -> list[int]:
+    reached = set(entries)
+    for index, node in enumerate(nodes):
+        if index in reached:
+            reached.update(node.targets)
+            if isinstance(node.work, FunctionSpec) and isinstance(node.work.action, RouterSpec):
+                reached.update((*node.work.action.forward, *node.work.action.sends))
+    return sorted(reached)
 
 
 @st.composite
@@ -208,8 +234,12 @@ def graph_specs(draw: st.DrawFn, known_names: tuple[str, ...], depth: int) -> Gr
         work = draw(function if depth == 2 else st.one_of(function, child))
         nodes.append(NodeSpec(node_name, work, draw(st.booleans()), draw(pick_some(later)), draw(st.booleans())))
     entries = draw(st.lists(st.sampled_from(range(len(names))), min_size=1, unique=True))
-    joins = draw(st.lists(join_specs(len(names)))) if len(names) > 2 else []
-    return GraphSpec(tuple(nodes), tuple(entries), tuple(joins))
+    reached = find_reached_nodes(nodes, entries)
+    joins = draw(st.lists(join_specs(len(names), reached))) if len(names) > 2 else []
+    targets = sorted({join.target for join in joins if join.target is not None})
+    alone = set(draw(pick_some(targets)))
+    kept_entries = [entry for entry in entries if entry not in alone] or entries
+    return GraphSpec(tuple(drop_ways(node, alone) for node in nodes), tuple(kept_entries), tuple(joins))
 
 
 def build_function(
