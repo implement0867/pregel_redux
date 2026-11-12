@@ -52,7 +52,6 @@ from pregel_redux.pregel import (
     open_channels,
     plan_tasks,
 )
-from pregel_redux.retries import RetryPolicy
 from pregel_redux.settings import RunSettings
 from pregel_redux.streams import (
     CustomPart,
@@ -85,7 +84,6 @@ class CompiledNode:
     joins: frozenset[JoinKey]
     triggers: tuple[TriggerKey, ...]
     defer: bool
-    retry_policy: RetryPolicy | None
 
     @cached_property
     def input_adapter(self) -> TypeAdapter[object]:
@@ -501,7 +499,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
                 action = self.nodes[name].action
                 match action:
                     case CallPlan():
-                        return await self.call_with_retries(action, name, call, run, step_exits)
+                        return await self.call_function(action, name, call, run, step_exits)
                     case CompiledGraph():
                         entry = await journal.enter_child(action, call)
                         result = await action.run_steps(entry.position, run, entry.journal, resumed=entry.resumed)
@@ -526,24 +524,6 @@ class CompiledGraph[StateT, InputT, OutputT]:
             arrivals=tuple(Arrival(key, name) for key in node.joins),
             sends=outcome.routes.sends,
         )
-
-    async def call_with_retries(
-        self, plan: CallPlan, name: str, call: NodeCall, run: Run, step_exits: AsyncExitStack
-    ) -> TaskWrites:
-        policy = self.nodes[name].retry_policy
-        scratchpad = current_scratchpad.get()
-        attempt = 1
-        while True:
-            scratchpad.interrupt_counter = 0
-            try:
-                return await self.call_function(plan, name, call, run, step_exits)
-            except GraphInterrupt:
-                raise
-            except Exception as failure:
-                if policy is None or not policy.allows(failure, attempt):
-                    raise
-                await asyncio.sleep(policy.read_delay(attempt))
-                attempt += 1
 
     async def call_function(
         self, plan: CallPlan, name: str, call: NodeCall, run: Run, step_exits: AsyncExitStack

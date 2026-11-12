@@ -9,7 +9,6 @@ from pregel_redux.dependencies import CallPlan, plan_call
 from pregel_redux.graph.compiled import CompiledGraph, CompiledNode
 from pregel_redux.graph.persistent import PersistentGraph
 from pregel_redux.pregel import BranchKey, JoinKey
-from pregel_redux.retries import RetryPolicy
 
 type Node[InputT] = Callable[Concatenate[InputT, ...], object]
 
@@ -58,21 +57,12 @@ class StateGraph[StateT, InputT, OutputT]:
         self.edges: set[Edge] = set()
         self.joins: set[Join] = set()
         self.deferred: set[str] = set()
-        self.retry_policies: dict[str, RetryPolicy] = {}
 
     @overload
-    def add_node(
-        self, name: str, node: Node[StateT], *, defer: bool = False, retry_policy: RetryPolicy | None = None
-    ) -> None: ...
+    def add_node(self, name: str, node: Node[StateT], *, defer: bool = False) -> None: ...
     @overload
     def add_node[NodeInputT](
-        self,
-        name: str,
-        node: Node[NodeInputT],
-        *,
-        input_schema: type[NodeInputT],
-        defer: bool = False,
-        retry_policy: RetryPolicy | None = None,
+        self, name: str, node: Node[NodeInputT], *, input_schema: type[NodeInputT], defer: bool = False
     ) -> None: ...
     @overload
     def add_node[ChildStateT, ChildInputT, ChildOutputT](
@@ -85,7 +75,6 @@ class StateGraph[StateT, InputT, OutputT]:
         *,
         input_schema: type[object] | None = None,
         defer: bool = False,
-        retry_policy: RetryPolicy | None = None,
     ) -> None:
         if name in self.nodes or name in self.child_graphs:
             raise ValueError(f"node {name!r} is already in this graph")
@@ -96,8 +85,6 @@ class StateGraph[StateT, InputT, OutputT]:
                 self.child_graphs[name] = node
             case _:
                 self.nodes[name] = node
-                if retry_policy is not None:
-                    self.retry_policies[name] = retry_policy
                 if input_schema is not None:
                     self.node_input_schemas[name] = input_schema
 
@@ -203,7 +190,6 @@ class StateGraph[StateT, InputT, OutputT]:
                     ),
                     joins=frozenset(key for key in join_keys if name in key.sources),
                     defer=name in self.deferred,
-                    retry_policy=self.retry_policies.get(name),
                     triggers=(BranchKey(name), *(key for key in join_keys if key.target == name)),
                 )
                 for name, action in actions.items()
