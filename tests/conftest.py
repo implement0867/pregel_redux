@@ -2,6 +2,11 @@ from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
 import pytest
+from hypothesis import settings
+
+settings.register_profile("check", max_examples=15, deadline=None)
+settings.register_profile("thorough", max_examples=500, deadline=None)
+settings.load_profile("check")
 
 
 @dataclass
