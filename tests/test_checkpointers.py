@@ -19,7 +19,7 @@ from pregel_redux import (
     StreamMode,
     interrupt,
 )
-from pregel_redux.checkpoints import Checkpoint, CheckpointTuple, PendingWrite, RunResumeRecord
+from pregel_redux.checkpoints import Checkpoint, CheckpointTuple, PendingWrite, RunCommandRecord, SavedWrites
 from pregel_redux.sqlite import SqliteCheckpointer
 from tests.conftest import collect, join_lists
 
@@ -119,24 +119,28 @@ def test_list_gives_the_checkpoints_before_an_id_with_the_newest_first(
 
 def test_checkpoint_is_found_by_its_id_with_its_pending_writes(checkpointer: Checkpointer) -> None:
     """
-    Arrange: a thread that stopped at an interrupt and got a resume value two times.
+    Arrange: a thread that stopped at an interrupt and got a record of its commands two times.
     Act: read the checkpoint of the interrupt by its id, and read an id that the thread does not have.
-    Assert: the checkpoint has one record for the interrupt and one for the last resume value.
+    Assert: the checkpoint has one record for the interrupt and one for the last record of commands.
     """
     graph = build_graph(checkpointer)
     graph.invoke({}, {"thread_id": "thread"})
     stopped = asyncio.run(collect(checkpointer.alist("thread", "", before=None, limit=1)))[0].checkpoint
-    asyncio.run(checkpointer.aput_writes("thread", "", stopped.id, RunResumeRecord(value="one")))
-    asyncio.run(checkpointer.aput_writes("thread", "", stopped.id, RunResumeRecord(value="two")))
+    one, two = (
+        RunCommandRecord(commands=(SavedWrites(fields={}, branches=(node,), arrivals=(), sends=()),))
+        for node in ("one", "two")
+    )
+    asyncio.run(checkpointer.aput_writes("thread", "", stopped.id, one))
+    asyncio.run(checkpointer.aput_writes("thread", "", stopped.id, two))
 
     actual = asyncio.run(checkpointer.aget_tuple("thread", "", stopped.id))
     missing = asyncio.run(checkpointer.aget_tuple("thread", "", UUID(int=1)))
 
     writes = () if actual is None else actual.pending_writes
     kinds = sorted(write.kind.value for write in writes)
-    resumes = [write.value for write in writes if isinstance(write, RunResumeRecord)]
-    assert kinds == ["interrupt", "resume"], f"Expected one interrupt record and one resume record, got {kinds}."
-    assert resumes == ["two"], f"Expected the last resume value, got {resumes}."
+    commands = [write for write in writes if isinstance(write, RunCommandRecord)]
+    assert kinds == ["command", "interrupt"], f"Expected one interrupt record and one command record, got {kinds}."
+    assert commands == [two], f"Expected the last record of commands, got {commands}."
     assert missing is None, f"Expected no checkpoint for an unknown id, got {missing}."
 
 

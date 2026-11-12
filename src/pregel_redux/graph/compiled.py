@@ -1,5 +1,6 @@
 import asyncio
 import inspect
+import sys
 import threading
 from collections import ChainMap
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Coroutine, Generator, Mapping, Sequence
@@ -560,12 +561,20 @@ class CompiledGraph[StateT, InputT, OutputT]:
         task_id = journal.make_task_id(call.task)
         if isinstance(name, str):
             run.stream.send(StreamMode.tasks, TaskStartPart(journal.ns, task_id, name, call.node_input))
+        saved_answers = len(scratchpad.resume)
+        ended = False
         try:
             writes = await self.run_node(call, run, journal, step_exits)
+            ended = True
         except GraphInterrupt as stop:
+            ended = True
             await finish_despite_cancellation(journal.record_interrupt(call.task, stop.interrupts, scratchpad.resume))
             run.stream.send(StreamMode.tasks, TaskResultPart(journal.ns, task_id, str(name), {}, stop.interrupts))
             return TaskInterrupted(stop.interrupts)
+        finally:
+            cancelled = isinstance(sys.exception(), asyncio.CancelledError)
+            if not ended and (len(scratchpad.resume) > saved_answers or not cancelled):
+                await finish_despite_cancellation(journal.record_interrupt(call.task, (), scratchpad.resume))
         await finish_despite_cancellation(journal.record(call.task, writes))
         if isinstance(name, str):
             run.stream.send(StreamMode.updates, UpdatesPart(journal.ns, name, writes.fields))

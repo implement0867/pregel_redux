@@ -42,7 +42,7 @@ class SavedWrites(Record):
 class PendingKind(StrEnum):
     writes = "writes"
     interrupt = "interrupt"
-    resume = "resume"
+    command = "command"
 
 
 class TaskWritesRecord(Record):
@@ -58,13 +58,13 @@ class TaskInterruptRecord(Record):
     resume: tuple[JsonValue, ...]
 
 
-class RunResumeRecord(Record):
-    kind: Literal[PendingKind.resume] = PendingKind.resume
+class RunCommandRecord(Record):
+    kind: Literal[PendingKind.command] = PendingKind.command
     task_id: None = None
-    value: JsonValue
+    commands: tuple[SavedWrites, ...]
 
 
-type PendingWrite = Annotated[TaskWritesRecord | TaskInterruptRecord | RunResumeRecord, Field(discriminator="kind")]
+type PendingWrite = Annotated[TaskWritesRecord | TaskInterruptRecord | RunCommandRecord, Field(discriminator="kind")]
 
 
 class SavedBranch(Record):

@@ -1,14 +1,21 @@
 import secrets
 import time
 from collections.abc import AsyncGenerator, AsyncIterator, Collection, Generator, Iterator, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import UTC, datetime
 from typing import Literal, Never, assert_never, overload
 from uuid import UUID, uuid5
 
 from pydantic import JsonValue
 
-from pregel_redux.channels import Stored, dump_json, extract_writes, load_json, reject_unknown_channels
+from pregel_redux.channels import (
+    Stored,
+    dump_json,
+    extract_writes,
+    load_json,
+    parse_updates,
+    reject_unknown_channels,
+)
 from pregel_redux.checkpoints import (
     AsyncCheckpointer,
     ChannelValues,
@@ -20,7 +27,7 @@ from pregel_redux.checkpoints import (
     JoinVersion,
     PendingSend,
     PendingWrite,
-    RunResumeRecord,
+    RunCommandRecord,
     SavedArrival,
     SavedBranch,
     SavedJoin,
@@ -30,7 +37,7 @@ from pregel_redux.checkpoints import (
     ThreadedCheckpointer,
     TriggerVersions,
 )
-from pregel_redux.commands import Command, Endpoint, Send
+from pregel_redux.commands import Command, Endpoint, Send, resolve_goto
 from pregel_redux.configs import ThreadConfig, read_config
 from pregel_redux.dependencies import Depends, Scope
 from pregel_redux.graph.compiled import (
@@ -67,6 +74,7 @@ from pregel_redux.pregel import (
     Topic,
     TriggerKey,
     apply_writes,
+    finish_channels,
     plan_tasks,
 )
 from pregel_redux.snapshots import PullPath, PushPath, StateSnapshot, TaskSnapshot
@@ -277,12 +285,32 @@ def load_position(graph: AnyGraph, checkpoint: Checkpoint) -> Position:
     return Position(channels, versions, seen)
 
 
+def read_command_writes(graph: AnyGraph, command: Command[str]) -> TaskWrites:
+    routes = resolve_goto(command.goto, graph.nodes.keys())
+    return TaskWrites(parse_updates(graph.channels, extract_writes(command.update)), routes.targets, (), routes.sends)
+
+
+def apply_command(graph: AnyGraph, position: Position, writes: TaskWrites) -> Position:
+    sends = (*position.channels.tasks.values, *writes.sends) if writes.sends else ()
+    applied = apply_writes(position, [], [replace(writes, sends=sends)], [], graph.trigger_keys)
+    return applied if plan_tasks(applied, graph.triggers) else finish_channels(applied)
+
+
 @dataclass(frozen=True)
 class ThreadScope:
     graph: AnyGraph
     checkpointer: AsyncCheckpointer
     thread_id: str
     checkpoint_ns: str
+
+    def read_position(self, saved: CheckpointTuple) -> Position:
+        position = load_position(self.graph, saved.checkpoint)
+        commands = [
+            writes for write in saved.pending_writes if isinstance(write, RunCommandRecord) for writes in write.commands
+        ]
+        for writes in commands:
+            position = apply_command(self.graph, position, load_writes(self.graph, writes))
+        return position
 
     async def put(
         self, position: Position, step: int, source: CheckpointSource, parent_id: UUID | None, newest_id: UUID | None
@@ -314,7 +342,7 @@ class ThreadScope:
         loaded = await self.find(checkpoint_id)
         if loaded is None:
             return None
-        position = load_position(self.graph, loaded.saved.checkpoint)
+        position = self.read_position(loaded.saved)
         if checkpoint_id is None:
             return position, self.open_journal(loaded.saved)
         step = loaded.saved.checkpoint.step
@@ -350,7 +378,7 @@ class ThreadScope:
         )
 
     async def read_snapshot(self, saved: CheckpointTuple, *, subgraphs: bool) -> "StateSnapshot":
-        position = load_position(self.graph, saved.checkpoint)
+        position = self.read_position(saved)
         journal = self.open_journal(saved)
         refs = [refer_task(task) for task in plan_tasks(position, self.graph.triggers)]
         interrupts = {
@@ -440,8 +468,11 @@ class ThreadJournal:
         ]
         return Scratchpad(self.make_task_ns(task), saved, resume, 0)
 
-    async def read_resume(self, command: Command[str] | None) -> ResumeInput:
-        if command is not None and command.resume is not None:
+    def read_resume(self, command: Command[str] | None) -> ResumeInput:
+        if command is None:
+            return ResumeInput([], {})
+        given = command.resume_by_interrupt_id or {}
+        if command.resume is not None:
             finished = {write.task_id for write in self.pending if isinstance(write, TaskWritesRecord)}
             waiting = [
                 interrupt.id
@@ -451,10 +482,14 @@ class ThreadJournal:
             ]
             if len(waiting) > 1:
                 raise ValueError(f"the interrupts {waiting!r} wait for an answer, so give resume_by_interrupt_id")
-            await self.put_write(RunResumeRecord(value=command.resume))
-            return ResumeInput([command.resume], command.resume_by_interrupt_id or {})
-        saved = [write.value for write in self.pending if isinstance(write, RunResumeRecord)]
-        return ResumeInput(saved, {} if command is None else command.resume_by_interrupt_id or {})
+            return ResumeInput([command.resume], given)
+        return ResumeInput([], given)
+
+    async def record_command(self, writes: TaskWrites) -> None:
+        commands = [saved for write in self.pending if isinstance(write, RunCommandRecord) for saved in write.commands]
+        record = RunCommandRecord(commands=(*commands, dump_writes(self.scope.graph, writes)))
+        await self.put_write(record)
+        self.pending = (*(write for write in self.pending if not isinstance(write, RunCommandRecord)), record)
 
     async def enter_child(self, child: AnyGraph, call: NodeCall) -> ChildEntry:
         scope = ThreadScope(child, self.scope.checkpointer, self.scope.thread_id, self.make_task_ns(call.task))
@@ -521,7 +556,12 @@ class PersistentGraph[StateT, InputT, OutputT]:
                 if loaded is None:
                     raise LookupError(f"thread {thread_id!r} has no checkpoint, so the run needs an input")
                 position, journal = loaded
-                return RunStart(position, journal, await journal.read_resume(input), resumed=True)
+                resume = journal.read_resume(input)
+                writes = None if input is None else read_command_writes(self.graph, input)
+                if writes is not None and (writes.fields or writes.branches or writes.sends):
+                    await journal.record_command(writes)
+                    position = apply_command(self.graph, position, writes)
+                return RunStart(position, journal, resume, resumed=True)
             case _ if loaded is None:
                 position = self.graph.feed(self.graph.open({}), extract_writes(input))
                 journal = await scope.begin(position, -1, None)
@@ -781,12 +821,12 @@ class PersistentGraph[StateT, InputT, OutputT]:
         scope = ThreadScope(graph, checkpointer, config["thread_id"], checkpoint_ns)
         loaded = await scope.find(config.get("checkpoint_id"))
         if loaded is None:
-            node = as_node or infer_writer(graph, {})
+            node = infer_writer(graph, {}) if as_node is None else as_node
             position, step, parent_id, newest_id = graph.open({}), -1, None, None
         else:
             checkpoint = loaded.saved.checkpoint
-            node = as_node or infer_writer(graph, checkpoint.versions_seen)
-            position = load_position(graph, checkpoint)
+            node = infer_writer(graph, checkpoint.versions_seen) if as_node is None else as_node
+            position = scope.read_position(loaded.saved)
             step, parent_id, newest_id = checkpoint.step, checkpoint.id, loaded.newest_id
         if node not in graph.nodes:
             raise ValueError(f"as_node is {node!r}, which is not a node of this graph")

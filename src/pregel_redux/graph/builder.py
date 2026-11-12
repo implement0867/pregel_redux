@@ -78,6 +78,9 @@ class StateGraph[StateT, InputT, OutputT]:
     ) -> None:
         if name in self.nodes or name in self.child_graphs:
             raise ValueError(f"node {name!r} is already in this graph")
+        reserved = sorted(set(name) & {"|", ":"})
+        if reserved:
+            raise ValueError(f"node name {name!r} has {reserved!r}, which separate the parts of a checkpoint namespace")
         if defer:
             self.deferred.add(name)
         match node:

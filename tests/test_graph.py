@@ -396,6 +396,19 @@ def test_graph_without_an_entry_edge_is_rejected_by_compile() -> None:
         builder.compile()
 
 
+@pytest.mark.parametrize("name", ["a|b", "a:b"])
+def test_node_name_with_a_namespace_separator_is_rejected(
+    parallel_builder: StateGraph[State[int], State[int], State[int]], name: str
+) -> None:
+    """
+    Arrange: a graph builder.
+    Act: add a node whose name has a character that separates the parts of a checkpoint namespace.
+    Assert: the builder rejects the name.
+    """
+    with pytest.raises(ValueError):
+        parallel_builder.add_node(name, lambda state: None)
+
+
 @pytest.mark.parametrize("name", ["first", "second"])
 def test_duplicate_node_name_is_rejected(
     parallel_builder: StateGraph[State[int], State[int], State[int]], name: str

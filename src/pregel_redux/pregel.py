@@ -249,6 +249,19 @@ def group_values[KeyT, ValueT](pairs: Sequence[tuple[KeyT, ValueT]]) -> dict[Key
     return groups
 
 
+def finish_channels(position: Position) -> Position:
+    channels = position.channels
+    branches, finished_branches = change_channels(channels.branches, lambda node, channel: channel.finish())
+    joins, finished_joins = change_channels(channels.joins, lambda key, channel: channel.finish())
+    changed: list[ChannelKey] = [*(BranchKey(node) for node in finished_branches), *finished_joins]
+    next_version = max(position.versions.values(), default=0) + 1
+    return Position(
+        Channels(channels.start, channels.fields, branches, joins, channels.tasks),
+        {**position.versions, **dict.fromkeys(changed, next_version)},
+        position.seen,
+    )
+
+
 def apply_writes(
     position: Position,
     tasks: Sequence[Task],

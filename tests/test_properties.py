@@ -183,7 +183,8 @@ def join_specs(draw: st.DrawFn, node_count: int) -> JoinSpec:
 
 @st.composite
 def graph_specs(draw: st.DrawFn, known_names: tuple[str, ...], depth: int) -> GraphSpec:
-    name = st.one_of(st.sampled_from(known_names), st.text()) if known_names else st.text()
+    text = st.text(st.characters(exclude_categories=["Cs"], exclude_characters="|:"))
+    name = st.one_of(st.sampled_from(known_names), text) if known_names else text
     names = list(dict.fromkeys(draw(st.lists(name, min_size=1, max_size=5))))
     nodes: list[NodeSpec] = []
     for index, node_name in enumerate(names):
@@ -632,6 +633,7 @@ class ThreadMachine(RuleBasedStateMachine):
         )
         started = sum(execution.path[0] == index for execution in list(thread.trace.executions.values()))
         thread.diverged = True
+        thread.trace.start_era()
 
         result = self.deliver(Command(goto=name), self.config, delivery)
 
