@@ -28,7 +28,7 @@ from pregel_redux import (
     interrupt,
 )
 from pregel_redux.sqlite import SqliteCheckpointer
-from tests.conftest import join_lists
+from tests.conftest import join_lists, read_error, read_result
 
 
 class State(TypedDict, total=False):
@@ -204,7 +204,7 @@ def test_task_that_finished_after_a_failure_has_a_result_and_no_error() -> None:
     graph.invoke(None, config)
     state = graph.get_state(config)
 
-    actual = [(task.name, task.result, task.error) for task in state.tasks if task.name == "recover"]
+    actual = [(task.name, read_result(task), read_error(task)) for task in state.tasks if task.name == "recover"]
     expected = [("recover", {"notes": ["recovered"]}, None)]
     assert actual == expected, f"Expected the finished task {expected}, got {actual}."
 
@@ -443,7 +443,7 @@ def test_answer_of_a_node_that_failed_stays_and_its_later_question_waits_after_a
     actual = graph.invoke(Command(resume="two"), config)
 
     waiting = [item.value for item in state.interrupts]
-    errors = [task.error for task in state.tasks]
+    errors = [read_error(task) for task in state.tasks]
     expected = Finished(State(notes=["one", "two"]))
     assert waiting == ["second question"], f"Expected only the second question to wait, got {waiting}."
     assert errors == ["ConnectionError('run 4')"], f"Expected the error of the fourth run, got {errors}."
