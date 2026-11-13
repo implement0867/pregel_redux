@@ -866,6 +866,14 @@ class ThreadMachine(RuleBasedStateMachine):
         paths = st.sampled_from(find_function_paths(self.thread.spec))
         self.thread.trace.faults.update(data.draw(st.dictionaries(paths, st.sampled_from(Phase), min_size=1)))
 
+    @precondition(lambda self: self.thread.snapshot is not None and len(self.thread.snapshot.next) > 1)
+    @rule(data=st.data())
+    def arm_faults_of_the_next_step(self, data: st.DataObject) -> None:
+        thread = self.thread
+        names = set(() if thread.snapshot is None else thread.snapshot.next)
+        paths = [path for path in find_function_paths(thread.spec) if thread.spec.nodes[path[0]].name in names]
+        thread.trace.faults.update({path: data.draw(st.sampled_from(Phase)) for path in paths})
+
     @precondition(is_started)
     @rule(data=st.data(), mode=st.sampled_from(CallMode), texts=st.lists(st.text()))
     def update_state(self, data: st.DataObject, mode: CallMode, texts: list[str]) -> None:
