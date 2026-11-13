@@ -41,9 +41,10 @@ from pregel_redux import (
     interrupt,
 )
 from pregel_redux.checkpoints import CheckpointSource
-from pregel_redux.snapshots import PullPath, PushPath
+from pregel_redux.snapshots import FailedTask, FinishedTask
 from pregel_redux.sqlite import SqliteCheckpointer
 from pregel_redux.streams import StreamPart, ValuesPart
+from pregel_redux.task_refs import PullRef, PushRef, StartRef
 from tests.conftest import collect, join_lists
 
 
@@ -764,9 +765,9 @@ class ThreadMachine(RuleBasedStateMachine):
             tasks = self.runner.run(graph.aget_state(self.config)).tasks
             for path, phase in trace.fired[fired:]:
                 name = self.thread.spec.nodes[path[0]].name
-                assert phase is Phase.cleanup or any(task.name == name and task.error is not None for task in tasks), (
-                    f"Expected the error of the failed node {name!r} in the tasks {tasks}."
-                )
+                assert phase is Phase.cleanup or any(
+                    task.name == name and isinstance(task.status, FailedTask) for task in tasks
+                ), f"Expected the error of the failed node {name!r} in the tasks {tasks}."
         self.check_stops(known)
         self.check_shutdown(trace.requested[requested:])
         if parts is not None and delivery.stream is not None:
@@ -898,7 +899,7 @@ class ThreadMachine(RuleBasedStateMachine):
         tag = thread.make_text("") if data.draw(st.booleans()) else None
         snapshot = thread.snapshot
         finished = snapshot is not None and any(
-            task.name == node.name and task.result is not None for task in snapshot.tasks
+            task.name == node.name and isinstance(task.status, FinishedTask) for task in snapshot.tasks
         )
         started = sum(execution.path[0] == index for execution in list(thread.trace.executions.values()))
         thread.diverged = True
@@ -997,9 +998,9 @@ class ThreadMachine(RuleBasedStateMachine):
             if len(parent.tasks) == 1:
                 task = parent.tasks[0]
                 match task.path:
-                    case PullPath():
+                    case PullRef():
                         writer = next((candidate for candidate in spec.nodes if candidate.name == task.name), None)
-                    case PushPath():
+                    case PushRef() | StartRef():
                         pass
                     case _ as unknown:
                         assert_never(unknown)
@@ -1028,7 +1029,11 @@ class ThreadMachine(RuleBasedStateMachine):
         if not updated:
             assert after == newest, f"Expected a refused update to leave the state {newest}, got {after}."
             return
-        finished = [task.result for task in before.tasks if task.result is not None and "checkpoint_id" not in config]
+        finished = [
+            task.status.result
+            for task in before.tasks
+            if isinstance(task.status, FinishedTask) and "checkpoint_id" not in config
+        ]
         event(f"state update over finished tasks: {bool(finished)}")
         expected = [
             *read_visits(before.values),

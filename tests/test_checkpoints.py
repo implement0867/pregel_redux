@@ -21,7 +21,7 @@ from pregel_redux import (
     StateGraph,
 )
 from pregel_redux.checkpoints import PendingWrite
-from tests.conftest import join_lists
+from tests.conftest import join_lists, read_result
 
 
 class State(TypedDict, total=False):
@@ -625,7 +625,7 @@ def test_failure_of_a_node_lets_the_other_nodes_of_its_step_finish() -> None:
     with pytest.raises(ConnectionError):
         asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
 
-    saved = {task.name: task.result for task in asyncio.run(graph.aget_state({"thread_id": "thread"})).tasks}
+    saved = {task.name: read_result(task) for task in asyncio.run(graph.aget_state({"thread_id": "thread"})).tasks}
     actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
 
     assert saved == {"fail": None, "slow": {"jokes": ["slow"]}}, f"Expected the result of the slow node, got {saved}."

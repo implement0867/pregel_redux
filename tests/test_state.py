@@ -1,5 +1,6 @@
 import asyncio
 from collections.abc import Callable
+from dataclasses import replace
 from typing import Annotated, Literal, TypedDict
 from uuid import uuid4
 
@@ -25,8 +26,9 @@ from pregel_redux import (
     read_config,
 )
 from pregel_redux.checkpoints import CheckpointSource
-from pregel_redux.snapshots import PullPath, PushPath
-from tests.conftest import collect, join_lists
+from pregel_redux.snapshots import FailedTask, FinishedTask, PendingTask, WaitingTask
+from pregel_redux.task_refs import PullRef, PushRef, StartRef, name_task
+from tests.conftest import collect, join_lists, read_error, read_result
 
 
 class State(TypedDict, total=False):
@@ -524,11 +526,11 @@ def test_state_tasks_have_the_result_of_a_finished_task_and_the_path() -> None:
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     graph.invoke({}, {"thread_id": "thread"})
-    expected = {"write": (PullPath("write"), {"notes": ["write"]}), "ask": (PullPath("ask"), None)}
+    expected = {"write": (PullRef("write"), {"notes": ["write"]}), "ask": (PullRef("ask"), None)}
 
     actual = graph.get_state({"thread_id": "thread"})
 
-    summary = {task.name: (task.path, task.result) for task in actual.tasks}
+    summary = {task.name: (task.path, read_result(task)) for task in actual.tasks}
     assert summary == expected, f"Expected {expected}, got {summary}."
 
 
@@ -549,7 +551,7 @@ def test_state_task_of_a_send_has_the_index_of_the_send_as_path(sends: int) -> N
     builder.add_edge(Endpoint.start, "fan_out")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     graph.invoke({}, {"thread_id": "thread"})
-    expected = [PushPath(index) for index in range(sends)]
+    expected = [PushRef("ask", index) for index in range(sends)]
 
     actual = graph.get_state({"thread_id": "thread"})
 
@@ -746,7 +748,7 @@ def test_state_after_a_failure_has_the_error_of_the_failed_task() -> None:
     with pytest.raises(ConnectionError):
         graph.invoke({}, config)
 
-    actual = {task.name: task.error for task in graph.get_state(config).tasks}
+    actual = {task.name: read_error(task) for task in graph.get_state(config).tasks}
 
     expected = {"failed": "ConnectionError('no network')", "finished": None}
     assert actual == expected, f"Expected {expected}, got {actual}."
@@ -775,7 +777,123 @@ def test_error_of_a_task_is_removed_when_the_task_asks_a_question_in_the_next_ru
         graph.invoke({}, config)
     graph.invoke(None, config)
 
-    actual = [([item.value for item in task.interrupts], task.error) for task in graph.get_state(config).tasks]
+    actual = [([item.value for item in task.interrupts], read_error(task)) for task in graph.get_state(config).tasks]
 
     expected = [(["question"], None)]
     assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+def build_step_of_three_outcomes(calls: list[str]) -> PersistentGraph[State, State, Output]:
+    def fail(state: State) -> State:
+        raise ConnectionError("no network")
+
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("write", build_writer("write", calls))
+    builder.add_node("ask", ask)
+    builder.add_node("fail", fail)
+    builder.add_edge(Endpoint.start, "write")
+    builder.add_edge(Endpoint.start, "ask")
+    builder.add_edge(Endpoint.start, "fail")
+    return builder.compile(checkpointer=InMemoryCheckpointer())
+
+
+def test_state_task_has_one_status_for_each_outcome_of_its_node() -> None:
+    """
+    Arrange: a thread whose step has a node that finished, a node that asks a question and a node that failed.
+    Act: read the state of the thread.
+    Assert: the tasks are finished with the update, waiting with the question, and failed with the error.
+    """
+    graph = build_step_of_three_outcomes([])
+    config = ThreadConfig(thread_id="thread")
+    with pytest.raises(ConnectionError):
+        graph.invoke({}, config)
+
+    actual = graph.get_state(config)
+
+    statuses = {task.name: task.status for task in actual.tasks}
+    question = actual.interrupts
+    expected = {
+        "write": FinishedTask({"notes": ["write"]}),
+        "ask": WaitingTask((question[0],)),
+        "fail": FailedTask("ConnectionError('no network')", ()),
+    }
+    assert [item.value for item in question] == ["question"], f"Expected one waiting question, got {question}."
+    assert statuses == expected, f"Expected {expected}, got {statuses}."
+
+
+def test_state_task_that_did_not_run_is_pending() -> None:
+    """
+    Arrange: a thread that stopped before its first node.
+    Act: read the state of the thread.
+    Assert: the task of the node is pending, and has no interrupt.
+    """
+    graph = build_chain([], interrupt_before=("first",))
+    graph.invoke({}, {"thread_id": "thread"})
+
+    actual = graph.get_state({"thread_id": "thread"})
+
+    summary = [(task.path, task.status, task.interrupts) for task in actual.tasks]
+    expected = [(PullRef("first"), PendingTask(), ())]
+    assert summary == expected, f"Expected {expected}, got {summary}."
+
+
+def test_state_task_of_the_input_is_the_start_task() -> None:
+    """
+    Arrange: a thread of a run that finished with an input.
+    Act: read the oldest state of the thread.
+    Assert: its task is the start task, which has the one name of the start task and finished with the input.
+    """
+    graph = build_chain([])
+    graph.invoke({"notes": ["input"]}, {"thread_id": "thread"})
+
+    actual = list(graph.get_state_history({"thread_id": "thread"}))[-1]
+
+    summary = [(task.path, task.name, task.status) for task in actual.tasks]
+    expected = [(StartRef(), "__start__", FinishedTask({"notes": ["input"]}))]
+    assert summary == expected, f"Expected {expected}, got {summary}."
+    assert name_task(StartRef()) == "__start__", "Expected the id of the start task to use the same name."
+
+
+def test_state_next_and_interrupts_follow_the_tasks() -> None:
+    """
+    Arrange: the state of a thread that stopped at an interrupt.
+    Act: copy the state with no tasks.
+    Assert: the state has a next node and an interrupt, and the copy has no next node and no interrupt.
+    """
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("ask", ask)
+    builder.add_edge(Endpoint.start, "ask")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    graph.invoke({}, {"thread_id": "thread"})
+    state = graph.get_state({"thread_id": "thread"})
+
+    actual = replace(state, tasks=())
+
+    values = [item.value for item in state.interrupts]
+    assert (state.next, values) == (("ask",), ["question"]), f"Expected the node ask and its question, got {state}."
+    assert (actual.next, actual.interrupts) == ((), ()), f"Expected no next node and no interrupt, got {actual}."
+
+
+def test_state_with_subgraphs_has_the_state_of_a_child_graph_that_finished() -> None:
+    """
+    Arrange: a thread whose step has a child graph that finished and a node that stopped at an interrupt.
+    Act: read the state with subgraphs.
+    Assert: the task of the child graph is finished with its update, and has the state of the child graph.
+    """
+    child = StateGraph(State, output_schema=State)
+    child.add_node("write", build_writer("write", []))
+    child.add_edge(Endpoint.start, "write")
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("child", child)
+    builder.add_node("ask", ask)
+    builder.add_edge(Endpoint.start, "child")
+    builder.add_edge(Endpoint.start, "ask")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    graph.invoke({}, {"thread_id": "thread"})
+
+    actual = graph.get_state({"thread_id": "thread"}, subgraphs=True)
+
+    task = next(task for task in actual.tasks if task.name == "child")
+    values = None if task.state is None else task.state.values
+    assert task.status == FinishedTask({"notes": ["write"]}), f"Expected the update of the child, got {task.status}."
+    assert values == {"notes": ["write"]}, f"Expected the state of the child graph, got {task.state}."
