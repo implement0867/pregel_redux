@@ -16,6 +16,7 @@ from pregel_redux import (
     Reducer,
     RunAborted,
     Scope,
+    Send,
     ShutdownController,
     StateGraph,
     ThreadConfig,
@@ -166,6 +167,35 @@ def test_answer_that_is_not_of_the_response_schema_leaves_the_question_waiting()
 
     assert waiting == questions, f"Expected the question {questions} to wait after the rejected answer, got {waiting}."
     assert actual == Finished(State(notes=["approved"])), f"Expected the second answer to finish the run, got {actual}."
+
+
+def test_deferred_node_runs_after_the_nodes_of_the_pending_sends() -> None:
+    """
+    Arrange: a router that sends two payloads to a worker, and a deferred node that the start reaches.
+    Act: run the graph.
+    Assert: the deferred node runs after the two workers and sees their writes.
+    """
+
+    def route(state: State) -> Command[str]:
+        return Command(update=State(notes=["route"]), goto=[Send("work", State(notes=[topic])) for topic in "ab"])
+
+    def work(state: State) -> State:
+        return State(notes=[f"work {state.get('notes', [])[0]}"])
+
+    def late(state: State) -> State:
+        return State(notes=[f"late saw {len(state.get('notes', []))}"])
+
+    builder = StateGraph(State)
+    builder.add_node("route", route)
+    builder.add_node("work", work)
+    builder.add_node("late", late, defer=True)
+    builder.add_edge(Endpoint.start, "route")
+    builder.add_edge(Endpoint.start, "late")
+
+    actual = asyncio.run(builder.compile().ainvoke({}))
+
+    expected = State(notes=["route", "work a", "work b", "late saw 3"])
+    assert actual == expected, f"Expected {expected}, got {actual}."
 
 
 def test_abort_after_an_answer_keeps_the_error_of_the_task() -> None:

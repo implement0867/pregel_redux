@@ -325,7 +325,8 @@ def apply_writes(
     }
     finished_branches: set[str] = set()
     finished_joins: set[JoinKey] = set()
-    if bump_step and not start_updated and updated_triggers.isdisjoint(trigger_keys):
+    pending_sends = (channels.tasks if tasks_channel is None else tasks_channel).values
+    if bump_step and not start_updated and not pending_sends and updated_triggers.isdisjoint(trigger_keys):
         branches, finished_branches = change_channels(branches, lambda node, channel: channel.finish())
         joins, finished_joins = change_channels(joins, lambda key, channel: channel.finish())
 
