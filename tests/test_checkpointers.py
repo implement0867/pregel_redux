@@ -136,7 +136,8 @@ def test_checkpoint_is_found_by_its_id_with_its_pending_writes(checkpointer: Che
     actual = asyncio.run(checkpointer.aget_tuple("thread", "", stopped.id))
     missing = asyncio.run(checkpointer.aget_tuple("thread", "", UUID(int=1)))
 
-    writes = () if actual is None else actual.pending_writes
+    assert actual is not None, "Expected a checkpoint for the id of the stop, got None."
+    writes = actual.pending_writes
     kinds = sorted(write.kind.value for write in writes)
     commands = [write for write in writes if isinstance(write, RunCommandRecord)]
     assert kinds == ["command", "stop"], f"Expected one stop record and one command record, got {kinds}."

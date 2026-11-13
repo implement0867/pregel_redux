@@ -239,7 +239,7 @@ def test_resume_of_a_thread_without_a_checkpoint_is_rejected() -> None:
     """
     Arrange: a graph with a checkpointer that holds no thread.
     Act: resume a thread.
-    Assert: the resume raises a LookupError that names the thread.
+    Assert: the resume raises a LookupError.
     """
     graph = build_joke_graph(InMemoryCheckpointer(), [], [])
 
@@ -283,7 +283,7 @@ def test_checkpoint_with_a_join_that_the_graph_does_not_have_is_rejected() -> No
     """
     Arrange: a thread of a failed run whose checkpoint holds a source of a join, and the same graph without the join.
     Act: resume the thread with the graph without the join.
-    Assert: the resume raises a ValueError that names the join.
+    Assert: the resume raises a ValueError.
     """
     checkpointer = InMemoryCheckpointer()
     graph = build_join_graph(checkpointer, [ConnectionError("no network")], [], with_join=True)
@@ -316,7 +316,7 @@ def test_invoke_without_an_input_rejects_a_graph_that_has_an_async_node() -> Non
     """
     Arrange: a graph with a checkpointer and an async node.
     Act: call invoke without an input.
-    Assert: invoke raises a TypeError that names ainvoke.
+    Assert: invoke raises a TypeError.
     """
 
     async def write_later(state: State) -> State:

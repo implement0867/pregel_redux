@@ -41,7 +41,7 @@ from pregel_redux import (
     interrupt,
 )
 from pregel_redux.checkpoints import CheckpointSource
-from pregel_redux.snapshots import PullPath, TaskSnapshot
+from pregel_redux.snapshots import PullPath, PushPath
 from pregel_redux.sqlite import SqliteCheckpointer
 from pregel_redux.streams import StreamPart, ValuesPart
 from tests.conftest import collect, join_lists
@@ -219,13 +219,14 @@ def drop_ways(node: NodeSpec, alone: set[int]) -> NodeSpec:
     def keep(indexes: tuple[int, ...]) -> tuple[int, ...]:
         return tuple(index for index in indexes if index not in alone)
 
-    work = node.work
-    if isinstance(work, FunctionSpec) and isinstance(work.action, RouterSpec):
-        action = RouterSpec(
-            keep(work.action.forward), keep(work.action.sends), keep(work.action.back), work.action.rounds
-        )
-        work = replace(work, action=action)
-    return replace(node, work=work, targets=keep(node.targets))
+    match node.work:
+        case FunctionSpec(action=RouterSpec() as router) as function:
+            action = RouterSpec(keep(router.forward), keep(router.sends), keep(router.back), router.rounds)
+            return replace(node, work=replace(function, action=action), targets=keep(node.targets))
+        case FunctionSpec() | ChildSpec():
+            return replace(node, targets=keep(node.targets))
+        case _:
+            assert_never(node.work)
 
 
 def find_reached_nodes(nodes: Sequence[NodeSpec], entries: Sequence[int]) -> list[int]:
@@ -233,8 +234,13 @@ def find_reached_nodes(nodes: Sequence[NodeSpec], entries: Sequence[int]) -> lis
     for index, node in enumerate(nodes):
         if index in reached:
             reached.update(node.targets)
-            if isinstance(node.work, FunctionSpec) and isinstance(node.work.action, RouterSpec):
-                reached.update((*node.work.action.forward, *node.work.action.sends))
+            match node.work:
+                case FunctionSpec(action=RouterSpec() as router):
+                    reached.update((*router.forward, *router.sends))
+                case FunctionSpec() | ChildSpec():
+                    pass
+                case _:
+                    assert_never(node.work)
     return sorted(reached)
 
 
@@ -445,10 +451,13 @@ def find_spec(spec: GraphSpec, checkpoint_ns: str) -> GraphSpec:
     found = spec
     for part in checkpoint_ns.split("|") if checkpoint_ns else ():
         name = part.rsplit(":", 1)[0]
-        work = next(node.work for node in found.nodes if node.name == name)
-        if not isinstance(work, ChildSpec):
-            raise TypeError(f"Expected the namespace {checkpoint_ns!r} to name child graphs, got {name!r}.")
-        found = work.graph
+        match next(node.work for node in found.nodes if node.name == name):
+            case ChildSpec(graph=graph):
+                found = graph
+            case FunctionSpec():
+                raise TypeError(f"Expected the namespace {checkpoint_ns!r} to name child graphs, got {name!r}.")
+            case _ as unknown:
+                assert_never(unknown)
     return found
 
 
@@ -477,13 +486,14 @@ def find_unfired_joins(spec: GraphSpec, trace: Trace) -> list[JoinSpec]:
         for order, execution in enumerate(list(trace.executions.values()))
         if execution.completed and execution.era == trace.era
     ]
-    unfired: list[JoinSpec] = []
-    for join in spec.joins:
-        last_run = max((order for order, node in current if node == join.target), default=-1)
-        arrived = {node for order, node in current if order > last_run}
-        if join.target is not None and arrived >= set(join.sources):
-            unfired.append(join)
-    return unfired
+    last_runs = {
+        join: max((order for order, node in current if node == join.target), default=-1) for join in spec.joins
+    }
+    return [
+        join
+        for join in spec.joins
+        if join.target is not None and {node for order, node in current if order > last_runs[join]} >= set(join.sources)
+    ]
 
 
 def run_plain(spec: GraphSpec, origin: str) -> tuple[Trace, State]:
@@ -575,8 +585,10 @@ def find_errors(error: BaseException) -> list[BaseException]:
             case item if id(item) not in found:
                 found[id(item)] = item
                 pending.extend((item.__cause__, item.__context__))
-            case _:
+            case BaseException():
                 pass
+            case _ as unknown:
+                assert_never(unknown)
     return list(found.values())
 
 
@@ -982,11 +994,15 @@ class ThreadMachine(RuleBasedStateMachine):
                     ThreadConfig(thread_id="thread", checkpoint_ns=before.checkpoint_ns, checkpoint_id=before.parent_id)
                 )
             )
-            match parent.tasks:
-                case [TaskSnapshot(name=name, path=PullPath())]:
-                    writer = next((candidate for candidate in spec.nodes if candidate.name == name), None)
-                case _:
-                    pass
+            if len(parent.tasks) == 1:
+                task = parent.tasks[0]
+                match task.path:
+                    case PullPath():
+                        writer = next((candidate for candidate in spec.nodes if candidate.name == task.name), None)
+                    case PushPath():
+                        pass
+                    case _ as unknown:
+                        assert_never(unknown)
         thread.diverge()
         thread.steered = True
         thread.result = None
@@ -1033,8 +1049,15 @@ class ThreadMachine(RuleBasedStateMachine):
     def finish(self) -> None:
         thread = self.thread
         delivery = Delivery(CallMode.asynchronous, None)
-        result = thread.result if isinstance(thread.result, Finished) and not thread.trace.faults else None
-        while not isinstance(result, Finished):
+        result = None if thread.trace.faults else thread.result
+        while True:
+            match result:
+                case Finished():
+                    break
+                case Interrupted() | None:
+                    pass
+                case _:
+                    assert_never(result)
             snapshot = self.runner.run(thread.graph.aget_state(self.config))
             progress = (
                 snapshot.checkpoint_id,
@@ -1046,17 +1069,21 @@ class ThreadMachine(RuleBasedStateMachine):
             answers = {item.id: thread.make_text("") for item in snapshot.interrupts}
             thread.trace.given.update({read_question(item): answers[item.id] for item in snapshot.interrupts})
             result = self.deliver(Command(resume_by_interrupt_id=answers) if answers else None, self.config, delivery)
-            if isinstance(result, Finished):
-                break
-            snapshot = self.runner.run(thread.graph.aget_state(self.config))
-            now = (
-                snapshot.checkpoint_id,
-                snapshot.interrupts,
-                len(thread.trace.fired),
-                len(thread.trace.consumed),
-                len(thread.trace.shutdowns),
-            )
-            assert now != progress, f"Expected a run with all answers to change the thread, got {result} again."
+            match result:
+                case Finished():
+                    pass
+                case Interrupted() | None:
+                    snapshot = self.runner.run(thread.graph.aget_state(self.config))
+                    now = (
+                        snapshot.checkpoint_id,
+                        snapshot.interrupts,
+                        len(thread.trace.fired),
+                        len(thread.trace.consumed),
+                        len(thread.trace.shutdowns),
+                    )
+                    assert now != progress, f"Expected a run with all answers to change the thread, got {result} again."
+                case _:
+                    assert_never(result)
 
         visits = result.output.get("visits", [])
         for note in thread.promised:

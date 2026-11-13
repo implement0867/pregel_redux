@@ -199,7 +199,7 @@ def test_sync_stream_rejects_a_graph_that_has_an_async_node() -> None:
     """
     Arrange: a graph with an async node, with and without a checkpointer.
     Act: stream a run with the sync function.
-    Assert: each call raises TypeError that names astream.
+    Assert: each call raises TypeError.
     """
     builder = build_builder(("async", write_async))
 
@@ -232,7 +232,10 @@ def test_stream_raises_the_exception_of_a_node_after_the_parts_before_it(*, sync
         next(stream)
 
     with pytest.raises(ConnectionError):
-        read_sync() if sync else asyncio.run(read())
+        if sync:
+            read_sync()
+        else:
+            asyncio.run(read())
 
     expected = [UpdatesPart((), "first", {"notes": ["first"]})]
     assert actual == expected, f"Expected {expected}, got {actual}."
@@ -286,7 +289,7 @@ def test_stream_without_a_checkpointer_rejects_an_interrupt() -> None:
     """
     Arrange: a graph without a checkpointer whose node calls interrupt.
     Act: stream a run.
-    Assert: the stream raises RuntimeError that names the checkpointer.
+    Assert: the stream raises RuntimeError.
     """
     graph = build_builder(("ask", ask)).compile()
 

@@ -273,7 +273,10 @@ def test_cleanup_error_of_a_finished_node_keeps_the_error_of_the_failed_node(
 
     graph = build_two_node_graph(use_value, raise_error, parallel=True).compile()
     with pytest.raises(LookupError) as raised:
-        _ = graph.invoke({}) if call == "invoke" else asyncio.run(graph.ainvoke({}))
+        if call == "invoke":
+            graph.invoke({})
+        else:
+            asyncio.run(graph.ainvoke({}))
 
     chain: list[BaseException] = [raised.value]
     while chain[-1].__context__ is not None and len(chain) < 10:
@@ -344,7 +347,10 @@ def test_cleanup_errors_of_two_nodes_of_one_step_are_both_in_the_context_chain(c
 
     graph = build_two_node_graph(use_first, use_second, parallel=True).compile()
     with pytest.raises((LookupError, ValueError)) as raised:
-        _ = graph.invoke({}) if call == "invoke" else asyncio.run(graph.ainvoke({}))
+        if call == "invoke":
+            graph.invoke({})
+        else:
+            asyncio.run(graph.ainvoke({}))
 
     chain: list[BaseException] = [raised.value]
     while chain[-1].__context__ is not None and len(chain) < 10:

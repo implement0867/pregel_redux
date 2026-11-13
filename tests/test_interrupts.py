@@ -3,7 +3,7 @@ from collections.abc import Callable
 from typing import Annotated, TypedDict
 
 import pytest
-from pydantic import BaseModel, ValidationError
+from pydantic import BaseModel, TypeAdapter, ValidationError
 
 from pregel_redux import (
     Command,
@@ -183,7 +183,7 @@ def test_one_resume_value_for_more_than_one_waiting_interrupt_is_rejected() -> N
     """
     Arrange: a thread that stopped at one interrupt in each of two nodes of one step.
     Act: run the thread with a Command that has one resume value and no interrupt id.
-    Assert: the run raises a ValueError that names resume_by_interrupt_id.
+    Assert: the run raises a ValueError.
     """
     graph = build_asking_graph(2, 1, [])
     asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
@@ -304,7 +304,7 @@ def test_interrupt_in_a_graph_without_a_checkpointer_is_rejected() -> None:
     """
     Arrange: a graph without a checkpointer, in which one node calls interrupt.
     Act: run the graph.
-    Assert: the run raises a RuntimeError that names the checkpointer.
+    Assert: the run raises a RuntimeError.
     """
     builder = StateGraph(State, output_schema=Output)
     builder.add_node("ask", build_asking_node("ask", 1, []))
@@ -346,8 +346,8 @@ def test_run_with_a_command_applies_its_update_and_its_goto(command: Command[str
     asyncio.run(graph.ainvoke(command, {"thread_id": "thread"}))
     asyncio.run(graph.ainvoke(Command(resume="yes"), {"thread_id": "thread"}))
 
-    notes = asyncio.run(graph.aget_state({"thread_id": "thread"})).values["notes"]
-    assert isinstance(notes, list), f"Expected a list of notes, got {notes}."
+    values = asyncio.run(graph.aget_state({"thread_id": "thread"})).values
+    notes = TypeAdapter(list[str]).validate_python(values["notes"])
     assert notes.count(note) == count, f"Expected the note {note!r} {count} time(s), got {notes}."
 
 
@@ -396,7 +396,8 @@ def test_failure_of_a_child_graph_after_an_answer_keeps_the_answer() -> None:
     builder.add_edge(Endpoint.start, "child")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     stopped = asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
-    answers = {item.id: "yes" for item in stopped.interrupts} if isinstance(stopped, Interrupted) else {}
+    assert isinstance(stopped, Interrupted), f"Expected a stop at the question, got {stopped}."
+    answers = {item.id: "yes" for item in stopped.interrupts}
     with pytest.raises(ConnectionError):
         asyncio.run(graph.ainvoke(Command(resume_by_interrupt_id=answers), {"thread_id": "thread"}))
 
@@ -438,9 +439,8 @@ def test_child_graph_that_got_its_answer_finishes_when_another_node_fails() -> N
     builder.add_edge(Endpoint.start, "sibling")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     stopped = asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
-    asked = (
-        [item for item in stopped.interrupts if item.value == "question"] if isinstance(stopped, Interrupted) else []
-    )
+    assert isinstance(stopped, Interrupted), f"Expected a stop at the question, got {stopped}."
+    asked = [item for item in stopped.interrupts if item.value == "question"]
     with pytest.raises(ConnectionError):
         asyncio.run(graph.ainvoke(Command(resume_by_interrupt_id={asked[0].id: "yes"}), {"thread_id": "thread"}))
 
@@ -505,7 +505,8 @@ def test_plain_answer_goes_to_the_one_interrupt_that_waits() -> None:
     waiting = [item.value for item in graph.get_state({"thread_id": "thread"}).interrupts]
 
     stopped = graph.invoke(Command(resume="yes"), {"thread_id": "thread"})
-    answers = {item.id: "no" for item in stopped.interrupts} if isinstance(stopped, Interrupted) else {}
+    assert isinstance(stopped, Interrupted), f"Expected a stop at the question of the first node, got {stopped}."
+    answers = {item.id: "no" for item in stopped.interrupts}
     actual = graph.invoke(Command(resume_by_interrupt_id=answers), {"thread_id": "thread"})
 
     expected = Finished(Output(notes=["first got no", "second got yes"]))

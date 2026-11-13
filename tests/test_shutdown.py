@@ -2,7 +2,7 @@ import asyncio
 import signal
 import threading
 from collections.abc import AsyncIterator
-from typing import Annotated, TypedDict
+from typing import Annotated, TypedDict, assert_never
 
 import pytest
 
@@ -22,6 +22,16 @@ from pregel_redux import (
     graceful_shutdown,
     interrupt,
     read_shutdown,
+)
+from pregel_redux.streams import (
+    CheckpointPart,
+    CustomPart,
+    InterruptsPart,
+    StreamPart,
+    TaskResultPart,
+    TaskStartPart,
+    UpdatesPart,
+    ValuesPart,
 )
 from tests.conftest import collect, join_lists
 
@@ -375,7 +385,16 @@ def test_stream_ends_after_the_current_step_at_a_graceful_shutdown() -> None:
 
     parts = list(graph.stream({}, {"thread_id": "thread"}, stream_mode=StreamMode.updates, signal=controller.signal))
 
-    names = [getattr(part, "node", None) for part in parts]
+    def read_node(part: StreamPart) -> str | None:
+        match part:
+            case UpdatesPart(node=node):
+                return node
+            case ValuesPart() | InterruptsPart() | CustomPart() | CheckpointPart() | TaskStartPart() | TaskResultPart():
+                return None
+            case _:
+                assert_never(part)
+
+    names = [read_node(part) for part in parts]
     assert names == ["first", None], f"Expected the update of the first node and the stop, got {parts}."
 
 
