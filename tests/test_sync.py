@@ -189,13 +189,13 @@ def test_invoke_inside_a_running_event_loop_gives_the_output(released: list[bool
 
 @pytest.mark.parametrize("scope", list(Scope), ids=lambda scope: scope.name)
 @pytest.mark.parametrize("error_type", [LookupError, ValueError])
-def test_sync_provider_that_opens_while_another_node_fails_is_closed(
+def test_node_with_a_sync_provider_finishes_when_another_node_fails(
     journal: Journal, error_type: type[Exception], scope: Scope
 ) -> None:
     """
     Arrange: a sync generator provider that is in its open step while another node of the step fails.
     Act: run the graph with ainvoke.
-    Assert: the failure is raised, the provider closed, and the node of the provider did not run.
+    Assert: the failure is raised after the node of the provider ran and the provider closed.
     """
     opened = threading.Event()
     release = threading.Event()
@@ -222,14 +222,14 @@ def test_sync_provider_that_opens_while_another_node_fails_is_closed(
     builder.add_node("fail", raise_error)
     builder.add_edge(Endpoint.start, "use")
     builder.add_edge(Endpoint.start, "fail")
-    expected = ["open link 1", "close 1"]
+    expected = ["open link 1", "node 1", "close 1"]
 
     with pytest.raises(error_type):
         asyncio.run(builder.compile().ainvoke({}))
 
     assert journal.events == expected, (
         f"Expected the events {expected}, got {journal.events}. "
-        "A provider that finishes its open step after the cancellation must close, and its node must not run."
+        "The other nodes of a step run to their end after a failure, and their providers close."
     )
 
 

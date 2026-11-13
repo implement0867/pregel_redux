@@ -408,17 +408,18 @@ def test_failure_of_a_child_graph_after_an_answer_keeps_the_answer() -> None:
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 
-def test_cancelled_child_graph_after_an_answer_does_not_wait_for_it_again() -> None:
+def test_child_graph_that_got_its_answer_finishes_when_another_node_fails() -> None:
     """
-    Arrange: a child graph whose node waits after it got its answer, next to a node that fails in the second run.
-    Act: run the thread, answer the question by its id so the failure cancels the child graph, and read the state.
+    Arrange: a child graph whose node pauses after it got its answer, next to a node that fails in the second run.
+    Act: run the thread, answer the question by its id so the other node fails, and read the state.
     Assert: only the question of the other node waits, because the node of the child graph received its answer.
     """
     runs: list[str] = []
 
     async def ask(state: State) -> State:
         answer = interrupt("question", response_schema=str)
-        await asyncio.sleep(60)
+        for _ in range(3):
+            await asyncio.sleep(0)
         return State(notes=[answer])
 
     def fail_later(state: State) -> State:

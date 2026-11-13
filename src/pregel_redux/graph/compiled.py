@@ -543,17 +543,22 @@ class CompiledGraph[StateT, InputT, OutputT]:
     async def run_step(
         self, calls: Sequence[NodeCall], run: Run, journal: Journal, step_exits: AsyncExitStack
     ) -> list[TaskWrites | TaskInterrupted]:
+        tasks = [asyncio.create_task(self.run_task(call, run, journal, step_exits)) for call in calls]
         try:
-            async with asyncio.TaskGroup() as group:
-                tasks = [group.create_task(self.run_task(call, run, journal, step_exits)) for call in calls]
-            return [task.result() for task in tasks]
-        except ExceptionGroup as group_error:
-            match group_error.exceptions:
-                case (failure,):
-                    pass
-                case _:
-                    raise
-        raise failure
+            await asyncio.wait(tasks)
+        except asyncio.CancelledError:
+            for task in tasks:
+                task.cancel()
+            await finish_despite_cancellation(asyncio.wait(tasks))
+            raise
+        failures = [failure for task in tasks if (failure := task.exception()) is not None]
+        match failures:
+            case []:
+                return [task.result() for task in tasks]
+            case [failure]:
+                raise failure
+            case _:
+                raise BaseExceptionGroup("several nodes of one step failed", failures)
 
     async def run_task(
         self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack

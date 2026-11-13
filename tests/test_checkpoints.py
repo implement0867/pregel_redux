@@ -594,3 +594,68 @@ def test_checkpoint_of_another_format_version_is_rejected() -> None:
 
     with pytest.raises(ValidationError):
         asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+
+
+def test_failure_of_a_node_lets_the_other_nodes_of_its_step_finish() -> None:
+    """
+    Arrange: a step with a node that fails at once and a node that pauses before it returns its write.
+    Act: run the thread, read the state after the failure, and run the thread again.
+    Assert: the state after the failure has the result of the slow node, and the slow node ran one time.
+    """
+    calls: list[str] = []
+
+    async def write_slowly(state: State) -> State:
+        calls.append("slow")
+        for _ in range(3):
+            await asyncio.sleep(0)
+        return {"jokes": ["slow"]}
+
+    async def fail_one_time(state: State) -> State:
+        calls.append("fail")
+        if calls.count("fail") == 1:
+            raise ConnectionError
+        return {"jokes": ["repaired"]}
+
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("slow", write_slowly)
+    builder.add_node("fail", fail_one_time)
+    builder.add_edge(Endpoint.start, "slow")
+    builder.add_edge(Endpoint.start, "fail")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    with pytest.raises(ConnectionError):
+        asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+
+    saved = {task.name: task.result for task in asyncio.run(graph.aget_state({"thread_id": "thread"})).tasks}
+    actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+
+    assert saved == {"fail": None, "slow": {"jokes": ["slow"]}}, f"Expected the result of the slow node, got {saved}."
+    assert actual == Finished(Output(jokes=["repaired", "slow"])), f"Expected the two writes, got {actual}."
+    assert calls.count("slow") == 1, f"Expected the slow node to run one time, got {calls}."
+
+
+@pytest.mark.parametrize("pauses", [0, 1, 3])
+def test_failures_of_two_nodes_of_one_step_are_raised_together(pauses: int) -> None:
+    """
+    Arrange: a step with a node that fails at once and a node that fails after some pauses.
+    Act: run the graph.
+    Assert: the run raises one group with the errors of the two nodes in the order of the nodes.
+    """
+
+    async def fail_first(state: State) -> State:
+        raise LookupError
+
+    async def fail_later(state: State) -> State:
+        for _ in range(pauses):
+            await asyncio.sleep(0)
+        raise ValueError
+
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("first", fail_first)
+    builder.add_node("later", fail_later)
+    builder.add_edge(Endpoint.start, "first")
+    builder.add_edge(Endpoint.start, "later")
+    with pytest.raises(ExceptionGroup) as raised:
+        asyncio.run(builder.compile().ainvoke({}))
+
+    actual = [type(error) for error in raised.value.exceptions]
+    assert actual == [LookupError, ValueError], f"Expected the errors of the two nodes, got {actual}."

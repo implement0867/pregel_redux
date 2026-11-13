@@ -355,14 +355,12 @@ def test_cleanup_errors_of_two_nodes_of_one_step_are_both_in_the_context_chain(c
 
 def test_cancellation_at_the_start_of_a_cleanup_does_not_skip_the_cleanup() -> None:
     """
-    Arrange: a node with a sync generator provider that fails directly after a node of the same step failed.
+    Arrange: a node with a sync generator provider that cancels the run of its graph and then fails.
     Act: run the graph, so the cancellation arrives when the cleanup of the provider starts.
-    Assert: the cleanup ran, and the run raises the errors of the two nodes.
+    Assert: the run is cancelled, and the cleanup ran.
     """
     closed: list[str] = []
-    first_waits = asyncio.Event()
-    second_waits = asyncio.Event()
-    gate = asyncio.Event()
+    runs: list[asyncio.Task[object]] = []
 
     def open_test_resource() -> Iterator[int]:
         try:
@@ -370,31 +368,18 @@ def test_cancellation_at_the_start_of_a_cleanup_does_not_skip_the_cleanup() -> N
         finally:
             closed.append("closed")
 
-    async def fail_first(state: State) -> State:
-        first_waits.set()
-        await gate.wait()
-        raise ValueError("first")
+    async def cancel_and_fail(state: State, value: Annotated[int, Depends(open_test_resource)]) -> State:
+        runs[0].cancel()
+        raise LookupError
 
-    async def fail_second(state: State, value: Annotated[int, Depends(open_test_resource)]) -> State:
-        second_waits.set()
-        await gate.wait()
-        raise LookupError("second")
+    async def run_graph() -> None:
+        runs.append(asyncio.ensure_future(build_one_node_graph(cancel_and_fail).compile().ainvoke({})))
+        await runs[0]
 
-    async def open_gate(state: State) -> State:
-        await first_waits.wait()
-        await second_waits.wait()
-        gate.set()
-        return {}
+    with pytest.raises(asyncio.CancelledError):
+        asyncio.run(run_graph())
 
-    builder = build_two_node_graph(fail_second, fail_first, parallel=True)
-    builder.add_node("gate", open_gate)
-    builder.add_edge(Endpoint.start, "gate")
-    with pytest.raises(ExceptionGroup) as raised:
-        asyncio.run(builder.compile().ainvoke({}))
-
-    actual = sorted(type(error).__name__ for error in raised.value.exceptions)
     assert closed == ["closed"], f"Expected the cleanup of the provider to run one time, got {closed}."
-    assert actual == ["LookupError", "ValueError"], f"Expected the errors of the two nodes, got {actual}."
 
 
 @pytest.mark.parametrize("error_type", [LookupError, ValueError, RuntimeError])
