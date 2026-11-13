@@ -439,6 +439,64 @@ def test_shutdown_request_after_an_abort_keeps_the_abort() -> None:
     assert controller.signal.aborted, "Expected the abort to stay."
 
 
+def test_signal_is_aborted_when_the_clock_reaches_the_deadline() -> None:
+    """
+    Arrange: a controller with a clock that the test moves, and a shutdown request with a grace period.
+    Act: read the signal before the deadline and at the deadline.
+    Assert: the signal is requested and not aborted before the deadline, and aborted at the deadline.
+    """
+    now = [100.0]
+    controller = ShutdownController(clock=lambda: now[0])
+    controller.shutdown(grace_period=5.0)
+
+    before = (controller.signal.requested, controller.signal.aborted, controller.signal.seconds_until_abort())
+    now[0] = 105.0
+    after = (controller.signal.requested, controller.signal.aborted, controller.signal.seconds_until_abort())
+
+    assert before == (True, False, 5.0), f"Expected a request with 5 seconds left, got {before}."
+    assert after == (True, True, 0.0), f"Expected an abort at the deadline, got {after}."
+
+
+def test_earlier_deadline_wins_between_two_shutdown_requests() -> None:
+    """
+    Arrange: a controller with a clock that the test moves, and a shutdown request with a long grace period.
+    Act: request a shutdown with a shorter grace period, then one with a longer grace period, then one with none.
+    Assert: the time until the abort is the shortest grace period after each request.
+    """
+    controller = ShutdownController(clock=lambda: 100.0)
+    controller.shutdown(grace_period=10.0)
+
+    controller.shutdown(grace_period=2.0)
+    after_shorter = controller.signal.seconds_until_abort()
+    controller.shutdown(grace_period=30.0)
+    after_longer = controller.signal.seconds_until_abort()
+    controller.shutdown()
+    after_none = controller.signal.seconds_until_abort()
+
+    assert (after_shorter, after_longer, after_none) == (2.0, 2.0, 2.0), (
+        f"Expected 2 seconds after each request, got {(after_shorter, after_longer, after_none)}."
+    )
+
+
+def test_signal_without_a_deadline_has_no_time_until_the_abort() -> None:
+    """
+    Arrange: a controller.
+    Act: read the time until the abort before a request, after a request with no grace period, and after an abort.
+    Assert: there is no time before the abort, and the time is zero after it.
+    """
+    controller = ShutdownController()
+
+    before = controller.signal.seconds_until_abort()
+    controller.shutdown()
+    requested = controller.signal.seconds_until_abort()
+    controller.abort()
+    aborted = controller.signal.seconds_until_abort()
+
+    assert (before, requested, aborted) == (None, None, 0.0), (
+        f"Expected no time, no time and zero, got {(before, requested, aborted)}."
+    )
+
+
 def test_first_interrupt_signal_requests_a_graceful_shutdown() -> None:
     """
     Arrange: a chain of two nodes where the first node raises SIGINT.
