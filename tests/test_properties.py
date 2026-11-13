@@ -5,6 +5,7 @@ from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Iterator, Mapping, Sequence
 from contextlib import AbstractContextManager, ExitStack, aclosing, closing, contextmanager
 from dataclasses import dataclass, field, replace
+from datetime import UTC, datetime
 from enum import Enum
 from pathlib import Path
 from tempfile import TemporaryDirectory
@@ -31,6 +32,8 @@ from pregel_redux import (
     Reducer,
     Scope,
     Send,
+    ShutdownController,
+    ShutdownSignal,
     StateGraph,
     StateSnapshot,
     StreamMode,
@@ -151,6 +154,9 @@ class Trace:
     given: dict[str, str] = field(default_factory=dict)
     plain: str | None = None
     fired: list[tuple[tuple[int, ...], Phase]] = field(default_factory=list)
+    shutdowns: set[tuple[int, ...]] = field(default_factory=set)
+    controller: ShutdownController = field(default_factory=ShutdownController)
+    requested: list[datetime] = field(default_factory=list)
     era: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -168,6 +174,15 @@ class Trace:
                 self.fired.append((path, phase))
         if armed:
             raise ConnectionError(path)
+
+    def request_shutdown(self, path: tuple[int, ...]) -> None:
+        with self.lock:
+            armed = path in self.shutdowns
+            if armed:
+                self.shutdowns.remove(path)
+                self.requested.append(datetime.now(UTC))
+        if armed:
+            self.controller.shutdown()
 
     def start_era(self) -> None:
         self.era += 1
@@ -288,6 +303,7 @@ def build_function(spec: GraphSpec, work: FunctionSpec, path: tuple[int, ...], b
             path, trace.era, state.get("origin"), state.get("clock", 0), tuple(state.get("visits", []))
         )
         label = trace.begin(execution)
+        trace.request_shutdown(path)
         trace.fail(path, Phase.start)
         return execution, label
 
@@ -646,13 +662,20 @@ class ThreadMachine(RuleBasedStateMachine):
         )
 
     def collect_stream(
-        self, run_input: State | Command[str] | None, config: ThreadConfig, mode: CallMode, plan: StreamPlan
+        self,
+        run_input: State | Command[str] | None,
+        config: ThreadConfig,
+        mode: CallMode,
+        plan: StreamPlan,
+        signal: ShutdownSignal,
     ) -> list[StreamPart]:
         graph = self.thread.graph
 
         def collect_sync() -> list[StreamPart]:
             taken: list[StreamPart] = []
-            parts = graph.stream(run_input, config, stream_mode=plan.modes, subgraphs=plan.subgraphs, step_limit=1000)
+            parts = graph.stream(
+                run_input, config, stream_mode=plan.modes, subgraphs=plan.subgraphs, step_limit=1000, signal=signal
+            )
             with closing(parts):
                 for part in parts:
                     if len(taken) == plan.stop_after:
@@ -663,7 +686,7 @@ class ThreadMachine(RuleBasedStateMachine):
         match mode:
             case CallMode.asynchronous:
                 parts = graph.astream(
-                    run_input, config, stream_mode=plan.modes, subgraphs=plan.subgraphs, step_limit=1000
+                    run_input, config, stream_mode=plan.modes, subgraphs=plan.subgraphs, step_limit=1000, signal=signal
                 )
                 return self.runner.run(take(parts, plan.stop_after))
             case CallMode.sync:
@@ -693,21 +716,26 @@ class ThreadMachine(RuleBasedStateMachine):
         mode = delivery.mode if self.thread.sync_allowed else CallMode.asynchronous
         trace = self.thread.trace
         fired = len(trace.fired)
+        requested = len(trace.requested)
+        trace.controller = ShutdownController()
+        signal = trace.controller.signal
         known = {item.checkpoint_id for item in self.thread.history}
         result: Finished[State] | Interrupted | None = None
         parts: list[StreamPart] | None = None
         raised: list[BaseException] = []
         try:
             if delivery.stream is not None:
-                parts = self.collect_stream(run_input, config, mode, delivery.stream)
+                parts = self.collect_stream(run_input, config, mode, delivery.stream, signal)
             else:
                 match mode:
                     case CallMode.asynchronous:
-                        result = self.runner.run(graph.ainvoke(run_input, config, step_limit=1000))
+                        result = self.runner.run(graph.ainvoke(run_input, config, step_limit=1000, signal=signal))
                     case CallMode.sync:
-                        result = graph.invoke(run_input, config, step_limit=1000)
+                        result = graph.invoke(run_input, config, step_limit=1000, signal=signal)
                     case CallMode.sync_in_loop:
-                        result = self.runner.run(call_in_loop(lambda: graph.invoke(run_input, config, step_limit=1000)))
+                        result = self.runner.run(
+                            call_in_loop(lambda: graph.invoke(run_input, config, step_limit=1000, signal=signal))
+                        )
                     case _:
                         assert_never(mode)
         except (ConnectionError, ExceptionGroup) as error:
@@ -728,10 +756,28 @@ class ThreadMachine(RuleBasedStateMachine):
                     f"Expected the error of the failed node {name!r} in the tasks {tasks}."
                 )
         self.check_stops(known)
+        self.check_shutdown(trace.requested[requested:])
         if parts is not None and delivery.stream is not None:
             self.check_stream(parts, delivery.stream)
         self.thread.result = result
         return result
+
+    def check_shutdown(self, requests: Sequence[datetime]) -> None:
+        event(f"graceful shutdown in a run: {bool(requests)}")
+        if not requests:
+            return
+        graph = self.thread.graph
+        snapshot = self.runner.run(graph.aget_state(self.config, subgraphs=True))
+        for namespace in ["", *(child.checkpoint_ns for child in find_namespaces(snapshot))]:
+            config = ThreadConfig(thread_id="thread", checkpoint_ns=namespace)
+            later = [
+                item.step
+                for item in self.runner.run(collect(graph.aget_state_history(config)))
+                if item.source is CheckpointSource.loop and item.created_at > requests[0]
+            ]
+            assert len(later) <= 1, (
+                f"Expected the graph {namespace!r} to stop after its current step at a shutdown, got the steps {later}."
+            )
 
     def check_stops(self, known: set[UUID]) -> None:
         thread = self.thread
@@ -857,7 +903,10 @@ class ThreadMachine(RuleBasedStateMachine):
                     target = Send(node.name, ChildInput(origin=tag, clock=0))
                 case _:
                     assert_never(node.work)
+        requested = len(thread.trace.requested)
         result = self.deliver(Command(goto=target), self.config, delivery)
+        if len(thread.trace.requested) > requested:
+            return
 
         executions = list(thread.trace.executions.values())
         now = sum(execution.path[0] == index for execution in executions)
@@ -875,6 +924,11 @@ class ThreadMachine(RuleBasedStateMachine):
         checkpoint_id = history[data.draw(st.integers(min_value=0)) % len(history)].checkpoint_id
         self.thread.diverge()
         self.deliver(None, ThreadConfig(thread_id="thread", checkpoint_id=checkpoint_id), delivery)
+
+    @rule(data=st.data())
+    def arm_shutdowns(self, data: st.DataObject) -> None:
+        paths = st.sampled_from(find_function_paths(self.thread.spec))
+        self.thread.trace.shutdowns.update(data.draw(st.sets(paths, min_size=1)))
 
     @rule(data=st.data())
     def arm_faults(self, data: st.DataObject) -> None:
@@ -987,6 +1041,7 @@ class ThreadMachine(RuleBasedStateMachine):
                 snapshot.interrupts,
                 len(thread.trace.fired),
                 len(thread.trace.consumed),
+                len(thread.trace.shutdowns),
             )
             answers = {item.id: thread.make_text("") for item in snapshot.interrupts}
             thread.trace.given.update({read_question(item): answers[item.id] for item in snapshot.interrupts})
@@ -994,7 +1049,13 @@ class ThreadMachine(RuleBasedStateMachine):
             if isinstance(result, Finished):
                 break
             snapshot = self.runner.run(thread.graph.aget_state(self.config))
-            now = (snapshot.checkpoint_id, snapshot.interrupts, len(thread.trace.fired), len(thread.trace.consumed))
+            now = (
+                snapshot.checkpoint_id,
+                snapshot.interrupts,
+                len(thread.trace.fired),
+                len(thread.trace.consumed),
+                len(thread.trace.shutdowns),
+            )
             assert now != progress, f"Expected a run with all answers to change the thread, got {result} again."
 
         visits = result.output.get("visits", [])

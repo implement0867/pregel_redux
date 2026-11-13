@@ -1,6 +1,7 @@
 import asyncio
 import inspect
 import threading
+import time
 from collections import ChainMap
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Coroutine, Generator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -56,6 +57,7 @@ from pregel_redux.pregel import (
     plan_tasks,
 )
 from pregel_redux.settings import RunSettings
+from pregel_redux.shutdown import RunAborted, ShutdownController, ShutdownSignal
 from pregel_redux.snapshots import StateSnapshot
 from pregel_redux.streams import (
     CheckpointPart,
@@ -80,6 +82,7 @@ class Run:
     step_limit: int
     resume: ResumeInput
     stream: Stream
+    shutdown: ShutdownSignal
 
 
 @dataclass(frozen=True)
@@ -255,6 +258,41 @@ def iterate_in_new_loop[ItemT](start: Callable[[], AsyncIterator[ItemT]]) -> Gen
         work.result()
 
 
+async def run_until_abort[ResultT](shutdown: ShutdownSignal, work: Coroutine[object, object, ResultT]) -> ResultT:
+    if shutdown.aborted:
+        work.close()
+        raise RunAborted("the shutdown signal of the run is aborted")
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(work)
+    timers: list[asyncio.TimerHandle] = []
+    aborting = False
+
+    def abort() -> None:
+        nonlocal aborting
+        aborting = True
+        task.cancel()
+
+    def react() -> None:
+        if shutdown.aborted:
+            abort()
+        elif shutdown.deadline is not None:
+            timers.append(loop.call_later(shutdown.deadline - time.monotonic(), abort))
+
+    unsubscribe = shutdown.subscribe(lambda: loop.call_soon_threadsafe(react))
+    react()
+    try:
+        return await task
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if not aborting or (current is not None and current.cancelling()):
+            raise
+        raise RunAborted("the run was aborted by its shutdown signal") from None
+    finally:
+        unsubscribe()
+        for timer in timers:
+            timer.cancel()
+
+
 async def stream_run[ResultT](
     start_run: Callable[[Callable[[StreamPart], None]], Coroutine[object, object, ResultT]],
 ) -> AsyncGenerator[StreamPart]:
@@ -293,7 +331,16 @@ class CompiledGraph[StateT, InputT, OutputT]:
 
     async def run_without_thread(self, input: InputT, step_limit: int | None, stream: Stream) -> OutputT:
         start = self.feed(self.open({}), extract_writes(input))
-        result = await self.run(start, step_limit, NoJournal((), 0), ResumeInput([], {}), stream, {}, resumed=False)
+        result = await self.run(
+            start,
+            step_limit,
+            NoJournal((), 0),
+            ResumeInput([], {}),
+            stream,
+            {},
+            ShutdownController().signal,
+            resumed=False,
+        )
         match result:
             case Finished():
                 return result.output
@@ -312,12 +359,13 @@ class CompiledGraph[StateT, InputT, OutputT]:
         resume: ResumeInput,
         stream: Stream,
         provided: dict[Depends, object],
+        shutdown: ShutdownSignal,
         *,
         resumed: bool,
     ) -> Finished[OutputT] | Interrupted:
         limit = RunSettings().step_limit if step_limit is None else step_limit
         async with AsyncExitStack() as run_exits:
-            run = Run(provided, run_exits, asyncio.Lock(), limit, resume, stream)
+            run = Run(provided, run_exits, asyncio.Lock(), limit, resume, stream, shutdown)
             return await self.run_steps(position, run, journal, resumed=resumed)
 
     @overload
@@ -511,6 +559,8 @@ class CompiledGraph[StateT, InputT, OutputT]:
             calls = [self.build_call(task, position) for task in tasks]
             names = {call.task.node for call in calls}
             if not skip_interrupt_before and not names.isdisjoint(self.interrupt_before):
+                return self.stop(position, run, journal, ())
+            if run.shutdown.requested and names != {Endpoint.start}:
                 return self.stop(position, run, journal, ())
             skip_interrupt_before = False
             if names != {Endpoint.start}:

@@ -49,6 +49,7 @@ from pregel_redux.graph.compiled import (
     name_task,
     refer_task,
     run_in_new_loop,
+    run_until_abort,
     stream_run,
 )
 from pregel_redux.interrupts import Finished, Interrupt, Interrupted, ResumeInput, Scratchpad
@@ -77,6 +78,7 @@ from pregel_redux.pregel import (
     finish_channels,
     plan_tasks,
 )
+from pregel_redux.shutdown import ShutdownController, ShutdownSignal, read_shutdown
 from pregel_redux.snapshots import PullPath, PushPath, StateSnapshot, TaskSnapshot
 from pregel_redux.streams import (
     CheckpointPart,
@@ -595,11 +597,29 @@ class PersistentGraph[StateT, InputT, OutputT]:
         config: ThreadConfig,
         step_limit: int | None,
         stream: Stream,
+        signal: ShutdownSignal | None,
+    ) -> Finished[OutputT] | Interrupted:
+        shutdown = ShutdownController().signal if signal is None else signal
+        return await run_until_abort(
+            shutdown, self.run_thread(checkpointer, input, config, step_limit, stream, shutdown)
+        )
+
+    async def run_thread(
+        self,
+        checkpointer: AsyncCheckpointer,
+        input: InputT | Command[str] | None,
+        config: ThreadConfig,
+        step_limit: int | None,
+        stream: Stream,
+        shutdown: ShutdownSignal,
     ) -> Finished[OutputT] | Interrupted:
         start = await self.start(checkpointer, input, config)
-        provided: dict[Depends, object] = {Depends(read_config, scope=scope): config for scope in Scope}
+        provided: dict[Depends, object] = {
+            **{Depends(read_config, scope=scope): config for scope in Scope},
+            **{Depends(read_shutdown, scope=scope): shutdown for scope in Scope},
+        }
         return await self.graph.run(
-            start.position, step_limit, start.journal, start.resume, stream, provided, resumed=start.resumed
+            start.position, step_limit, start.journal, start.resume, stream, provided, shutdown, resumed=start.resumed
         )
 
     async def ainvoke(
@@ -608,9 +628,10 @@ class PersistentGraph[StateT, InputT, OutputT]:
         config: ThreadConfig,
         *,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> Finished[OutputT] | Interrupted:
         stream = Stream(frozenset(), subgraphs=False, emit=lambda part: None)
-        return await self.run(self.checkpointer, input, config, step_limit, stream)
+        return await self.run(self.checkpointer, input, config, step_limit, stream, signal)
 
     def invoke(
         self,
@@ -618,11 +639,12 @@ class PersistentGraph[StateT, InputT, OutputT]:
         config: ThreadConfig,
         *,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> Finished[OutputT] | Interrupted:
         self.graph.reject_async_nodes("ainvoke")
         stream = Stream(frozenset(), subgraphs=False, emit=lambda part: None)
         checkpointer = ThreadedCheckpointer(self.checkpointer)
-        return run_in_new_loop(lambda: self.run(checkpointer, input, config, step_limit, stream))
+        return run_in_new_loop(lambda: self.run(checkpointer, input, config, step_limit, stream, signal))
 
     @overload
     def astream(
@@ -633,6 +655,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.values],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> AsyncGenerator[ValuesPart]: ...
     @overload
     def astream(
@@ -643,6 +666,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.updates],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> AsyncGenerator[UpdatesPart | InterruptsPart]: ...
     @overload
     def astream(
@@ -653,6 +677,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.custom],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> AsyncGenerator[CustomPart]: ...
     @overload
     def astream(
@@ -663,6 +688,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.tasks],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> AsyncGenerator[TaskStartPart | TaskResultPart]: ...
     @overload
     def astream(
@@ -673,6 +699,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.checkpoints],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> AsyncGenerator[CheckpointPart]: ...
     @overload
     def astream(
@@ -683,6 +710,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: Collection[StreamMode],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> AsyncGenerator[StreamPart]: ...
     def astream(
         self,
@@ -692,6 +720,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: StreamMode | Collection[StreamMode],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> AsyncGenerator[StreamPart]:
         modes = frozenset([stream_mode] if isinstance(stream_mode, StreamMode) else stream_mode)
         return stream_run(
@@ -701,6 +730,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
                 config,
                 step_limit,
                 Stream(modes, subgraphs=subgraphs, emit=emit),
+                signal,
             )
         )
 
@@ -713,6 +743,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.values],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> Generator[ValuesPart]: ...
     @overload
     def stream(
@@ -723,6 +754,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.updates],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> Generator[UpdatesPart | InterruptsPart]: ...
     @overload
     def stream(
@@ -733,6 +765,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.custom],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> Generator[CustomPart]: ...
     @overload
     def stream(
@@ -743,6 +776,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.tasks],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> Generator[TaskStartPart | TaskResultPart]: ...
     @overload
     def stream(
@@ -753,6 +787,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: Literal[StreamMode.checkpoints],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> Generator[CheckpointPart]: ...
     @overload
     def stream(
@@ -763,6 +798,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: Collection[StreamMode],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> Generator[StreamPart]: ...
     def stream(
         self,
@@ -772,6 +808,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream_mode: StreamMode | Collection[StreamMode],
         subgraphs: bool = False,
         step_limit: int | None = None,
+        signal: ShutdownSignal | None = None,
     ) -> Generator[StreamPart]:
         self.graph.reject_async_nodes("astream")
         modes = frozenset([stream_mode] if isinstance(stream_mode, StreamMode) else stream_mode)
@@ -784,6 +821,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
                     config,
                     step_limit,
                     Stream(modes, subgraphs=subgraphs, emit=emit),
+                    signal,
                 )
             )
         )
