@@ -561,7 +561,8 @@ class CompiledGraph[StateT, InputT, OutputT]:
             if not skip_interrupt_before and not names.isdisjoint(self.interrupt_before):
                 return self.stop(position, run, journal, ())
             if run.shutdown.requested and names != {Endpoint.start}:
-                return self.stop(position, run, journal, ())
+                snapshot = await journal.read_snapshot()
+                return self.stop(position, run, journal, () if snapshot is None else snapshot.interrupts)
             skip_interrupt_before = False
             if names != {Endpoint.start}:
                 if steps == run.step_limit:

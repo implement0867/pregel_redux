@@ -19,6 +19,7 @@ from pregel_redux import (
     StateGraph,
     StreamMode,
     graceful_shutdown,
+    interrupt,
     read_shutdown,
 )
 from tests.conftest import collect, join_lists
@@ -163,6 +164,32 @@ def test_run_with_a_signal_that_already_requests_a_shutdown_runs_no_node() -> No
 
     assert stopped == Interrupted((), {"notes": ["input"]}), f"Expected a stop with the input, got {stopped}."
     assert calls == [], f"Expected no node to run, got {calls}."
+
+
+def test_graceful_shutdown_before_a_step_reports_the_questions_that_wait() -> None:
+    """
+    Arrange: a thread where a node waits for the answer to a question, and a controller with a shutdown request.
+    Act: run the thread again without an input and with the signal.
+    Assert: the stop has the question that waits, the same as the state of the thread.
+    """
+    controller = ShutdownController()
+    controller.shutdown()
+
+    def ask(state: State) -> State:
+        return {"notes": [interrupt("question", response_schema=str)]}
+
+    builder = StateGraph(State)
+    builder.add_node("ask", ask)
+    builder.add_edge(Endpoint.start, "ask")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    asked = graph.invoke({}, {"thread_id": "thread"})
+
+    stopped = graph.invoke(None, {"thread_id": "thread"}, signal=controller.signal)
+
+    waiting = graph.get_state({"thread_id": "thread"}).interrupts
+    assert isinstance(asked, Interrupted), f"Expected a question in the first run, got {asked}."
+    assert isinstance(stopped, Interrupted), f"Expected a stop, got {stopped}."
+    assert stopped.interrupts == asked.interrupts == waiting, f"Expected the question {waiting}, got {stopped}."
 
 
 def test_abort_stops_a_node_at_once_and_runs_the_cleanup() -> None:
