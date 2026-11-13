@@ -362,7 +362,7 @@ class ThreadScope:
         self,
         journal: "ThreadJournal",
         task: TaskRef,
-        interrupts: Mapping[str, tuple[Interrupt, ...]],
+        stops: Mapping[str, TaskInterruptRecord],
         *,
         subgraphs: bool,
     ) -> TaskSnapshot:
@@ -374,13 +374,16 @@ class ThreadScope:
             waiting: tuple[Interrupt, ...] = ()
         elif child is not None:
             waiting = child.interrupts
+        elif task_id in stops:
+            waiting = stops[task_id].interrupts
         else:
-            waiting = interrupts.get(task_id, ())
+            waiting = ()
         return TaskSnapshot(
             id=task_id,
             name=name,
             path=PullPath(name) if task.send_index is None else PushPath(task.send_index),
             interrupts=waiting,
+            error=stops[task_id].error if writes is None and task_id in stops else None,
             result=None if writes is None else writes.fields,
             state=child if subgraphs else None,
         )
@@ -389,10 +392,8 @@ class ThreadScope:
         position = self.read_position(saved)
         journal = self.open_journal(saved)
         refs = [refer_task(task) for task in plan_tasks(position, self.graph.triggers)]
-        interrupts = {
-            write.task_id: write.interrupts for write in saved.pending_writes if isinstance(write, TaskInterruptRecord)
-        }
-        tasks = tuple([await self.read_task_snapshot(journal, ref, interrupts, subgraphs=subgraphs) for ref in refs])
+        stops = {write.task_id: write for write in saved.pending_writes if isinstance(write, TaskInterruptRecord)}
+        tasks = tuple([await self.read_task_snapshot(journal, ref, stops, subgraphs=subgraphs) for ref in refs])
         return StateSnapshot(
             values=position.channels.read_values(),
             next=tuple(task.name for task in tasks),
@@ -457,6 +458,18 @@ class ThreadJournal:
     ) -> None:
         await self.put_write(
             TaskInterruptRecord(task_id=self.make_task_id(task), interrupts=tuple(interrupts), resume=tuple(resume))
+        )
+
+    async def record_failure(self, task: TaskRef, resume: Sequence[JsonValue], error: str, *, answered: bool) -> None:
+        task_id = self.make_task_id(task)
+        waiting = [
+            interrupt
+            for write in self.pending
+            if isinstance(write, TaskInterruptRecord) and write.task_id == task_id and not answered
+            for interrupt in write.interrupts
+        ]
+        await self.put_write(
+            TaskInterruptRecord(task_id=task_id, interrupts=tuple(waiting), resume=tuple(resume), error=error)
         )
 
     def find_writes(self, task: TaskRef) -> TaskWrites | None:

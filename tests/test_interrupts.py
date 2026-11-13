@@ -453,7 +453,7 @@ def test_failure_before_a_question_keeps_the_question_waiting() -> None:
     """
     Arrange: a thread in which a node waits for an answer, and the node fails before its question in the next run.
     Act: run the thread again without an answer, and read the state after the failure.
-    Assert: the state has the same waiting interrupt, because the question has no answer.
+    Assert: the state has the same waiting interrupt, because the question has no answer, and the error.
     """
     runs: list[str] = []
 
@@ -472,10 +472,12 @@ def test_failure_before_a_question_keeps_the_question_waiting() -> None:
     with pytest.raises(ConnectionError):
         asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
 
-    actual = asyncio.run(graph.aget_state({"thread_id": "thread"})).interrupts
+    state = asyncio.run(graph.aget_state({"thread_id": "thread"}))
+    errors = [task.error for task in state.tasks]
 
     assert [item.value for item in expected] == ["question"], f"Expected one waiting question, got {expected}."
-    assert actual == expected, f"Expected the waiting interrupts {expected}, got {actual}."
+    assert state.interrupts == expected, f"Expected the waiting interrupts {expected}, got {state.interrupts}."
+    assert errors == ["ConnectionError()"], f"Expected the error of the failed task, got {errors}."
 
 
 def test_plain_answer_goes_to_the_one_interrupt_that_waits() -> None:

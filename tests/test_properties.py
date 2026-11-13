@@ -150,7 +150,7 @@ class Trace:
     consumed: set[str] = field(default_factory=set)
     given: dict[str, str] = field(default_factory=dict)
     plain: str | None = None
-    fired: list[tuple[int, ...]] = field(default_factory=list)
+    fired: list[tuple[tuple[int, ...], Phase]] = field(default_factory=list)
     era: int = 0
     lock: threading.Lock = field(default_factory=threading.Lock)
 
@@ -165,7 +165,7 @@ class Trace:
             armed = self.faults.get(path) is phase
             if armed:
                 del self.faults[path]
-                self.fired.append(path)
+                self.fired.append((path, phase))
         if armed:
             raise ConnectionError(path)
 
@@ -714,12 +714,19 @@ class ThreadMachine(RuleBasedStateMachine):
             raised = find_errors(error)
             if not any(isinstance(item, ConnectionError) for item in raised):
                 raise
-        failed = set(trace.fired[fired:])
+        failed = {path for path, _ in trace.fired[fired:]}
         reported = {item.args[0] for item in raised if isinstance(item, ConnectionError)}
         event(f"failures in one run: {min(len(failed), 2)}")
         assert reported <= failed, f"Expected only the errors of the failures {failed}, got {reported}."
         if delivery.stream is None or delivery.stream.stop_after is None:
             assert reported == failed, f"Expected the errors of all failures {failed}, got {reported}."
+        if delivery.stream is None or delivery.stream.stop_after is None:
+            tasks = self.runner.run(graph.aget_state(self.config)).tasks
+            for path, phase in trace.fired[fired:]:
+                name = self.thread.spec.nodes[path[0]].name
+                assert phase is Phase.cleanup or any(task.name == name and task.error is not None for task in tasks), (
+                    f"Expected the error of the failed node {name!r} in the tasks {tasks}."
+                )
         self.check_stops(known)
         if parts is not None and delivery.stream is not None:
             self.check_stream(parts, delivery.stream)

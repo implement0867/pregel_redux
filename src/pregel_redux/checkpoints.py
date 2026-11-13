@@ -56,6 +56,7 @@ class TaskInterruptRecord(Record):
     task_id: str
     interrupts: tuple[Interrupt, ...]
     resume: tuple[JsonValue, ...]
+    error: str | None = None
 
 
 class RunCommandRecord(Record):

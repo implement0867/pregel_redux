@@ -141,6 +141,9 @@ class Journal(Protocol):
     async def record_interrupt(
         self, task: TaskRef, interrupts: Sequence[Interrupt], resume: Sequence[JsonValue]
     ) -> None: ...
+    async def record_failure(
+        self, task: TaskRef, resume: Sequence[JsonValue], error: str, *, answered: bool
+    ) -> None: ...
     def find_writes(self, task: TaskRef) -> TaskWrites | None: ...
     def make_task_id(self, task: TaskRef) -> str: ...
     async def read_snapshot(self) -> StateSnapshot | None: ...
@@ -178,6 +181,9 @@ class NoJournal:
     async def record_interrupt(
         self, task: TaskRef, interrupts: Sequence[Interrupt], resume: Sequence[JsonValue]
     ) -> None:
+        pass
+
+    async def record_failure(self, task: TaskRef, resume: Sequence[JsonValue], error: str, *, answered: bool) -> None:
         pass
 
     def find_writes(self, task: TaskRef) -> TaskWrites | None:
@@ -583,6 +589,14 @@ class CompiledGraph[StateT, InputT, OutputT]:
             await finish_despite_cancellation(journal.record_interrupt(call.task, stop.interrupts, scratchpad.resume))
             run.stream.send(StreamMode.tasks, TaskResultPart(journal.ns, task_id, str(name), {}, stop.interrupts))
             return TaskInterrupted(stop.interrupts)
+        except Exception as error:
+            ended = True
+            await finish_despite_cancellation(
+                journal.record_failure(
+                    call.task, scratchpad.resume, repr(error), answered=len(scratchpad.resume) > saved_answers
+                )
+            )
+            raise
         finally:
             if not ended and len(scratchpad.resume) > saved_answers:
                 await finish_despite_cancellation(journal.record_interrupt(call.task, (), scratchpad.resume))

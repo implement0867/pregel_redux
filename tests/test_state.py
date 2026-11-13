@@ -717,3 +717,59 @@ def test_state_update_after_a_failed_step_keeps_the_writes_of_the_finished_node(
 
     expected = {"notes": ["finished", "update"]}
     assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+def test_state_after_a_failure_has_the_error_of_the_failed_task() -> None:
+    """
+    Arrange: a thread whose step has a node that finished and a node that failed.
+    Act: read the state after the failure.
+    Assert: the task of the failed node has the error, and the task of the finished node has none.
+    """
+    calls: list[str] = []
+
+    def fail(state: State) -> State:
+        raise ConnectionError("no network")
+
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("finished", build_writer("finished", calls))
+    builder.add_node("failed", fail)
+    builder.add_edge(Endpoint.start, "finished")
+    builder.add_edge(Endpoint.start, "failed")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    config = ThreadConfig(thread_id="thread")
+    with pytest.raises(ConnectionError):
+        graph.invoke({}, config)
+
+    actual = {task.name: task.error for task in graph.get_state(config).tasks}
+
+    expected = {"failed": "ConnectionError('no network')", "finished": None}
+    assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+def test_error_of_a_task_is_removed_when_the_task_asks_a_question_in_the_next_run() -> None:
+    """
+    Arrange: a thread whose node failed in the first run and asks a question in the second run.
+    Act: read the state after the second run.
+    Assert: the task has the waiting question and no error.
+    """
+    runs: list[str] = []
+
+    def fail_then_ask(state: State) -> State:
+        runs.append("run")
+        if len(runs) == 1:
+            raise ConnectionError
+        return State(notes=[interrupt("question", response_schema=str)])
+
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("ask", fail_then_ask)
+    builder.add_edge(Endpoint.start, "ask")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    config = ThreadConfig(thread_id="thread")
+    with pytest.raises(ConnectionError):
+        graph.invoke({}, config)
+    graph.invoke(None, config)
+
+    actual = [([item.value for item in task.interrupts], task.error) for task in graph.get_state(config).tasks]
+
+    expected = [(["question"], None)]
+    assert actual == expected, f"Expected {expected}, got {actual}."

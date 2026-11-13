@@ -23,6 +23,7 @@ class TaskSnapshot:
     name: str
     path: PullPath | PushPath
     interrupts: tuple[Interrupt, ...]
+    error: str | None
     result: Mapping[str, object] | None
     state: "StateSnapshot | None"
 
