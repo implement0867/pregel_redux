@@ -16,7 +16,7 @@ from pregel_redux import (
     StateGraph,
     interrupt,
 )
-from tests.conftest import join_lists
+from tests.conftest import join_lists, read_error
 
 
 class State(TypedDict, total=False):
@@ -473,7 +473,7 @@ def test_failure_before_a_question_keeps_the_question_waiting() -> None:
         asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
 
     state = asyncio.run(graph.aget_state({"thread_id": "thread"}))
-    errors = [task.error for task in state.tasks]
+    errors = [read_error(task) for task in state.tasks]
 
     assert [item.value for item in expected] == ["question"], f"Expected one waiting question, got {expected}."
     assert state.interrupts == expected, f"Expected the waiting interrupts {expected}, got {state.interrupts}."

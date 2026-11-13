@@ -22,7 +22,7 @@ from pregel_redux import (
     ThreadConfig,
     interrupt,
 )
-from tests.conftest import join_lists
+from tests.conftest import join_lists, read_error
 
 
 class State(TypedDict, total=False):
@@ -227,7 +227,7 @@ def test_abort_after_an_answer_keeps_the_error_of_the_task() -> None:
     with pytest.raises(RunAborted):
         asyncio.run(graph.ainvoke(Command(resume="yes"), config, signal=controller.signal))
 
-    errors = [task.error for task in asyncio.run(graph.aget_state(config)).tasks]
+    errors = [read_error(task) for task in asyncio.run(graph.aget_state(config)).tasks]
 
     assert errors == ["ConnectionError('first run')"], f"Expected the error of the first run, got {errors}."
 
@@ -273,8 +273,8 @@ def test_graceful_stop_of_a_child_graph_keeps_the_error_of_its_task() -> None:
     state = asyncio.run(graph.aget_state(config, subgraphs=True))
 
     task = next(task for task in state.tasks if task.name == "child")
-    inner = [] if task.state is None else [item.error for item in task.state.tasks]
+    inner = [] if task.state is None else [read_error(item) for item in task.state.tasks]
     assert isinstance(stopped, Interrupted), f"Expected a graceful stop, got {stopped}."
     assert runs.count("fail") == 1, f"Expected the failed node of the child graph not to run again, got {runs}."
     assert inner == ["ConnectionError('no network')"], f"Expected the error in the child graph, got {inner}."
-    assert task.error == "ConnectionError('no network')", f"Expected the error of the child task, got {task.error}."
+    assert read_error(task) == "ConnectionError('no network')", f"Expected the error of the child task, got {task}."

@@ -17,7 +17,6 @@ from pregel_redux.configs import ThreadConfig, parse_run_target, parse_state_add
 from pregel_redux.dependencies import Depends, Scope
 from pregel_redux.graph.adapters import iterate_in_new_loop, run_in_new_loop, stream_run
 from pregel_redux.graph.compiled import CompiledGraph
-from pregel_redux.graph.task_refs import refer_task
 from pregel_redux.graph.threads import ThreadJournal, ThreadScope, find_graph, infer_writer
 from pregel_redux.interrupts import Finished, Interrupted, ResumeInput
 from pregel_redux.pregel import (
@@ -44,6 +43,7 @@ from pregel_redux.streams import (
     UpdatesPart,
     ValuesPart,
 )
+from pregel_redux.task_refs import refer_task
 
 
 @dataclass(frozen=True)

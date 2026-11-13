@@ -12,7 +12,7 @@ from pydantic import JsonValue, TypeAdapter
 
 from pregel_redux.channels import Channel, extract_writes, parse_updates
 from pregel_redux.checkpoints import CheckpointSource
-from pregel_redux.commands import Endpoint, Send, read_outcome
+from pregel_redux.commands import Send, read_outcome
 from pregel_redux.dependencies import (
     CallPlan,
     Depends,
@@ -23,7 +23,6 @@ from pregel_redux.dependencies import (
     open_providers,
 )
 from pregel_redux.graph.adapters import iterate_in_new_loop, run_in_new_loop, stream_run
-from pregel_redux.graph.task_refs import NodeCall, TaskRef, name_task, refer_task
 from pregel_redux.interrupts import (
     Finished,
     GraphInterrupt,
@@ -70,6 +69,7 @@ from pregel_redux.streams import (
     ValuesPart,
     current_stream_writer,
 )
+from pregel_redux.task_refs import NodeCall, PullRef, PushRef, StartRef, TaskRef, name_task, refer_task
 
 
 @dataclass(frozen=True)
@@ -124,11 +124,11 @@ class NoJournal:
         return None
 
     def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad:
-        return Scratchpad(str(task.node), [], resume, 0)
+        return Scratchpad(task.name, [], resume, 0)
 
     async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> ChildEntry:
         start = child.feed(child.open(extract_writes(call.node_input)), {})
-        child_ns = (*self.ns, f"{call.task.node}:{self.make_task_id(call.task)}")
+        child_ns = (*self.ns, f"{call.task.name}:{self.make_task_id(call.task)}")
         return ChildEntry(start, NoJournal(child_ns, 0), resumed=False)
 
 
@@ -420,15 +420,16 @@ class CompiledGraph[StateT, InputT, OutputT]:
             await self.send_checkpoint(run, journal)
         while tasks := plan_tasks(position, self.triggers):
             calls = [self.build_call(task, position) for task in tasks]
-            names = {call.task.node for call in calls}
+            names = {call.task.name for call in calls}
+            runs_nodes = any(not isinstance(task, StartTask) for task in tasks)
             if not skip_interrupt_before and not names.isdisjoint(self.interrupt_before):
                 return self.stop(position, run, journal, (), StopReason.breakpoint)
-            if run.shutdown.requested and names != {Endpoint.start}:
+            if run.shutdown.requested and runs_nodes:
                 snapshot = await journal.read_snapshot()
                 waiting = () if snapshot is None else snapshot.interrupts
                 return self.stop(position, run, journal, waiting, StopReason.shutdown)
             skip_interrupt_before = False
-            if names != {Endpoint.start}:
+            if runs_nodes:
                 if steps == run.step_limit:
                     raise RuntimeError(f"the graph did not finish within {run.step_limit} steps")
                 steps += 1
@@ -494,9 +495,16 @@ class CompiledGraph[StateT, InputT, OutputT]:
         scratchpad = journal.open_scratchpad(call.task, run.resume)
         current_scratchpad.set(scratchpad)
         current_stream_writer.set(lambda data: run.stream.send(StreamMode.custom, CustomPart(journal.ns, data)))
-        name = call.task.node
+        name = call.task.name
         task_id = journal.make_task_id(call.task)
-        if isinstance(name, str):
+        match call.task:
+            case StartRef():
+                is_node = False
+            case PullRef() | PushRef():
+                is_node = True
+            case _:
+                assert_never(call.task)
+        if is_node:
             run.stream.send(StreamMode.tasks, TaskStartPart(journal.ns, task_id, name, call.node_input))
         saved_answers = len(scratchpad.resume)
         try:
@@ -512,7 +520,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         match outcome:
             case TaskWrites():
                 await journal.record(call.task, outcome)
-                if isinstance(name, str):
+                if is_node:
                     run.stream.send(StreamMode.updates, UpdatesPart(journal.ns, name, outcome.fields))
                     run.stream.send(StreamMode.tasks, TaskResultPart(journal.ns, task_id, name, outcome.fields, ()))
                 return outcome
@@ -520,7 +528,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
                 return TaskStopped(outcome.interrupts, outcome.reason)
             case Interrupted():
                 await journal.record_waiting(call.task, outcome.interrupts)
-                part = TaskResultPart(journal.ns, task_id, str(name), {}, outcome.interrupts)
+                part = TaskResultPart(journal.ns, task_id, name, {}, outcome.interrupts)
                 run.stream.send(StreamMode.tasks, part)
                 return TaskStopped(outcome.interrupts, outcome.reason)
             case _:
@@ -529,12 +537,12 @@ class CompiledGraph[StateT, InputT, OutputT]:
     async def run_node(
         self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack
     ) -> TaskWrites | Interrupted:
-        match call.task.node:
-            case Endpoint.start:
+        match call.task:
+            case StartRef():
                 return TaskWrites(
                     parse_updates(self.channels, extract_writes(call.node_input)), self.entry_nodes, (), ()
                 )
-            case str() as name:
+            case PullRef(name=name) | PushRef(name=name):
                 action = self.nodes[name].action
                 match action:
                     case CallPlan():
@@ -552,7 +560,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
                     case _:
                         assert_never(action)
             case _:
-                assert_never(call.task.node)
+                assert_never(call.task)
 
     def read_writes(self, name: str, result: object) -> TaskWrites:
         node = self.nodes[name]

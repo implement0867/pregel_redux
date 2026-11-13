@@ -9,6 +9,7 @@ from pregel_redux.dependencies import CallPlan, plan_call
 from pregel_redux.graph.compiled import CompiledGraph, CompiledNode
 from pregel_redux.graph.persistent import PersistentGraph
 from pregel_redux.pregel import BranchKey, JoinKey
+from pregel_redux.task_refs import StartRef
 
 type Node[InputT] = Callable[Concatenate[InputT, ...], object]
 
@@ -78,7 +79,7 @@ class StateGraph[StateT, InputT, OutputT]:
     ) -> None:
         if name in self.nodes or name in self.child_graphs:
             raise ValueError(f"node {name!r} is already in this graph")
-        if name == "__start__":
+        if name == StartRef().name:
             raise ValueError(f"node name {name!r} is the name of the start task in a state snapshot")
         reserved = sorted(set(name) & {"|", ":"})
         if reserved:

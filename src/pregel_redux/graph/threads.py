@@ -1,6 +1,7 @@
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime
+from typing import assert_never
 from uuid import UUID, uuid5
 
 from pydantic import JsonValue
@@ -34,7 +35,6 @@ from pregel_redux.graph.conversion import (
     load_writes,
     make_checkpoint_id,
 )
-from pregel_redux.graph.task_refs import NodeCall, TaskRef, name_task, refer_task
 from pregel_redux.interrupts import Interrupt, ResumeInput, Scratchpad, make_interrupt_id
 from pregel_redux.pregel import (
     Position,
@@ -42,7 +42,16 @@ from pregel_redux.pregel import (
     apply_command,
     plan_tasks,
 )
-from pregel_redux.snapshots import PullPath, PushPath, StateSnapshot, TaskSnapshot
+from pregel_redux.snapshots import (
+    FailedTask,
+    FinishedTask,
+    PendingTask,
+    StateSnapshot,
+    TaskSnapshot,
+    TaskStatus,
+    WaitingTask,
+)
+from pregel_redux.task_refs import NodeCall, PullRef, PushRef, StartRef, TaskRef, name_task, refer_task
 
 
 @dataclass(frozen=True)
@@ -105,7 +114,13 @@ class ThreadScope:
         return OpenedRun(position, ThreadJournal(self, CheckpointTuple(checkpoint=fork, pending_writes=()), fork.id))
 
     async def read_child_snapshot(self, journal: "ThreadJournal", task: TaskRef) -> "StateSnapshot | None":
-        child = self.graph.nodes[task.node].action if isinstance(task.node, str) else None
+        match task:
+            case StartRef():
+                return None
+            case PullRef() | PushRef():
+                child = self.graph.nodes[task.name].action
+            case _:
+                assert_never(task)
         if not isinstance(child, CompiledGraph):
             return None
         scope = ThreadScope(child, self.checkpointer, self.thread_id, journal.make_task_ns(task))
@@ -113,31 +128,28 @@ class ThreadScope:
         return None if saved is None else await scope.read_snapshot(saved, subgraphs=True)
 
     async def read_task_snapshot(self, journal: "ThreadJournal", task: TaskRef, *, subgraphs: bool) -> TaskSnapshot:
-        task_id = journal.make_task_id(task)
-        name = str(task.node) if isinstance(task.node, str) else "__start__"
         writes = journal.find_writes(task)
         child = await self.read_child_snapshot(journal, task) if subgraphs or writes is None else None
-        stop = journal.find_stop(task)
+        status: TaskStatus
         if writes is not None:
-            waiting: tuple[Interrupt, ...] = ()
-        elif child is not None:
-            waiting = child.interrupts
+            status = FinishedTask(writes.fields)
         else:
-            waiting = journal.find_waiting(task)
-        match stop:
-            case TaskFailed(error=failure) if writes is None:
-                error = failure
-            case _:
-                error = None
-        return TaskSnapshot(
-            id=task_id,
-            name=name,
-            path=PullPath(name) if task.send_index is None else PushPath(task.send_index),
-            interrupts=waiting,
-            error=error,
-            result=None if writes is None else writes.fields,
-            state=child if subgraphs else None,
-        )
+            waiting = journal.find_waiting(task) if child is None else child.interrupts
+            stop = journal.find_stop(task)
+            match stop:
+                case TaskFailed():
+                    status = FailedTask(stop.error, waiting)
+                case TaskWaiting() | None:
+                    match waiting:
+                        case ():
+                            status = PendingTask()
+                        case (first, *rest):
+                            status = WaitingTask((first, *rest))
+                        case _:
+                            raise TypeError(f"the waiting interrupts {waiting!r} are not a tuple")
+                case _:
+                    assert_never(stop)
+        return TaskSnapshot(id=journal.make_task_id(task), path=task, status=status, state=child if subgraphs else None)
 
     async def read_snapshot(self, saved: CheckpointTuple, *, subgraphs: bool) -> "StateSnapshot":
         position = self.read_position(saved)
@@ -146,7 +158,6 @@ class ThreadScope:
         tasks = tuple([await self.read_task_snapshot(journal, ref, subgraphs=subgraphs) for ref in refs])
         return StateSnapshot(
             values=position.channels.read_values(),
-            next=tuple(task.name for task in tasks),
             checkpoint_ns=self.checkpoint_ns,
             checkpoint_id=saved.checkpoint.id,
             parent_id=saved.checkpoint.parent_id,
@@ -154,7 +165,6 @@ class ThreadScope:
             step=saved.checkpoint.step,
             source=saved.checkpoint.source,
             tasks=tasks,
-            interrupts=tuple(item for task in tasks for item in task.interrupts),
         )
 
 
@@ -189,7 +199,7 @@ class ThreadJournal:
 
     def make_task_ns(self, task: TaskRef) -> str:
         parent_ns = f"{self.scope.checkpoint_ns}|" if self.scope.checkpoint_ns else ""
-        return f"{parent_ns}{task.node}:{self.make_task_id(task)}"
+        return f"{parent_ns}{task.name}:{self.make_task_id(task)}"
 
     async def put_write(self, write: PendingWrite) -> None:
         scope = self.scope
