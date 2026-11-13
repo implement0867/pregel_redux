@@ -546,11 +546,14 @@ class CompiledGraph[StateT, InputT, OutputT]:
         try:
             async with asyncio.TaskGroup() as group:
                 tasks = [group.create_task(self.run_task(call, run, journal, step_exits)) for call in calls]
-        except ExceptionGroup as failures:
-            if len(failures.exceptions) == 1:
-                raise failures.exceptions[0] from None
-            raise
-        return [task.result() for task in tasks]
+            return [task.result() for task in tasks]
+        except ExceptionGroup as group_error:
+            match group_error.exceptions:
+                case (failure,):
+                    pass
+                case _:
+                    raise
+        raise failure
 
     async def run_task(
         self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack
