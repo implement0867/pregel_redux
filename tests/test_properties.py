@@ -693,7 +693,7 @@ class ThreadMachine(RuleBasedStateMachine):
         mode = delivery.mode if self.thread.sync_allowed else CallMode.asynchronous
         trace = self.thread.trace
         fired = len(trace.fired)
-        known = {item.checkpoint_id for item in self.runner.run(collect(graph.aget_state_history(self.config)))}
+        known = {item.checkpoint_id for item in self.thread.history}
         result: Finished[State] | Interrupted | None = None
         parts: list[StreamPart] | None = None
         raised: list[BaseException] = []
@@ -735,10 +735,9 @@ class ThreadMachine(RuleBasedStateMachine):
 
     def check_stops(self, known: set[UUID]) -> None:
         thread = self.thread
-        history = {
-            item.checkpoint_id: item for item in self.runner.run(collect(thread.graph.aget_state_history(self.config)))
-        }
-        for reached in history.values():
+        thread.history = self.runner.run(collect(thread.graph.aget_state_history(self.config)))
+        history = {item.checkpoint_id: item for item in thread.history}
+        for reached in thread.history:
             passed = None if reached.parent_id is None else history.get(reached.parent_id)
             if (
                 reached.checkpoint_id in known
@@ -784,13 +783,22 @@ class ThreadMachine(RuleBasedStateMachine):
         self.deliver(None, self.config, delivery)
         self.check_questions_still_wait(unanswered)
 
-    @precondition(lambda self: bool(self.waiting()))
-    @rule(delivery=deliveries(), data=st.data())
-    def answer(self, delivery: Delivery, data: st.DataObject) -> None:
-        chosen = data.draw(st.lists(st.sampled_from(self.waiting()), min_size=1, unique_by=lambda item: item.id))
-        answers = {item.id: self.thread.make_text(data.draw(st.text())) for item in chosen}
-        self.thread.trace.given.update({read_question(item): answers[item.id] for item in chosen})
-        unanswered = [item for item in self.waiting() if item.id not in answers]
+    @precondition(is_started)
+    @rule(delivery=deliveries(), picks=st.lists(st.tuples(st.integers(min_value=0), st.text()), min_size=1))
+    def answer(self, delivery: Delivery, picks: list[tuple[int, str]]) -> None:
+        waiting = self.waiting()
+        event(f"answer for waiting interrupts: {bool(waiting)}")
+        if not waiting:
+            return
+        answers: dict[str, str] = {}
+        for index, text in picks:
+            chosen = waiting[index % len(waiting)]
+            if chosen.id not in answers:
+                answers[chosen.id] = self.thread.make_text(text)
+        self.thread.trace.given.update(
+            {read_question(item): answers[item.id] for item in waiting if item.id in answers}
+        )
+        unanswered = [item for item in waiting if item.id not in answers]
         self.deliver(Command(resume_by_interrupt_id=answers), self.config, delivery)
         self.check_questions_still_wait(unanswered)
 
@@ -879,13 +887,17 @@ class ThreadMachine(RuleBasedStateMachine):
             return {thread.spec.nodes[entry].name for entry in thread.spec.entries}
         return set(thread.snapshot.next)
 
-    @precondition(lambda self: len(self.next_names()) > 1)
+    @precondition(lambda self: len(self.thread.spec.nodes) > 1)
     @rule(data=st.data())
     def arm_faults_of_the_next_step(self, data: st.DataObject) -> None:
         thread = self.thread
         names = self.next_names()
-        paths = [path for path in find_function_paths(thread.spec) if thread.spec.nodes[path[0]].name in names]
-        thread.trace.faults.update({path: data.draw(st.sampled_from(Phase)) for path in paths})
+        paths = find_function_paths(thread.spec)
+        phases = data.draw(st.lists(st.sampled_from(Phase), min_size=len(paths), max_size=len(paths)))
+        event(f"faults for a next step of several nodes: {len(names) > 1}")
+        thread.trace.faults.update(
+            {path: phase for path, phase in zip(paths, phases, strict=True) if thread.spec.nodes[path[0]].name in names}
+        )
 
     @precondition(is_started)
     @rule(data=st.data(), mode=st.sampled_from(CallMode), texts=st.lists(st.text()))
@@ -901,7 +913,8 @@ class ThreadMachine(RuleBasedStateMachine):
             else ThreadConfig(thread_id="thread", checkpoint_ns=before.checkpoint_ns)
         )
         spec = find_spec(thread.spec, before.checkpoint_ns)
-        node = data.draw(st.one_of(st.none(), st.sampled_from(spec.nodes)))
+        pick = data.draw(st.one_of(st.none(), st.integers(min_value=0)))
+        node = None if pick is None else spec.nodes[pick % len(spec.nodes)]
         notes = [thread.make_text(text) for text in texts]
         values = State(visits=notes)
         event(f"state update at an older checkpoint: {before in thread.history[1:]}")
