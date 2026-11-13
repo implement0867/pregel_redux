@@ -20,10 +20,21 @@ jobs:
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v5
-      - uses: astral-sh/setup-uv@v6
+      - uses: astral-sh/setup-uv@v7
         with:
+          python-version: '3.13'
           cache-dependency-glob: uv.lock
+      - uses: actions/cache/restore@v5
+        with:
+          path: .hypothesis
+          key: hypothesis-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: hypothesis-
       - run: make check
+      - uses: actions/cache/save@v5
+        if: ${{ !cancelled() }}
+        with:
+          path: .hypothesis
+          key: hypothesis-${{ github.run_id }}-${{ github.run_attempt }}
       - name: Post the coverage
         if: ${{ !cancelled() && hashFiles('.coverage') != '' }}
         env:
