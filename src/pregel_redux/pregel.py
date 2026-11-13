@@ -1,9 +1,9 @@
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, assert_never
 
-from pregel_redux.channels import Channel, FieldChannel, Stored, reject_unknown_channels
-from pregel_redux.commands import Endpoint, Send
+from pregel_redux.channels import Channel, FieldChannel, Stored, extract_writes, parse_updates, reject_unknown_channels
+from pregel_redux.commands import Command, Endpoint, Send, resolve_goto
 
 
 @dataclass(frozen=True)
@@ -349,3 +349,22 @@ def apply_writes(
         {**position.versions, **dict.fromkeys(changed, next_version)},
         seen,
     )
+
+
+def read_command_writes(
+    node_names: Collection[str], channels: Mapping[str, Channel], command: Command[str]
+) -> TaskWrites:
+    routes = resolve_goto(command.goto, node_names)
+    return TaskWrites(parse_updates(channels, extract_writes(command.update)), routes.targets, (), routes.sends)
+
+
+def apply_command(
+    trigger_keys: Collection[TriggerKey],
+    triggers: Mapping[str, Sequence[TriggerKey]],
+    position: Position,
+    writes: TaskWrites,
+) -> Position:
+    sends = (*position.channels.tasks.values, *writes.sends) if writes.sends else ()
+    branches = frozenset(node for node in writes.branches if not position.channels.branches[node].is_available())
+    applied = apply_writes(position, [], [replace(writes, branches=branches, sends=sends)], [], trigger_keys)
+    return applied if plan_tasks(applied, triggers) else finish_channels(applied)

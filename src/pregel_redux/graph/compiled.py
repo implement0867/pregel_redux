@@ -1,20 +1,16 @@
 import asyncio
 import inspect
-import threading
 from collections import ChainMap
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Coroutine, Generator, Mapping, Sequence
-from concurrent.futures import ThreadPoolExecutor
+from collections.abc import AsyncGenerator, Callable, Collection, Generator, Mapping, Sequence
 from contextlib import AsyncExitStack
-from contextvars import copy_context
 from dataclasses import dataclass
 from functools import cached_property
-from queue import SimpleQueue
 from typing import Literal, Never, Protocol, assert_never, overload
 from uuid import NAMESPACE_OID, uuid5
 
 from pydantic import JsonValue, TypeAdapter
 
-from pregel_redux.channels import Channel, Stored, extract_writes, parse_updates
+from pregel_redux.channels import Channel, extract_writes, parse_updates
 from pregel_redux.checkpoints import CheckpointSource
 from pregel_redux.commands import Endpoint, Send, read_outcome
 from pregel_redux.dependencies import (
@@ -26,6 +22,8 @@ from pregel_redux.dependencies import (
     finish_despite_cancellation,
     open_providers,
 )
+from pregel_redux.graph.adapters import iterate_in_new_loop, run_in_new_loop, stream_run
+from pregel_redux.graph.task_refs import NodeCall, TaskRef, name_task, refer_task
 from pregel_redux.interrupts import (
     Finished,
     GraphInterrupt,
@@ -45,7 +43,6 @@ from pregel_redux.pregel import (
     LastValueAfterFinish,
     NamedBarrierValue,
     NamedBarrierValueAfterFinish,
-    NodeName,
     Position,
     PullTask,
     PushTask,
@@ -73,6 +70,66 @@ from pregel_redux.streams import (
     ValuesPart,
     current_stream_writer,
 )
+
+
+@dataclass(frozen=True)
+class ChildEntry:
+    position: Position
+    journal: "Journal"
+    resumed: bool
+
+
+class Journal(Protocol):
+    @property
+    def ns(self) -> tuple[str, ...]: ...
+    async def save(self, position: Position, source: CheckpointSource) -> None: ...
+    async def record(self, task: TaskRef, writes: TaskWrites) -> None: ...
+    async def record_waiting(self, task: TaskRef, interrupts: Sequence[Interrupt]) -> None: ...
+    async def record_failure(self, task: TaskRef, error: str) -> None: ...
+    async def record_answers(self, task: TaskRef, answers: Sequence[JsonValue]) -> None: ...
+    def find_writes(self, task: TaskRef) -> TaskWrites | None: ...
+    def make_task_id(self, task: TaskRef) -> str: ...
+    async def read_snapshot(self) -> StateSnapshot | None: ...
+    def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad: ...
+    async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> ChildEntry: ...
+
+
+@dataclass
+class NoJournal:
+    ns: tuple[str, ...]
+    step: int
+
+    async def save(self, position: Position, source: CheckpointSource) -> None:
+        self.step += 1
+
+    def make_task_id(self, task: TaskRef) -> str:
+        return str(uuid5(NAMESPACE_OID, f"{'|'.join(self.ns)}|{self.step}|{name_task(task)}"))
+
+    async def read_snapshot(self) -> None:
+        return None
+
+    async def record(self, task: TaskRef, writes: TaskWrites) -> None:
+        pass
+
+    async def record_waiting(self, task: TaskRef, interrupts: Sequence[Interrupt]) -> None:
+        pass
+
+    async def record_failure(self, task: TaskRef, error: str) -> None:
+        pass
+
+    async def record_answers(self, task: TaskRef, answers: Sequence[JsonValue]) -> None:
+        pass
+
+    def find_writes(self, task: TaskRef) -> TaskWrites | None:
+        return None
+
+    def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad:
+        return Scratchpad(str(task.node), [], resume, 0)
+
+    async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> ChildEntry:
+        start = child.feed(child.open(extract_writes(call.node_input)), {})
+        child_ns = (*self.ns, f"{call.task.node}:{self.make_task_id(call.task)}")
+        return ChildEntry(start, NoJournal(child_ns, 0), resumed=False)
 
 
 @dataclass(frozen=True)
@@ -114,178 +171,9 @@ class CompiledNode:
 
 
 @dataclass(frozen=True)
-class TaskRef:
-    node: NodeName
-    send_index: int | None
-
-
-@dataclass(frozen=True)
-class NodeCall:
-    task: TaskRef
-    node_input: object
-
-
-@dataclass(frozen=True)
 class TaskStopped:
     interrupts: tuple[Interrupt, ...]
     reason: StopReason
-
-
-@dataclass(frozen=True)
-class ChildEntry:
-    position: Position
-    journal: "Journal"
-    resumed: bool
-
-
-class Journal(Protocol):
-    @property
-    def ns(self) -> tuple[str, ...]: ...
-    async def save(self, position: Position, source: CheckpointSource) -> None: ...
-    async def record(self, task: TaskRef, writes: TaskWrites) -> None: ...
-    async def record_waiting(self, task: TaskRef, interrupts: Sequence[Interrupt]) -> None: ...
-    async def record_failure(self, task: TaskRef, error: str) -> None: ...
-    async def record_answers(self, task: TaskRef, answers: Sequence[JsonValue]) -> None: ...
-    def find_writes(self, task: TaskRef) -> TaskWrites | None: ...
-    def make_task_id(self, task: TaskRef) -> str: ...
-    async def read_snapshot(self) -> StateSnapshot | None: ...
-    def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad: ...
-    async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> ChildEntry: ...
-
-
-def name_task(task: TaskRef) -> str:
-    match task.node:
-        case Endpoint.start:
-            return "start"
-        case str() as node:
-            return f"pull|{node}" if task.send_index is None else f"push|{node}|{task.send_index}"
-        case _:
-            assert_never(task.node)
-
-
-@dataclass
-class NoJournal:
-    ns: tuple[str, ...]
-    step: int
-
-    async def save(self, position: Position, source: CheckpointSource) -> None:
-        self.step += 1
-
-    def make_task_id(self, task: TaskRef) -> str:
-        return str(uuid5(NAMESPACE_OID, f"{'|'.join(self.ns)}|{self.step}|{name_task(task)}"))
-
-    async def read_snapshot(self) -> None:
-        return None
-
-    async def record(self, task: TaskRef, writes: TaskWrites) -> None:
-        pass
-
-    async def record_waiting(self, task: TaskRef, interrupts: Sequence[Interrupt]) -> None:
-        pass
-
-    async def record_failure(self, task: TaskRef, error: str) -> None:
-        pass
-
-    async def record_answers(self, task: TaskRef, answers: Sequence[JsonValue]) -> None:
-        pass
-
-    def find_writes(self, task: TaskRef) -> TaskWrites | None:
-        return None
-
-    def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad:
-        return Scratchpad(str(task.node), [], resume, 0)
-
-    async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> ChildEntry:
-        start = child.feed(child.open(extract_writes(call.node_input)), {})
-        child_ns = (*self.ns, f"{call.task.node}:{self.make_task_id(call.task)}")
-        return ChildEntry(start, NoJournal(child_ns, 0), resumed=False)
-
-
-def refer_task(task: Task) -> TaskRef:
-    match task:
-        case StartTask():
-            return TaskRef(Endpoint.start, None)
-        case PullTask():
-            return TaskRef(task.node, None)
-        case PushTask():
-            return TaskRef(task.send.node, task.index)
-        case _:
-            assert_never(task)
-
-
-def run_in_new_loop[ResultT](start_run: Callable[[], Coroutine[object, object, ResultT]]) -> ResultT:
-    try:
-        asyncio.get_running_loop()
-    except RuntimeError:
-        in_loop = False
-    else:
-        in_loop = True
-    if not in_loop:
-        return asyncio.run(start_run())
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        return executor.submit(copy_context().run, asyncio.run, start_run()).result()
-
-
-def iterate_in_new_loop[ItemT](start: Callable[[], AsyncIterator[ItemT]]) -> Generator[ItemT]:
-    items = SimpleQueue[Stored[ItemT] | None]()
-    lock = threading.Lock()
-    cancels: list[Callable[[], object]] = []
-
-    async def pump() -> None:
-        async for item in start():
-            items.put(Stored(item))
-
-    async def supervise() -> None:
-        task = asyncio.ensure_future(pump())
-        loop = asyncio.get_running_loop()
-        cancels.append(lambda: loop.call_soon_threadsafe(task.cancel))
-        try:
-            await task
-        finally:
-            with lock:
-                cancels.clear()
-
-    with ThreadPoolExecutor(max_workers=1) as executor:
-        work = executor.submit(copy_context().run, asyncio.run, supervise())
-        work.add_done_callback(lambda _: items.put(None))
-        try:
-            while (item := items.get()) is not None:
-                yield item.value
-        finally:
-            with lock:
-                for cancel in cancels:
-                    cancel()
-            match work.exception():
-                case None | asyncio.CancelledError():
-                    pass
-                case error:
-                    raise error
-
-
-async def stream_run[ResultT](
-    start_run: Callable[[Callable[[StreamPart], None]], Coroutine[object, object, ResultT]],
-) -> AsyncGenerator[StreamPart]:
-    parts = asyncio.Queue[StreamPart | None]()
-    loop = asyncio.get_running_loop()
-
-    def emit(part: StreamPart | None) -> None:
-        loop.call_soon_threadsafe(parts.put_nowait, part)
-
-    async def work() -> ResultT:
-        try:
-            return await start_run(emit)
-        finally:
-            emit(None)
-
-    task = asyncio.create_task(work())
-    try:
-        while (part := await parts.get()) is not None:
-            yield part
-    finally:
-        task.cancel()
-        await asyncio.wait([task])
-        if not task.cancelled() and (error := task.exception()) is not None:
-            raise error
 
 
 @dataclass(frozen=True)
