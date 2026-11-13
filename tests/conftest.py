@@ -23,6 +23,13 @@ def append_item[T](current: list[T], update: T) -> list[T]:
     return [*current, update]
 
 
+@pytest.hookimpl(tryfirst=True)
+def pytest_collection_modifyitems(items: list[pytest.Item]) -> None:
+    for item in items:
+        if item.get_closest_marker("xdist_group") is None:
+            item.add_marker(pytest.mark.xdist_group("other_tests"))
+
+
 @pytest.fixture
 def journal() -> Journal:
     return Journal()

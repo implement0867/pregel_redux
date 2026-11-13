@@ -23,7 +23,7 @@ build-backend = "uv_build"
 dev = [
     "basedpyright>=1.40.2",
     "hypothesis>=6.170.15",
-    "pytest>=9.2.0",
+    "pytest>=9.1.1,<9.2",
     "pytest-cov>=7.1.0",
     "pytest-xdist>=3.8.0",
     "ruff>=0.17.4",
@@ -31,10 +31,10 @@ dev = [
 ]
 
 [tool.pytest]
-minversion = "9.2"
+minversion = "9.1"
 strict = true
 testpaths = ["tests"]
-addopts = ["-ra", "--cov", "--cov-report=term-missing", "--numprocesses=auto"]
+addopts = ["-ra", "--cov", "--cov-report=term-missing", "--numprocesses=2", "--dist=loadgroup"]
 filterwarnings = ["error"]
 
 [tool.basedpyright]

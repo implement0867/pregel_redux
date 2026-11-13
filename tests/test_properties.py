@@ -1178,7 +1178,7 @@ class SqliteThreadMachine(ThreadMachine):
 MemoryThreadMachine.TestCase.settings = settings(deadline=None)
 SqliteThreadMachine.TestCase.settings = settings(deadline=None)
 TestThreadOnMemory = MemoryThreadMachine.TestCase
-TestThreadOnSqlite = SqliteThreadMachine.TestCase
+TestThreadOnSqlite = pytest.mark.xdist_group("sqlite_state_machine")(SqliteThreadMachine.TestCase)
 
 
 def has_join_as_the_only_way(spec: GraphSpec) -> bool:
