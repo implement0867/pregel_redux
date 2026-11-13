@@ -240,9 +240,11 @@ def test_stream_stops_the_run_when_the_reader_stops(journal: Journal, nodes_afte
     Act: close the stream while the second node runs.
     Assert: no node after the second node ran.
     """
+    started = threading.Event()
     release = threading.Event()
 
     def wait_in_node(state: State) -> None:
+        started.set()
         release.wait(timeout=1)
         journal.events.append("second")
 
@@ -256,6 +258,7 @@ def test_stream_stops_the_run_when_the_reader_stops(journal: Journal, nodes_afte
         builder.add_edge("second" if index == 0 else f"later-{index - 1}", f"later-{index}")
     parts = builder.compile().stream({}, stream_mode=StreamMode.updates)
     next(parts)
+    started.wait(timeout=1)
     timer = threading.Timer(0.05, release.set)
     expected = ["first", "second"]
 

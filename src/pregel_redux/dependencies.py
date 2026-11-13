@@ -82,17 +82,33 @@ def read_dependency_parameters(function: Callable[..., object], *, state_paramet
 
 async def finish_despite_cancellation[ResultT](work: Awaitable[ResultT]) -> ResultT:
     future = asyncio.ensure_future(work)
-    cancelled = False
+    task = asyncio.current_task()
+    if task is None:
+        raise RuntimeError("finish_despite_cancellation works only inside a task")
+    requests = 0
     while not future.done():
         try:
             await asyncio.wait([future])
         except asyncio.CancelledError:
-            cancelled = True
+            requests += 1
+            task.uncancel()
+    if not future.cancelled() and (error := future.exception()) is not None:
+        context = error.__context__
+        try:
+            raise error
+        finally:
+            error.__context__ = context
     result = future.result()
-    task = asyncio.current_task()
-    if cancelled and task is not None:
+    for _ in range(requests):
         task.cancel()
     return result
+
+
+class ShieldedExitStack(AsyncExitStack[bool]):
+    async def __aexit__(
+        self, error_type: type[BaseException] | None, error: BaseException | None, traceback: TracebackType | None
+    ) -> bool:
+        return await finish_despite_cancellation(super().__aexit__(error_type, error, traceback))
 
 
 def close_at_exit(exits: AsyncExitStack, until: AsyncExitStack) -> None:

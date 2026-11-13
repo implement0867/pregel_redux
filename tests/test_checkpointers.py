@@ -119,15 +119,15 @@ def test_list_gives_the_checkpoints_before_an_id_with_the_newest_first(
 
 def test_checkpoint_is_found_by_its_id_with_its_pending_writes(checkpointer: Checkpointer) -> None:
     """
-    Arrange: a thread that stopped at an interrupt and got a record of its commands two times.
+    Arrange: a thread that stopped at an interrupt and got a record of its first command two times.
     Act: read the checkpoint of the interrupt by its id, and read an id that the thread does not have.
-    Assert: the checkpoint has one record for the interrupt and one for the last record of commands.
+    Assert: the checkpoint has one record for the stop and one for the last record of the command.
     """
     graph = build_graph(checkpointer)
     graph.invoke({}, {"thread_id": "thread"})
     stopped = asyncio.run(collect(checkpointer.alist("thread", "", before=None, limit=1)))[0].checkpoint
     one, two = (
-        RunCommandRecord(commands=(SavedWrites(fields={}, branches=(node,), arrivals=(), sends=()),))
+        RunCommandRecord(index=0, command=SavedWrites(fields={}, branches=(node,), arrivals=(), sends=()))
         for node in ("one", "two")
     )
     asyncio.run(checkpointer.aput_writes("thread", "", stopped.id, one))
@@ -139,7 +139,7 @@ def test_checkpoint_is_found_by_its_id_with_its_pending_writes(checkpointer: Che
     writes = () if actual is None else actual.pending_writes
     kinds = sorted(write.kind.value for write in writes)
     commands = [write for write in writes if isinstance(write, RunCommandRecord)]
-    assert kinds == ["command", "interrupt"], f"Expected one interrupt record and one command record, got {kinds}."
+    assert kinds == ["command", "stop"], f"Expected one stop record and one command record, got {kinds}."
     assert commands == [two], f"Expected the last record of commands, got {commands}."
     assert missing is None, f"Expected no checkpoint for an unknown id, got {missing}."
 

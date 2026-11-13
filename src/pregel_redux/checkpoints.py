@@ -41,8 +41,15 @@ class SavedWrites(Record):
 
 class PendingKind(StrEnum):
     writes = "writes"
-    interrupt = "interrupt"
+    stop = "stop"
+    answers = "answers"
     command = "command"
+
+
+@dataclass(frozen=True, order=True)
+class PendingKey:
+    kind: PendingKind
+    owner: str
 
 
 class TaskWritesRecord(Record):
@@ -50,22 +57,60 @@ class TaskWritesRecord(Record):
     task_id: str
     writes: SavedWrites
 
+    @property
+    def key(self) -> PendingKey:
+        return PendingKey(self.kind, self.task_id)
 
-class TaskInterruptRecord(Record):
-    kind: Literal[PendingKind.interrupt] = PendingKind.interrupt
-    task_id: str
+
+class StopKind(StrEnum):
+    waiting = "waiting"
+    failed = "failed"
+
+
+class TaskWaiting(Record):
+    outcome: Literal[StopKind.waiting] = StopKind.waiting
     interrupts: tuple[Interrupt, ...]
-    resume: tuple[JsonValue, ...]
-    error: str | None = None
+
+
+class TaskFailed(Record):
+    outcome: Literal[StopKind.failed] = StopKind.failed
+    error: str
+    interrupts: tuple[Interrupt, ...]
+
+
+class TaskStopRecord(Record):
+    kind: Literal[PendingKind.stop] = PendingKind.stop
+    task_id: str
+    stop: Annotated[TaskWaiting | TaskFailed, Field(discriminator="outcome")]
+
+    @property
+    def key(self) -> PendingKey:
+        return PendingKey(self.kind, self.task_id)
+
+
+class TaskAnswersRecord(Record):
+    kind: Literal[PendingKind.answers] = PendingKind.answers
+    task_id: str
+    answers: tuple[JsonValue, ...]
+
+    @property
+    def key(self) -> PendingKey:
+        return PendingKey(self.kind, self.task_id)
 
 
 class RunCommandRecord(Record):
     kind: Literal[PendingKind.command] = PendingKind.command
-    task_id: None = None
-    commands: tuple[SavedWrites, ...]
+    index: int
+    command: SavedWrites
+
+    @property
+    def key(self) -> PendingKey:
+        return PendingKey(self.kind, str(self.index))
 
 
-type PendingWrite = Annotated[TaskWritesRecord | TaskInterruptRecord | RunCommandRecord, Field(discriminator="kind")]
+type PendingWrite = Annotated[
+    TaskWritesRecord | TaskStopRecord | TaskAnswersRecord | RunCommandRecord, Field(discriminator="kind")
+]
 
 
 class SavedBranch(Record):
@@ -180,7 +225,7 @@ class ThreadedCheckpointer:
 @dataclass
 class InMemoryCheckpointer:
     threads: dict[str, dict[str, dict[UUID, str]]] = field(default_factory=dict)
-    pending: dict[tuple[str, str, UUID], dict[tuple[str, str], str]] = field(default_factory=dict)
+    pending: dict[tuple[str, str, UUID], dict[PendingKey, str]] = field(default_factory=dict)
 
     def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
         records = self.threads.setdefault(thread_id, {}).setdefault(checkpoint.checkpoint_ns, {})
@@ -190,7 +235,7 @@ class InMemoryCheckpointer:
         if checkpoint_id not in self.threads[thread_id][checkpoint_ns]:
             raise KeyError(checkpoint_id)
         records = self.pending.setdefault((thread_id, checkpoint_ns, checkpoint_id), {})
-        records[(write.kind.value, write.task_id or "")] = write.model_dump_json()
+        records[write.key] = write.model_dump_json()
 
     def read_tuple(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID) -> CheckpointTuple:
         adapter = TypeAdapter[PendingWrite](PendingWrite)
@@ -217,8 +262,7 @@ class InMemoryCheckpointer:
 
     def delete_thread(self, thread_id: str) -> None:
         self.threads.pop(thread_id, None)
-        for key in [key for key in tuple(self.pending) if key[0] == thread_id]:
-            self.pending.pop(key, None)
+        self.pending = {key: records for key, records in self.pending.items() if key[0] != thread_id}
 
     async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
         self.put(thread_id, checkpoint)

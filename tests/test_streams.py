@@ -167,7 +167,11 @@ def test_parts_of_a_child_graph_are_in_the_stream_only_when_subgraphs_is_set(
 
     parts = asyncio.run(collect(graph.astream({}, stream_mode=StreamMode.updates, subgraphs=subgraphs)))
 
-    actual = [(part.ns, part.node) for part in parts if isinstance(part, UpdatesPart)]
+    actual = [
+        (tuple(segment.split(":")[0] for segment in part.ns), part.node)
+        for part in parts
+        if isinstance(part, UpdatesPart)
+    ]
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 

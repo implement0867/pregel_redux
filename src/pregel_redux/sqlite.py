@@ -6,6 +6,7 @@ from uuid import UUID
 from pydantic import TypeAdapter
 from sqlalchemy import Engine, delete, select
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column
+from sqlalchemy.pool import StaticPool
 
 from pregel_redux.checkpoints import Checkpoint, CheckpointTuple, PendingWrite
 
@@ -30,7 +31,7 @@ class WriteRow(Base):
     checkpoint_ns: Mapped[str] = mapped_column(primary_key=True)
     checkpoint_id: Mapped[UUID] = mapped_column(primary_key=True)
     kind: Mapped[str] = mapped_column(primary_key=True)
-    task_id: Mapped[str] = mapped_column(primary_key=True)
+    owner: Mapped[str] = mapped_column(primary_key=True)
     write: Mapped[str] = mapped_column()
 
 
@@ -42,7 +43,7 @@ def read_tuple(session: Session, row: CheckpointRow) -> CheckpointTuple:
             WriteRow.checkpoint_ns == row.checkpoint_ns,
             WriteRow.checkpoint_id == row.checkpoint_id,
         )
-        .order_by(WriteRow.kind, WriteRow.task_id)
+        .order_by(WriteRow.kind, WriteRow.owner)
     )
     adapter = TypeAdapter[PendingWrite](PendingWrite)
     return CheckpointTuple(
@@ -55,12 +56,23 @@ def read_tuple(session: Session, row: CheckpointRow) -> CheckpointTuple:
 class SqliteCheckpointer:
     engine: Engine
 
+    def __post_init__(self) -> None:
+        match self.engine.pool:
+            case StaticPool():
+                raise ValueError(
+                    "SqliteCheckpointer writes from several threads, which one shared connection cannot do"
+                )
+            case _ if self.engine.url.database in (None, "", ":memory:"):
+                raise ValueError("SqliteCheckpointer needs a database file, because each thread opens a connection")
+            case _:
+                pass
+
     def setup(self) -> None:
         Base.metadata.create_all(self.engine)
 
     def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
         with Session(self.engine) as session, session.begin():
-            session.add(
+            session.merge(
                 CheckpointRow(
                     thread_id=thread_id,
                     checkpoint_ns=checkpoint.checkpoint_ns,
@@ -71,13 +83,15 @@ class SqliteCheckpointer:
 
     def put_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
         with Session(self.engine) as session, session.begin():
+            if session.get(CheckpointRow, (thread_id, checkpoint_ns, checkpoint_id)) is None:
+                raise KeyError(checkpoint_id)
             session.merge(
                 WriteRow(
                     thread_id=thread_id,
                     checkpoint_ns=checkpoint_ns,
                     checkpoint_id=checkpoint_id,
-                    kind=write.kind.value,
-                    task_id=write.task_id or "",
+                    kind=write.key.kind.value,
+                    owner=write.key.owner,
                     write=write.model_dump_json(),
                 )
             )

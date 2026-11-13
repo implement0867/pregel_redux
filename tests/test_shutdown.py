@@ -17,6 +17,7 @@ from pregel_redux import (
     ShutdownController,
     ShutdownSignal,
     StateGraph,
+    StopReason,
     StreamMode,
     graceful_shutdown,
     interrupt,
@@ -57,7 +58,9 @@ def test_graceful_shutdown_stops_the_run_after_the_current_step() -> None:
     stopped = graph.invoke({}, {"thread_id": "thread"}, signal=controller.signal)
     finished = graph.invoke(None, {"thread_id": "thread"})
 
-    assert stopped == Interrupted((), {"notes": ["first"]}), f"Expected a stop after the first node, got {stopped}."
+    assert stopped == Interrupted((), {"notes": ["first"]}, StopReason.shutdown), (
+        f"Expected a stop after the first node, got {stopped}."
+    )
     assert finished == Finished(State(notes=["first", "second"])), f"Expected the two writes, got {finished}."
     assert calls == ["first", "second"], f"Expected each node to run one time, got {calls}."
 
@@ -98,7 +101,9 @@ def test_graceful_shutdown_lets_the_other_nodes_of_the_step_finish() -> None:
     stopped = asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}, signal=controller.signal))
     finished = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
 
-    assert stopped == Interrupted((), {"notes": ["request", "slow"]}), f"Expected the two writes, got {stopped}."
+    assert stopped == Interrupted((), {"notes": ["request", "slow"]}, StopReason.shutdown), (
+        f"Expected the two writes, got {stopped}."
+    )
     assert finished == Finished(State(notes=["request", "slow", "last"])), f"Expected three writes, got {finished}."
     assert sorted(calls) == ["last", "request", "slow"], f"Expected each node to run one time, got {calls}."
 
@@ -135,7 +140,9 @@ def test_graceful_shutdown_stops_a_child_graph_after_its_current_step() -> None:
     calls_at_the_stop = list(calls)
     finished = graph.invoke(None, {"thread_id": "thread"})
 
-    assert stopped == Interrupted((), {"notes": []}), f"Expected a stop inside the child graph, got {stopped}."
+    assert stopped == Interrupted((), {"notes": []}, StopReason.shutdown), (
+        f"Expected a stop inside the child graph, got {stopped}."
+    )
     assert calls_at_the_stop == ["first"], f"Expected only the first node before the stop, got {calls_at_the_stop}."
     assert finished == Finished(State(notes=["first", "second"])), f"Expected the two writes, got {finished}."
     assert calls == ["first", "second"], f"Expected each node to run one time, got {calls}."
@@ -162,7 +169,9 @@ def test_run_with_a_signal_that_already_requests_a_shutdown_runs_no_node() -> No
 
     stopped = graph.invoke({"notes": ["input"]}, {"thread_id": "thread"}, signal=controller.signal)
 
-    assert stopped == Interrupted((), {"notes": ["input"]}), f"Expected a stop with the input, got {stopped}."
+    assert stopped == Interrupted((), {"notes": ["input"]}, StopReason.shutdown), (
+        f"Expected a stop with the input, got {stopped}."
+    )
     assert calls == [], f"Expected no node to run, got {calls}."
 
 
@@ -314,7 +323,9 @@ def test_node_that_finishes_in_the_grace_period_gives_a_graceful_stop() -> None:
 
     stopped = graph.invoke({}, {"thread_id": "thread"}, signal=controller.signal)
 
-    assert stopped == Interrupted((), {"notes": ["first"]}), f"Expected a stop after the first node, got {stopped}."
+    assert stopped == Interrupted((), {"notes": ["first"]}, StopReason.shutdown), (
+        f"Expected a stop after the first node, got {stopped}."
+    )
 
 
 def test_node_reads_the_shutdown_signal_of_its_run() -> None:
@@ -431,7 +442,9 @@ def test_first_interrupt_signal_requests_a_graceful_shutdown() -> None:
     with graceful_shutdown() as shutdown:
         stopped = asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}, signal=shutdown))
 
-    assert stopped == Interrupted((), {"notes": ["first"]}), f"Expected a stop after the first node, got {stopped}."
+    assert stopped == Interrupted((), {"notes": ["first"]}, StopReason.shutdown), (
+        f"Expected a stop after the first node, got {stopped}."
+    )
     assert signal.getsignal(signal.SIGINT) is handler_before, "Expected the earlier handler after the block."
 
 

@@ -1,6 +1,7 @@
+import asyncio
 import signal
 import time
-from collections.abc import Callable, Collection, Generator
+from collections.abc import Callable, Collection, Coroutine, Generator
 from contextlib import contextmanager
 from dataclasses import dataclass, field
 from enum import Enum
@@ -72,6 +73,42 @@ class ShutdownController:
             listener()
 
 
+async def run_until_abort[ResultT](shutdown: ShutdownSignal, work: Coroutine[object, object, ResultT]) -> ResultT:
+    if shutdown.aborted:
+        work.close()
+        raise RunAborted("the shutdown signal of the run is aborted")
+    loop = asyncio.get_running_loop()
+    task = asyncio.ensure_future(work)
+    timers: list[asyncio.TimerHandle] = []
+    aborting = False
+
+    def abort() -> None:
+        nonlocal aborting
+        if not aborting:
+            aborting = True
+            task.cancel()
+
+    def react() -> None:
+        if shutdown.aborted:
+            abort()
+        elif shutdown.deadline is not None:
+            timers.append(loop.call_later(shutdown.deadline - time.monotonic(), abort))
+
+    unsubscribe = shutdown.subscribe(lambda: loop.call_soon_threadsafe(react))
+    react()
+    try:
+        return await task
+    except asyncio.CancelledError:
+        current = asyncio.current_task()
+        if not aborting or (current is not None and current.cancelling()):
+            raise
+        raise RunAborted("the run was aborted by its shutdown signal") from None
+    finally:
+        unsubscribe()
+        for timer in timers:
+            timer.cancel()
+
+
 def read_shutdown() -> ShutdownSignal:
     raise RuntimeError("read_shutdown supplies a value only in a run of a graph that has a checkpointer")
 
@@ -90,8 +127,10 @@ def graceful_shutdown(
         else:
             controller.shutdown(grace_period)
 
-    earlier = {number: signal.signal(number, handle) for number in signals}
+    earlier: dict[signal.Signals, Callable[[int, FrameType | None], object] | int | None] = {}
     try:
+        for number in signals:
+            earlier[number] = signal.signal(number, handle)
         yield controller.signal
     finally:
         for number, handler in earlier.items():

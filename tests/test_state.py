@@ -18,6 +18,7 @@ from pregel_redux import (
     Send,
     StateGraph,
     StateSnapshot,
+    StopReason,
     StreamMode,
     ThreadConfig,
     interrupt,
@@ -339,7 +340,9 @@ def test_new_input_on_a_stopped_thread_stops_before_the_named_node_again() -> No
 
     actual = graph.invoke({"notes": ["more"]}, {"thread_id": "thread"})
 
-    assert actual == Interrupted((), {"notes": ["first", "more", "first"]}), f"Expected a stop, got {actual}."
+    assert actual == Interrupted((), {"notes": ["first", "more", "first"]}, StopReason.breakpoint), (
+        f"Expected a stop, got {actual}."
+    )
     assert calls == ["first", "first"], f"Expected the first node to run two times, got {calls}."
 
 
@@ -363,7 +366,7 @@ def test_child_graph_stops_before_its_named_node_and_continues() -> None:
     stopped = [graph.invoke({}, {"thread_id": "thread"})]
     actual = graph.invoke(None, {"thread_id": "thread"})
 
-    assert stopped == [Interrupted((), {"notes": []})], f"Expected one stop, got {stopped}."
+    assert stopped == [Interrupted((), {"notes": []}, StopReason.breakpoint)], f"Expected one stop, got {stopped}."
     assert calls == ["first", "second"], f"Expected each node to run one time, got {calls}."
     assert isinstance(actual, Finished), f"Expected a finished run, got {actual}."
 
@@ -403,7 +406,9 @@ def test_resume_value_continues_a_thread_that_stopped_before_a_node() -> None:
     third = graph.invoke(Command(resume="answer"), {"thread_id": "thread"})
 
     values = [item.value for item in second.interrupts] if isinstance(second, Interrupted) else None
-    assert first == Interrupted((), {"notes": []}), f"Expected a stop without a value, got {first}."
+    assert first == Interrupted((), {"notes": []}, StopReason.breakpoint), (
+        f"Expected a stop without a value, got {first}."
+    )
     assert values == ["question"], f"Expected the value of the interrupt, got {second}."
     assert third == Finished(Output(notes=["answer"])), f"Expected the answer, got {third}."
 
@@ -498,7 +503,7 @@ def test_interrupted_result_has_the_values_at_the_stop(stop_before: str, notes: 
     Assert: the result has no interrupt and the values that the nodes before the stop wrote.
     """
     graph = build_chain([], interrupt_before=(stop_before,))
-    expected = Interrupted((), {"notes": notes})
+    expected = Interrupted((), {"notes": notes}, StopReason.breakpoint)
 
     actual = graph.invoke({"notes": ["input"]}, {"thread_id": "thread"})
 

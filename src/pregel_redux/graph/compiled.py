@@ -1,7 +1,6 @@
 import asyncio
 import inspect
 import threading
-import time
 from collections import ChainMap
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Coroutine, Generator, Mapping, Sequence
 from concurrent.futures import ThreadPoolExecutor
@@ -21,6 +20,7 @@ from pregel_redux.commands import Endpoint, Send, read_outcome
 from pregel_redux.dependencies import (
     CallPlan,
     Depends,
+    ShieldedExitStack,
     close_at_exit,
     execute_plan,
     finish_despite_cancellation,
@@ -33,6 +33,7 @@ from pregel_redux.interrupts import (
     Interrupted,
     ResumeInput,
     Scratchpad,
+    StopReason,
     current_scratchpad,
 )
 from pregel_redux.pregel import (
@@ -57,7 +58,7 @@ from pregel_redux.pregel import (
     plan_tasks,
 )
 from pregel_redux.settings import RunSettings
-from pregel_redux.shutdown import RunAborted, ShutdownController, ShutdownSignal
+from pregel_redux.shutdown import ShutdownController, ShutdownSignal, run_until_abort
 from pregel_redux.snapshots import StateSnapshot
 from pregel_redux.streams import (
     CheckpointPart,
@@ -125,8 +126,9 @@ class NodeCall:
 
 
 @dataclass(frozen=True)
-class TaskInterrupted:
+class TaskStopped:
     interrupts: tuple[Interrupt, ...]
+    reason: StopReason
 
 
 @dataclass(frozen=True)
@@ -141,12 +143,9 @@ class Journal(Protocol):
     def ns(self) -> tuple[str, ...]: ...
     async def save(self, position: Position, source: CheckpointSource) -> None: ...
     async def record(self, task: TaskRef, writes: TaskWrites) -> None: ...
-    async def record_interrupt(
-        self, task: TaskRef, interrupts: Sequence[Interrupt], resume: Sequence[JsonValue]
-    ) -> None: ...
-    async def record_failure(
-        self, task: TaskRef, resume: Sequence[JsonValue], error: str, *, answered: bool
-    ) -> None: ...
+    async def record_waiting(self, task: TaskRef, interrupts: Sequence[Interrupt]) -> None: ...
+    async def record_failure(self, task: TaskRef, error: str) -> None: ...
+    async def record_answers(self, task: TaskRef, answers: Sequence[JsonValue]) -> None: ...
     def find_writes(self, task: TaskRef) -> TaskWrites | None: ...
     def make_task_id(self, task: TaskRef) -> str: ...
     async def read_snapshot(self) -> StateSnapshot | None: ...
@@ -181,12 +180,13 @@ class NoJournal:
     async def record(self, task: TaskRef, writes: TaskWrites) -> None:
         pass
 
-    async def record_interrupt(
-        self, task: TaskRef, interrupts: Sequence[Interrupt], resume: Sequence[JsonValue]
-    ) -> None:
+    async def record_waiting(self, task: TaskRef, interrupts: Sequence[Interrupt]) -> None:
         pass
 
-    async def record_failure(self, task: TaskRef, resume: Sequence[JsonValue], error: str, *, answered: bool) -> None:
+    async def record_failure(self, task: TaskRef, error: str) -> None:
+        pass
+
+    async def record_answers(self, task: TaskRef, answers: Sequence[JsonValue]) -> None:
         pass
 
     def find_writes(self, task: TaskRef) -> TaskWrites | None:
@@ -197,7 +197,8 @@ class NoJournal:
 
     async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> ChildEntry:
         start = child.feed(child.open(extract_writes(call.node_input)), {})
-        return ChildEntry(start, NoJournal((*self.ns, str(call.task.node)), 0), resumed=False)
+        child_ns = (*self.ns, f"{call.task.node}:{self.make_task_id(call.task)}")
+        return ChildEntry(start, NoJournal(child_ns, 0), resumed=False)
 
 
 def refer_task(task: Task) -> TaskRef:
@@ -250,68 +251,41 @@ def iterate_in_new_loop[ItemT](start: Callable[[], AsyncIterator[ItemT]]) -> Gen
         try:
             while (item := items.get()) is not None:
                 yield item.value
-        except GeneratorExit:
+        finally:
             with lock:
                 for cancel in cancels:
                     cancel()
-            raise
-        work.result()
-
-
-async def run_until_abort[ResultT](shutdown: ShutdownSignal, work: Coroutine[object, object, ResultT]) -> ResultT:
-    if shutdown.aborted:
-        work.close()
-        raise RunAborted("the shutdown signal of the run is aborted")
-    loop = asyncio.get_running_loop()
-    task = asyncio.ensure_future(work)
-    timers: list[asyncio.TimerHandle] = []
-    aborting = False
-
-    def abort() -> None:
-        nonlocal aborting
-        aborting = True
-        task.cancel()
-
-    def react() -> None:
-        if shutdown.aborted:
-            abort()
-        elif shutdown.deadline is not None:
-            timers.append(loop.call_later(shutdown.deadline - time.monotonic(), abort))
-
-    unsubscribe = shutdown.subscribe(lambda: loop.call_soon_threadsafe(react))
-    react()
-    try:
-        return await task
-    except asyncio.CancelledError:
-        current = asyncio.current_task()
-        if not aborting or (current is not None and current.cancelling()):
-            raise
-        raise RunAborted("the run was aborted by its shutdown signal") from None
-    finally:
-        unsubscribe()
-        for timer in timers:
-            timer.cancel()
+            match work.exception():
+                case None | asyncio.CancelledError():
+                    pass
+                case error:
+                    raise error
 
 
 async def stream_run[ResultT](
     start_run: Callable[[Callable[[StreamPart], None]], Coroutine[object, object, ResultT]],
 ) -> AsyncGenerator[StreamPart]:
     parts = asyncio.Queue[StreamPart | None]()
+    loop = asyncio.get_running_loop()
+
+    def emit(part: StreamPart | None) -> None:
+        loop.call_soon_threadsafe(parts.put_nowait, part)
 
     async def work() -> ResultT:
         try:
-            return await start_run(parts.put_nowait)
+            return await start_run(emit)
         finally:
-            parts.put_nowait(None)
+            emit(None)
 
     task = asyncio.create_task(work())
     try:
         while (part := await parts.get()) is not None:
             yield part
-        await task
     finally:
         task.cancel()
-        await asyncio.gather(task, return_exceptions=True)
+        await asyncio.wait([task])
+        if not task.cancelled() and (error := task.exception()) is not None:
+            raise error
 
 
 @dataclass(frozen=True)
@@ -364,9 +338,10 @@ class CompiledGraph[StateT, InputT, OutputT]:
         resumed: bool,
     ) -> Finished[OutputT] | Interrupted:
         limit = RunSettings().step_limit if step_limit is None else step_limit
-        async with AsyncExitStack() as run_exits:
+        async with ShieldedExitStack() as run_exits:
             run = Run(provided, run_exits, asyncio.Lock(), limit, resume, stream, shutdown)
-            return await self.run_steps(position, run, journal, resumed=resumed)
+            return await run_until_abort(shutdown, self.run_steps(position, run, journal, resumed=resumed))
+        raise RuntimeError("a run-scoped dependency suppressed the exception of its run")
 
     @overload
     def astream(
@@ -559,29 +534,32 @@ class CompiledGraph[StateT, InputT, OutputT]:
             calls = [self.build_call(task, position) for task in tasks]
             names = {call.task.node for call in calls}
             if not skip_interrupt_before and not names.isdisjoint(self.interrupt_before):
-                return self.stop(position, run, journal, ())
+                return self.stop(position, run, journal, (), StopReason.breakpoint)
             if run.shutdown.requested and names != {Endpoint.start}:
                 snapshot = await journal.read_snapshot()
-                return self.stop(position, run, journal, () if snapshot is None else snapshot.interrupts)
+                waiting = () if snapshot is None else snapshot.interrupts
+                return self.stop(position, run, journal, waiting, StopReason.shutdown)
             skip_interrupt_before = False
             if names != {Endpoint.start}:
                 if steps == run.step_limit:
                     raise RuntimeError(f"the graph did not finish within {run.step_limit} steps")
                 steps += 1
-            async with AsyncExitStack() as step_exits:
+            async with ShieldedExitStack() as step_exits:
                 results = await self.run_step(calls, run, journal, step_exits)
-                interrupts = [
-                    item for result in results if isinstance(result, TaskInterrupted) for item in result.interrupts
-                ]
-                if any(isinstance(result, TaskInterrupted) for result in results):
-                    return self.stop(position, run, journal, tuple(interrupts))
+                stops = [result for result in results if isinstance(result, TaskStopped)]
+                if stops:
+                    interrupts = tuple(item for stopped in stops for item in stopped.interrupts)
+                    by_shutdown = all(stopped.reason is StopReason.shutdown for stopped in stops)
+                    reason = StopReason.shutdown if by_shutdown else StopReason.question
+                    return self.stop(position, run, journal, interrupts, reason)
                 writes = [result for result in results if isinstance(result, TaskWrites)]
                 position = apply_writes(position, tasks, writes, [], self.trigger_keys)
                 await journal.save(position, CheckpointSource.loop)
                 await self.send_checkpoint(run, journal)
+            await asyncio.sleep(0)  # deliver a pending cancellation
             run.stream.send(StreamMode.values, ValuesPart(journal.ns, position.channels.read_values(), ()))
             if not names.isdisjoint(self.interrupt_after):
-                return self.stop(position, run, journal, ())
+                return self.stop(position, run, journal, (), StopReason.breakpoint)
         values = position.channels.read_values()
         return Finished(self.output_schema(**{name: values[name] for name in self.output_fields if name in values}))
 
@@ -591,15 +569,17 @@ class CompiledGraph[StateT, InputT, OutputT]:
             if snapshot is not None:
                 run.stream.send(StreamMode.checkpoints, CheckpointPart(journal.ns, snapshot))
 
-    def stop(self, position: Position, run: Run, journal: Journal, interrupts: tuple[Interrupt, ...]) -> Interrupted:
+    def stop(
+        self, position: Position, run: Run, journal: Journal, interrupts: tuple[Interrupt, ...], reason: StopReason
+    ) -> Interrupted:
         values = position.channels.read_values()
         run.stream.send(StreamMode.values, ValuesPart(journal.ns, values, interrupts))
         run.stream.send(StreamMode.updates, InterruptsPart(journal.ns, interrupts))
-        return Interrupted(interrupts, values)
+        return Interrupted(interrupts, values, reason)
 
     async def run_step(
         self, calls: Sequence[NodeCall], run: Run, journal: Journal, step_exits: AsyncExitStack
-    ) -> list[TaskWrites | TaskInterrupted]:
+    ) -> list[TaskWrites | TaskStopped]:
         tasks = [asyncio.create_task(self.run_task(call, run, journal, step_exits)) for call in calls]
         try:
             await asyncio.wait(tasks)
@@ -619,7 +599,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
 
     async def run_task(
         self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack
-    ) -> TaskWrites | TaskInterrupted:
+    ) -> TaskWrites | TaskStopped:
         saved = journal.find_writes(call.task)
         if saved is not None:
             return saved
@@ -631,33 +611,36 @@ class CompiledGraph[StateT, InputT, OutputT]:
         if isinstance(name, str):
             run.stream.send(StreamMode.tasks, TaskStartPart(journal.ns, task_id, name, call.node_input))
         saved_answers = len(scratchpad.resume)
-        ended = False
         try:
-            writes = await self.run_node(call, run, journal, step_exits)
-            ended = True
+            outcome = await self.run_node(call, run, journal, step_exits)
         except GraphInterrupt as stop:
-            ended = True
-            await finish_despite_cancellation(journal.record_interrupt(call.task, stop.interrupts, scratchpad.resume))
-            run.stream.send(StreamMode.tasks, TaskResultPart(journal.ns, task_id, str(name), {}, stop.interrupts))
-            return TaskInterrupted(stop.interrupts)
+            outcome = Interrupted(stop.interrupts, {}, StopReason.question)
         except Exception as error:
-            ended = True
-            await finish_despite_cancellation(
-                journal.record_failure(
-                    call.task, scratchpad.resume, repr(error), answered=len(scratchpad.resume) > saved_answers
-                )
-            )
+            await journal.record_failure(call.task, repr(error))
             raise
         finally:
-            if not ended and len(scratchpad.resume) > saved_answers:
-                await finish_despite_cancellation(journal.record_interrupt(call.task, (), scratchpad.resume))
-        await finish_despite_cancellation(journal.record(call.task, writes))
-        if isinstance(name, str):
-            run.stream.send(StreamMode.updates, UpdatesPart(journal.ns, name, writes.fields))
-            run.stream.send(StreamMode.tasks, TaskResultPart(journal.ns, task_id, name, writes.fields, ()))
-        return writes
+            if len(scratchpad.resume) > saved_answers:
+                await journal.record_answers(call.task, scratchpad.resume)
+        match outcome:
+            case TaskWrites():
+                await journal.record(call.task, outcome)
+                if isinstance(name, str):
+                    run.stream.send(StreamMode.updates, UpdatesPart(journal.ns, name, outcome.fields))
+                    run.stream.send(StreamMode.tasks, TaskResultPart(journal.ns, task_id, name, outcome.fields, ()))
+                return outcome
+            case Interrupted(reason=StopReason.shutdown):
+                return TaskStopped(outcome.interrupts, outcome.reason)
+            case Interrupted():
+                await journal.record_waiting(call.task, outcome.interrupts)
+                part = TaskResultPart(journal.ns, task_id, str(name), {}, outcome.interrupts)
+                run.stream.send(StreamMode.tasks, part)
+                return TaskStopped(outcome.interrupts, outcome.reason)
+            case _:
+                assert_never(outcome)
 
-    async def run_node(self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack) -> TaskWrites:
+    async def run_node(
+        self, call: NodeCall, run: Run, journal: Journal, step_exits: AsyncExitStack
+    ) -> TaskWrites | Interrupted:
         match call.task.node:
             case Endpoint.start:
                 return TaskWrites(
@@ -675,7 +658,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
                             case Finished():
                                 return self.read_writes(name, result.output)
                             case Interrupted():
-                                raise GraphInterrupt(result.interrupts)
+                                return result
                             case _:
                                 assert_never(result)
                     case _:
