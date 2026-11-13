@@ -239,6 +239,131 @@ def test_provider_requested_two_times_in_one_node_call_runs_one_time(journal: Jo
     )
 
 
+@pytest.mark.parametrize("scope", list(Scope), ids=lambda scope: scope.name)
+@pytest.mark.parametrize("provider_kind", ["sync", "async"])
+@pytest.mark.parametrize("call", ["invoke", "ainvoke"])
+def test_cleanup_error_of_a_finished_node_keeps_the_error_of_the_failed_node(
+    scope: Scope, provider_kind: str, call: str
+) -> None:
+    """
+    Arrange: a node that finishes with a provider whose cleanup fails, in one step with a node that fails.
+    Act: run the graph.
+    Assert: the run raises the cleanup error, and the error of the failed node is in its context chain.
+    """
+
+    def open_test_resource() -> Iterator[int]:
+        try:
+            yield 1
+        finally:
+            raise LookupError("cleanup failed")
+
+    async def open_awaited_resource() -> AsyncIterator[int]:
+        try:
+            yield 1
+        finally:
+            raise LookupError("cleanup failed")
+
+    provider = open_test_resource if provider_kind == "sync" else open_awaited_resource
+
+    def use_value(state: State, value: Annotated[int, Depends(provider, scope=scope)]) -> State:
+        return {"seen": [value]}
+
+    def raise_error(state: State) -> State:
+        raise ValueError("node failed")
+
+    graph = build_two_node_graph(use_value, raise_error, parallel=True).compile()
+    with pytest.raises(LookupError) as raised:
+        _ = graph.invoke({}) if call == "invoke" else asyncio.run(graph.ainvoke({}))
+
+    chain: list[BaseException] = [raised.value]
+    while chain[-1].__context__ is not None and len(chain) < 10:
+        chain.append(chain[-1].__context__)
+    assert any(isinstance(error, ValueError) for error in chain), (
+        f"Expected the error of the failed node in the context chain, got {chain}."
+    )
+
+
+@pytest.mark.parametrize("call", ["invoke", "ainvoke"])
+def test_cleanup_errors_of_two_nodes_of_one_step_are_both_in_the_context_chain(call: str) -> None:
+    """
+    Arrange: two nodes of one step, each with a node-scoped provider whose cleanup fails.
+    Act: run the graph.
+    Assert: the context chain of the raised error has the two cleanup errors.
+    """
+
+    def open_test_resource() -> Iterator[int]:
+        try:
+            yield 1
+        finally:
+            raise LookupError("first cleanup failed")
+
+    async def open_awaited_resource() -> AsyncIterator[int]:
+        try:
+            yield 2
+        finally:
+            raise ValueError("second cleanup failed")
+
+    def use_first(state: State, value: Annotated[int, Depends(open_test_resource)]) -> State:
+        return {"seen": [value]}
+
+    def use_second(state: State, value: Annotated[int, Depends(open_awaited_resource)]) -> State:
+        return {"seen": [value]}
+
+    graph = build_two_node_graph(use_first, use_second, parallel=True).compile()
+    with pytest.raises((LookupError, ValueError)) as raised:
+        _ = graph.invoke({}) if call == "invoke" else asyncio.run(graph.ainvoke({}))
+
+    chain: list[BaseException] = [raised.value]
+    while chain[-1].__context__ is not None and len(chain) < 10:
+        chain.append(chain[-1].__context__)
+    actual = sorted(type(error).__name__ for error in chain)
+    assert actual == ["LookupError", "ValueError"], f"Expected the two cleanup errors in the chain, got {chain}."
+
+
+def test_cancellation_at_the_start_of_a_cleanup_does_not_skip_the_cleanup() -> None:
+    """
+    Arrange: a node with a sync generator provider that fails directly after a node of the same step failed.
+    Act: run the graph, so the cancellation arrives when the cleanup of the provider starts.
+    Assert: the cleanup ran, and the run raises the errors of the two nodes.
+    """
+    closed: list[str] = []
+    first_waits = asyncio.Event()
+    second_waits = asyncio.Event()
+    gate = asyncio.Event()
+
+    def open_test_resource() -> Iterator[int]:
+        try:
+            yield 1
+        finally:
+            closed.append("closed")
+
+    async def fail_first(state: State) -> State:
+        first_waits.set()
+        await gate.wait()
+        raise ValueError("first")
+
+    async def fail_second(state: State, value: Annotated[int, Depends(open_test_resource)]) -> State:
+        second_waits.set()
+        await gate.wait()
+        raise LookupError("second")
+
+    async def open_gate(state: State) -> State:
+        await first_waits.wait()
+        await second_waits.wait()
+        gate.set()
+        return {}
+
+    builder = build_two_node_graph(fail_second, fail_first, parallel=True)
+    builder.add_node("gate", open_gate)
+    builder.add_edge(Endpoint.start, "gate")
+    with pytest.raises(ExceptionGroup) as raised:
+        asyncio.run(builder.compile().ainvoke({}))
+
+    actual = sorted(type(error).__name__ for error in raised.value.exceptions)
+    assert closed == ["closed"], f"Expected the cleanup of the provider to run one time, got {closed}."
+    assert actual == ["LookupError", "ValueError"], f"Expected the errors of the two nodes, got {actual}."
+
+
 @pytest.mark.parametrize("error_type", [LookupError, ValueError, RuntimeError])
 def test_provider_cleanup_receives_the_exception_of_the_node(error_type: type[Exception]) -> None:
     caught: list[BaseException] = []

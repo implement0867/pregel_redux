@@ -408,11 +408,11 @@ def test_failure_of_a_child_graph_after_an_answer_keeps_the_answer() -> None:
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 
-def test_cancelled_child_graph_after_an_answer_has_no_waiting_interrupt() -> None:
+def test_cancelled_child_graph_after_an_answer_does_not_wait_for_it_again() -> None:
     """
     Arrange: a child graph whose node waits after it got its answer, next to a node that fails in the second run.
     Act: run the thread, answer the question by its id so the failure cancels the child graph, and read the state.
-    Assert: the state has no waiting interrupt, because the node of the child graph received its answer.
+    Assert: only the question of the other node waits, because the node of the child graph received its answer.
     """
     runs: list[str] = []
 
@@ -445,7 +445,36 @@ def test_cancelled_child_graph_after_an_answer_has_no_waiting_interrupt() -> Non
 
     waiting = [item.value for item in asyncio.run(graph.aget_state({"thread_id": "thread"})).interrupts]
 
-    assert waiting == [], f"Expected no waiting interrupt after the answer, got {waiting}."
+    assert waiting == ["other question"], f"Expected only the question without an answer, got {waiting}."
+
+
+def test_failure_before_a_question_keeps_the_question_waiting() -> None:
+    """
+    Arrange: a thread in which a node waits for an answer, and the node fails before its question in the next run.
+    Act: run the thread again without an answer, and read the state after the failure.
+    Assert: the state has the same waiting interrupt, because the question has no answer.
+    """
+    runs: list[str] = []
+
+    def ask(state: State) -> State:
+        runs.append("run")
+        if len(runs) == 2:
+            raise ConnectionError
+        return State(notes=[interrupt("question", response_schema=str)])
+
+    builder = StateGraph(State)
+    builder.add_node("ask", ask)
+    builder.add_edge(Endpoint.start, "ask")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    expected = asyncio.run(graph.aget_state({"thread_id": "thread"})).interrupts
+    with pytest.raises(ConnectionError):
+        asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+
+    actual = asyncio.run(graph.aget_state({"thread_id": "thread"})).interrupts
+
+    assert [item.value for item in expected] == ["question"], f"Expected one waiting question, got {expected}."
+    assert actual == expected, f"Expected the waiting interrupts {expected}, got {actual}."
 
 
 def test_plain_answer_goes_to_the_one_interrupt_that_waits() -> None:

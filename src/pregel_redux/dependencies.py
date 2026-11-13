@@ -95,6 +95,26 @@ async def finish_despite_cancellation[ResultT](work: Awaitable[ResultT]) -> Resu
     return result
 
 
+def close_at_exit(exits: AsyncExitStack, until: AsyncExitStack) -> None:
+    async def close(
+        error_type: type[BaseException] | None, error: BaseException | None, traceback: TracebackType | None
+    ) -> bool:
+        try:
+            await exits.aclose()
+        except BaseException as cleanup_error:
+            last = cleanup_error
+            chain = {id(last)}
+            while last.__context__ is not None and id(last.__context__) not in chain:
+                last = last.__context__
+                chain.add(id(last))
+            if error is not None and id(error) not in chain and last.__context__ is None:
+                last.__context__ = error
+            raise
+        return False
+
+    until.push_async_exit(close)
+
+
 async def run_in_thread(function: Callable[..., object], *arguments: object, **named_arguments: object) -> object:
     await asyncio.sleep(0)  # deliver a pending cancellation
     return await finish_despite_cancellation(asyncio.to_thread(function, *arguments, **named_arguments))
@@ -110,7 +130,7 @@ class ThreadedContext(AbstractAsyncContextManager[object]):
     async def __aexit__(
         self, error_type: type[BaseException] | None, error: BaseException | None, traceback: TracebackType | None
     ) -> bool | None:
-        return bool(await run_in_thread(self.manager.__exit__, error_type, error, traceback))
+        return await finish_despite_cancellation(asyncio.to_thread(self.manager.__exit__, error_type, error, traceback))
 
 
 async def call_without_blocking(

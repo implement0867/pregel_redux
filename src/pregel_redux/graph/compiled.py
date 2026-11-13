@@ -1,6 +1,5 @@
 import asyncio
 import inspect
-import sys
 import threading
 from collections import ChainMap
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Collection, Coroutine, Generator, Mapping, Sequence
@@ -21,6 +20,7 @@ from pregel_redux.commands import Endpoint, Send, read_outcome
 from pregel_redux.dependencies import (
     CallPlan,
     Depends,
+    close_at_exit,
     execute_plan,
     finish_despite_cancellation,
     open_providers,
@@ -207,6 +207,10 @@ def run_in_new_loop[ResultT](start_run: Callable[[], Coroutine[object, object, R
     try:
         asyncio.get_running_loop()
     except RuntimeError:
+        in_loop = False
+    else:
+        in_loop = True
+    if not in_loop:
         return asyncio.run(start_run())
     with ThreadPoolExecutor(max_workers=1) as executor:
         return executor.submit(copy_context().run, asyncio.run, start_run()).result()
@@ -572,8 +576,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
             run.stream.send(StreamMode.tasks, TaskResultPart(journal.ns, task_id, str(name), {}, stop.interrupts))
             return TaskInterrupted(stop.interrupts)
         finally:
-            cancelled = isinstance(sys.exception(), asyncio.CancelledError)
-            if not ended and (len(scratchpad.resume) > saved_answers or not cancelled):
+            if not ended and len(scratchpad.resume) > saved_answers:
                 await finish_despite_cancellation(journal.record_interrupt(call.task, (), scratchpad.resume))
         await finish_despite_cancellation(journal.record(call.task, writes))
         if isinstance(name, str):
@@ -628,7 +631,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         async with AsyncExitStack[bool]() as node_exits:
             result = await execute_plan(plan, call.node_input, node_values, node_exits)
             writes = self.read_writes(name, result)
-            step_exits.push_async_callback(node_exits.pop_all().aclose)
+            close_at_exit(node_exits.pop_all(), step_exits)
         if writes is None:
             raise RuntimeError(f"a dependency of {plan.function!r} suppressed the exception of its node")
         return writes

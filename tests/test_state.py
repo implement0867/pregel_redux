@@ -689,3 +689,31 @@ def test_state_history_with_an_unknown_checkpoint_id_is_empty() -> None:
     actual = list(graph.get_state_history({"thread_id": "thread", "checkpoint_id": uuid4()}))
 
     assert actual == [], f"Expected no state, got {actual}."
+
+
+def test_state_update_after_a_failed_step_keeps_the_writes_of_the_finished_node() -> None:
+    """
+    Arrange: a thread whose step has a node that finished and a node that failed.
+    Act: update the state as the failed node, and read the state.
+    Assert: the state has the write of the finished node and then the update.
+    """
+    calls: list[str] = []
+
+    def fail(state: State) -> State:
+        raise ConnectionError
+
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("finished", build_writer("finished", calls))
+    builder.add_node("failed", fail)
+    builder.add_edge(Endpoint.start, "finished")
+    builder.add_edge(Endpoint.start, "failed")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    config = ThreadConfig(thread_id="thread")
+    with pytest.raises(ConnectionError):
+        graph.invoke({}, config)
+
+    graph.update_state(config, State(notes=["update"]), as_node="failed")
+    actual = graph.get_state(config).values
+
+    expected = {"notes": ["finished", "update"]}
+    assert actual == expected, f"Expected {expected}, got {actual}."

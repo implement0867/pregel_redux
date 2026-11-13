@@ -832,6 +832,21 @@ class PersistentGraph[StateT, InputT, OutputT]:
             checkpoint = loaded.saved.checkpoint
             node = infer_writer(graph, checkpoint.versions_seen) if as_node is None else as_node
             position = scope.read_position(loaded.saved)
+            if config.get("checkpoint_id") is None:
+                journal = scope.open_journal(loaded.saved)
+                finished = [
+                    (task, writes)
+                    for task in plan_tasks(position, graph.triggers)
+                    if (writes := journal.find_writes(refer_task(task))) is not None
+                ]
+                if finished:
+                    position = apply_writes(
+                        position,
+                        [task for task, _ in finished],
+                        [writes for _, writes in finished],
+                        [],
+                        graph.trigger_keys,
+                    )
             step, parent_id, newest_id = checkpoint.step, checkpoint.id, loaded.newest_id
         if node not in graph.nodes:
             raise ValueError(f"as_node is {node!r}, which is not a node of this graph")
