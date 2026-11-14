@@ -21,6 +21,7 @@ build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "ast-grep-cli>=0.51.2",
     "basedpyright>=1.40.2",
     "hypothesis>=6.170.15",
     "pytest>=9.1.1,<9.2",

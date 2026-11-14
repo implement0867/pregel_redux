@@ -12,6 +12,21 @@ wheels = [
 ]
 
 [[package]]
+name = "ast-grep-cli"
+version = "0.51.2"
+source = { registry = "https://pypi.org/simple" }
+sdist = { url = "https://files.pythonhosted.org/packages/6f/0c/6197f089e762c7c82fe23b895dedd515cd2ed16d477f9983b5b3e50d4586/ast_grep_cli-0.51.2.tar.gz", hash = "sha256:7e787c6fe171026e16fb9761a6d3b50cbc6f519b893e7cff2e66dfde95145c81", size = 299897, upload-time = "2026-11-11T05:17:37.982Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/6e/08/6e7843c7061b92fed10ecc604bf9263e65050325b1a5e73ee7c9d6d8b005/ast_grep_cli-0.51.2-py3-none-macosx_10_12_universal2.macosx_10_12_x86_64.macosx_11_0_arm64.whl", hash = "sha256:4301bfa472b7fa77dadb639173e3908bd0b97ffe3e164ab62e03c14e94669616", size = 17360542, upload-time = "2026-11-11T05:17:18.956Z" },
+    { url = "https://files.pythonhosted.org/packages/b6/ef/1cd2da2353ff8e6db008d8a6d372dc413c1d09127c82525323bdd74eb747/ast_grep_cli-0.51.2-py3-none-macosx_10_12_x86_64.whl", hash = "sha256:6a2f528fc10d668b220b512e7e34466a13b4ba7b5ee95d1596a2b1e194a0a6cf", size = 8711114, upload-time = "2026-11-11T05:17:21.927Z" },
+    { url = "https://files.pythonhosted.org/packages/cb/53/825dbe31554952870173af79eb032b079da36a2387f284e99c97f1bdcd78/ast_grep_cli-0.51.2-py3-none-manylinux_2_28_aarch64.whl", hash = "sha256:571f8c7cb2c7de16c52cf7862f2a528c67eb87d084e335a3f7366c7fa745158c", size = 8536527, upload-time = "2026-11-11T05:17:24.174Z" },
+    { url = "https://files.pythonhosted.org/packages/c6/e3/0531ce742e1c8df48dc51b7eaf6fcf0c10aa3d52e51ba82a720658248d99/ast_grep_cli-0.51.2-py3-none-manylinux_2_28_x86_64.whl", hash = "sha256:461f5ea36dbc0d8e3b965128deb0ac81b17f41b74b28da909cf836ce95953027", size = 8889774, upload-time = "2026-11-11T05:17:26.379Z" },
+    { url = "https://files.pythonhosted.org/packages/22/b8/ac07fd5478d3a43e2d7b560bce6060df1071935fe210425637985d171896/ast_grep_cli-0.51.2-py3-none-win32.whl", hash = "sha256:a20d49bf6f3305c026f93e964c602819712af9caec8df44d278c7940707685f9", size = 16666561, upload-time = "2026-11-11T05:17:29.412Z" },
+    { url = "https://files.pythonhosted.org/packages/b7/2b/715cd3706e160f624c8da574d8acdf78249a9858d9331fa2cbfe19f7a5ad/ast_grep_cli-0.51.2-py3-none-win_amd64.whl", hash = "sha256:b8aad3396a78e1129c2e00f664f8c6965d9c1c1329140722d607517f69ad279a", size = 17767965, upload-time = "2026-11-11T05:17:32.568Z" },
+    { url = "https://files.pythonhosted.org/packages/a4/01/21ff76e85c8fe1ec6a182ed2296f28a859c0ca85c05d950e4eb2059e3ee6/ast_grep_cli-0.51.2-py3-none-win_arm64.whl", hash = "sha256:ba0f2d5d672bdd2d6926ce7fc7c062b15d468af73c2d35a1244fc853f4cf93f4", size = 17026621, upload-time = "2026-11-11T05:17:35.927Z" },
+]
+
+[[package]]
 name = "basedpyright"
 version = "1.40.2"
 source = { registry = "https://pypi.org/simple" }
@@ -293,6 +308,7 @@ sqlite = [
 
 [package.dev-dependencies]
 dev = [
+    { name = "ast-grep-cli" },
     { name = "basedpyright" },
     { name = "hypothesis" },
     { name = "pytest" },
@@ -313,6 +329,7 @@ provides-extras = ["sqlite"]
 
 [package.metadata.requires-dev]
 dev = [
+    { name = "ast-grep-cli", specifier = ">=0.51.2" },
     { name = "basedpyright", specifier = ">=1.40.2" },
     { name = "hypothesis", specifier = ">=6.170.15" },
     { name = "pytest", specifier = ">=9.1.1,<9.2" },
