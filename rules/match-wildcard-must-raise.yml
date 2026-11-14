@@ -1,0 +1,18 @@
+id: match-wildcard-must-raise
+language: python
+severity: error
+message: The last catch-all case (`case _:` or a bare name) of a `match` must raise or call `assert_never`.
+note: Name each accepted case in its own pattern, so that an unexpected value cannot pass.
+rule:
+  kind: case_clause
+  has:
+    matches: catch-all-pattern
+  not:
+    has:
+      kind: block
+      has:
+        any:
+          - kind: raise_statement
+          - kind: expression_statement
+            has:
+              pattern: assert_never($$$ARGS)

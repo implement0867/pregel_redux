@@ -1,0 +1,23 @@
+id: match-needs-wildcard
+valid:
+  - |
+    match result:
+        case Interrupted():
+            return result.interrupts
+        case Finished():
+            return []
+        case _:
+            assert_never(result)
+  - |
+    match result:
+        case Finished():
+            return []
+        case other:
+            assert_never(other)
+invalid:
+  - |
+    match result:
+        case Interrupted():
+            return result.interrupts
+        case Finished():
+            return []

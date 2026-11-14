@@ -1,0 +1,44 @@
+id: no-fallback-conditional
+snapshots:
+  before = frozenset(interrupt_before) if interrupt_before != '*' else names:
+    labels:
+    - source: frozenset(interrupt_before) if interrupt_before != '*' else names
+      style: primary
+      start: 9
+      end: 74
+  before = names if interrupt_before == '*' else frozenset(interrupt_before):
+    labels:
+    - source: names if interrupt_before == '*' else frozenset(interrupt_before)
+      style: primary
+      start: 9
+      end: 74
+  "error = status.error if isinstance(status, FailedTask) else None":
+    labels:
+    - source: status.error if isinstance(status, FailedTask) else None
+      style: primary
+      start: 8
+      end: 64
+  "modes = [mode] if isinstance(mode, StreamMode) else list(mode)":
+    labels:
+    - source: "[mode] if isinstance(mode, StreamMode) else list(mode)"
+      style: primary
+      start: 8
+      end: 62
+  "modes = frozenset([mode] if isinstance(mode, StreamMode) else mode)":
+    labels:
+    - source: "[mode] if isinstance(mode, StreamMode) else mode"
+      style: primary
+      start: 18
+      end: 66
+  "modes = mode if not isinstance(mode, StreamMode) else [mode]":
+    labels:
+    - source: mode if not isinstance(mode, StreamMode) else [mode]
+      style: primary
+      start: 8
+      end: 60
+  "questions = asked.interrupts if isinstance(asked, Interrupted) else ()":
+    labels:
+    - source: asked.interrupts if isinstance(asked, Interrupted) else ()
+      style: primary
+      start: 12
+      end: 70

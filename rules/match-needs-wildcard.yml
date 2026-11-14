@@ -1,0 +1,12 @@
+id: match-needs-wildcard
+language: python
+severity: error
+message: A `match` must end with a catch-all case that raises or calls `assert_never`.
+rule:
+  kind: match_statement
+  not:
+    has:
+      stopBy: end
+      kind: case_clause
+      has:
+        matches: catch-all-pattern
