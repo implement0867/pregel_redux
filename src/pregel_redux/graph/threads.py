@@ -25,7 +25,7 @@ from pregel_redux.checkpoints import (
 )
 from pregel_redux.commands import Command
 from pregel_redux.configs import Namespace, Segment, encode_namespace
-from pregel_redux.dependencies import finish_despite_cancellation
+from pregel_redux.dependencies import CallPlan, finish_despite_cancellation
 from pregel_redux.graph.compiled import ChildEntry, CompiledGraph
 from pregel_redux.graph.conversion import (
     AnyGraph,
@@ -123,11 +123,16 @@ class ThreadScope:
             case StartRef():
                 return None
             case PullRef() | PushRef():
-                child = self.graph.nodes[task.name].action
+                action = self.graph.nodes[task.name].action
             case _:
                 assert_never(task)
-        if not isinstance(child, CompiledGraph):
-            return None
+        match action:
+            case CallPlan():
+                return None
+            case CompiledGraph() as child:
+                pass
+            case _:
+                assert_never(action)
         scope = ThreadScope(child, self.checkpointer, self.thread_id, journal.make_task_ns(task))
         saved = await self.checkpointer.aget_tuple(scope.thread_id, scope.stored_ns, None)
         return None if saved is None else await scope.read_snapshot(saved, subgraphs=True)
