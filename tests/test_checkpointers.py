@@ -70,9 +70,9 @@ def test_run_with_an_interrupt_continues_from_the_stored_checkpoint(checkpointer
     Assert: the output has the notes of all nodes and the answer.
     """
     graph = build_graph(checkpointer)
-    graph.invoke({}, {"thread_id": "thread"})
+    graph.invoke({}, "thread")
 
-    actual = graph.invoke(Command(resume="answer"), {"thread_id": "thread"})
+    actual = graph.invoke(Command(resume="answer"), "thread")
 
     expected = Finished(Output(notes=["first", "answer", "last"]))
     assert actual == expected, f"Expected {expected}, got {actual}."
@@ -85,12 +85,12 @@ def test_threads_do_not_share_checkpoints(checkpointer: Checkpointer) -> None:
     Assert: the third thread has no checkpoint, and each thread has its own latest step.
     """
     graph = build_graph(checkpointer)
-    graph.invoke({}, {"thread_id": "stopped"})
-    graph.invoke({}, {"thread_id": "finished"})
-    graph.invoke(Command(resume="answer"), {"thread_id": "finished"})
+    graph.invoke({}, "stopped")
+    graph.invoke({}, "finished")
+    graph.invoke(Command(resume="answer"), "finished")
 
     missing = asyncio.run(checkpointer.aget_tuple("other", "", None))
-    steps = [graph.get_state({"thread_id": thread_id}).step for thread_id in ("stopped", "finished")]
+    steps = [graph.get_state(thread_id).step for thread_id in ("stopped", "finished")]
 
     assert missing is None, f"Expected no checkpoint, got {missing}."
     assert steps == [1, 3], f"Expected the steps [1, 3], got {steps}."
@@ -106,7 +106,7 @@ def test_list_gives_the_checkpoints_before_an_id_with_the_newest_first(
     Assert: the list has the older checkpoints, the newest first, and not more than the limit.
     """
     graph = build_graph(checkpointer)
-    graph.invoke({}, {"thread_id": "thread"})
+    graph.invoke({}, "thread")
     stored = asyncio.run(collect(checkpointer.alist("thread", "", before=None, limit=None)))
     before = None if skipped == 0 else stored[skipped - 1].checkpoint.id
 
@@ -124,7 +124,7 @@ def test_checkpoint_is_found_by_its_id_with_its_pending_writes(checkpointer: Che
     Assert: the checkpoint has one record for the stop and one for the last record of the command.
     """
     graph = build_graph(checkpointer)
-    graph.invoke({}, {"thread_id": "thread"})
+    graph.invoke({}, "thread")
     stopped = asyncio.run(collect(checkpointer.alist("thread", "", before=None, limit=1)))[0].checkpoint
     one, two = (
         RunCommandRecord(index=0, command=SavedWrites(fields={}, branches=(node,), arrivals=(), sends=()))
@@ -152,8 +152,8 @@ def test_deleted_thread_has_no_checkpoints(checkpointer: Checkpointer) -> None:
     Assert: the deleted thread has no checkpoint, and the other thread keeps its checkpoints.
     """
     graph = build_graph(checkpointer)
-    graph.invoke({}, {"thread_id": "deleted"})
-    graph.invoke({}, {"thread_id": "kept"})
+    graph.invoke({}, "deleted")
+    graph.invoke({}, "kept")
 
     asyncio.run(checkpointer.adelete_thread("deleted"))
 
@@ -191,12 +191,12 @@ def test_sync_functions_of_the_graph_use_the_sync_functions_of_the_checkpointer(
     Assert: the run finishes with the notes of the nodes, the update and the answer, and the history has each step.
     """
     graph = build_graph(SyncOnlyCheckpointer())
-    stopped = list(graph.stream({}, {"thread_id": "thread"}))
-    graph.update_state({"thread_id": "thread"}, {"notes": ["update"]}, as_node="first")
+    stopped = list(graph.stream({}, "thread"))
+    graph.update_state("thread", {"notes": ["update"]}, as_node="first")
 
-    actual = graph.invoke(Command(resume="answer"), {"thread_id": "thread"})
+    actual = graph.invoke(Command(resume="answer"), "thread")
 
-    steps = [snapshot.step for snapshot in graph.get_state_history({"thread_id": "thread"})]
+    steps = [snapshot.step for snapshot in graph.get_state_history("thread")]
     expected = Finished(Output(notes=["first", "update", "answer", "last"]))
     kinds = [type(part) for part in stopped if isinstance(part, UpdatesPart | InterruptsPart)]
     assert kinds == [UpdatesPart, InterruptsPart], (
@@ -204,7 +204,7 @@ def test_sync_functions_of_the_graph_use_the_sync_functions_of_the_checkpointer(
     )
     assert actual == expected, f"Expected {expected}, got {actual}."
     assert steps == [4, 3, 2, 1, 0, -1], f"Expected the steps from 4 to -1, got {steps}."
-    assert graph.get_state({"thread_id": "thread"}).step == 4, "Expected the state of the last step."
+    assert graph.get_state("thread").step == 4, "Expected the state of the last step."
 
 
 def test_sync_functions_of_the_checkpointer_give_the_stored_checkpoints(checkpointer: Checkpointer) -> None:
@@ -214,7 +214,7 @@ def test_sync_functions_of_the_checkpointer_give_the_stored_checkpoints(checkpoi
     Assert: the newest checkpoint is the first of the list, and the deleted thread has no checkpoint.
     """
     graph = build_graph(checkpointer)
-    graph.invoke({}, {"thread_id": "thread"})
+    graph.invoke({}, "thread")
 
     newest = checkpointer.get_tuple("thread", "", None)
     listed = list(checkpointer.list("thread", "", before=None, limit=None))
@@ -233,9 +233,9 @@ def test_async_functions_of_the_graph_work_with_each_checkpointer(checkpointer: 
     Assert: the output has the notes of all nodes and the answer.
     """
     graph = build_graph(checkpointer)
-    asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    asyncio.run(graph.ainvoke({}, "thread"))
 
-    actual = asyncio.run(graph.ainvoke(Command(resume="answer"), {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(Command(resume="answer"), "thread"))
 
     expected = Finished(Output(notes=["first", "answer", "last"]))
     assert actual == expected, f"Expected {expected}, got {actual}."

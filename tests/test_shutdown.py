@@ -58,8 +58,8 @@ def test_graceful_shutdown_stops_the_run_after_the_current_step() -> None:
     builder.add_edge("first", "second")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
-    stopped = graph.invoke({}, {"thread_id": "thread"}, signal=controller.signal)
-    finished = graph.invoke(None, {"thread_id": "thread"})
+    stopped = graph.invoke({}, "thread", signal=controller.signal)
+    finished = graph.invoke(None, "thread")
 
     assert stopped == Interrupted((), {"notes": ["first"]}, StopReason.shutdown), (
         f"Expected a stop after the first node, got {stopped}."
@@ -101,8 +101,8 @@ def test_graceful_shutdown_lets_the_other_nodes_of_the_step_finish() -> None:
     builder.add_edge(("request", "slow"), "last")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
-    stopped = asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}, signal=controller.signal))
-    finished = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+    stopped = asyncio.run(graph.ainvoke({}, "thread", signal=controller.signal))
+    finished = asyncio.run(graph.ainvoke(None, "thread"))
 
     assert stopped == Interrupted((), {"notes": ["request", "slow"]}, StopReason.shutdown), (
         f"Expected the two writes, got {stopped}."
@@ -139,9 +139,9 @@ def test_graceful_shutdown_stops_a_child_graph_after_its_current_step() -> None:
     builder.add_edge(Endpoint.start, "child")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
-    stopped = graph.invoke({}, {"thread_id": "thread"}, signal=controller.signal)
+    stopped = graph.invoke({}, "thread", signal=controller.signal)
     calls_at_the_stop = list(calls)
-    finished = graph.invoke(None, {"thread_id": "thread"})
+    finished = graph.invoke(None, "thread")
 
     assert stopped == Interrupted((), {"notes": []}, StopReason.shutdown), (
         f"Expected a stop inside the child graph, got {stopped}."
@@ -170,7 +170,7 @@ def test_run_with_a_signal_that_already_requests_a_shutdown_runs_no_node() -> No
     builder.add_edge(Endpoint.start, "write")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
-    stopped = graph.invoke({"notes": ["input"]}, {"thread_id": "thread"}, signal=controller.signal)
+    stopped = graph.invoke({"notes": ["input"]}, "thread", signal=controller.signal)
 
     assert stopped == Interrupted((), {"notes": ["input"]}, StopReason.shutdown), (
         f"Expected a stop with the input, got {stopped}."
@@ -194,11 +194,11 @@ def test_graceful_shutdown_before_a_step_reports_the_questions_that_wait() -> No
     builder.add_node("ask", ask)
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    asked = graph.invoke({}, {"thread_id": "thread"})
+    asked = graph.invoke({}, "thread")
 
-    stopped = graph.invoke(None, {"thread_id": "thread"}, signal=controller.signal)
+    stopped = graph.invoke(None, "thread", signal=controller.signal)
 
-    waiting = graph.get_state({"thread_id": "thread"}).interrupts
+    waiting = graph.get_state("thread").interrupts
     assert isinstance(asked, Interrupted), f"Expected a question in the first run, got {asked}."
     assert isinstance(stopped, Interrupted), f"Expected a stop, got {stopped}."
     assert stopped.interrupts == asked.interrupts == waiting, f"Expected the question {waiting}, got {stopped}."
@@ -233,9 +233,9 @@ def test_abort_stops_a_node_at_once_and_runs_the_cleanup() -> None:
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
     with pytest.raises(RunAborted):
-        asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}, signal=controller.signal))
+        asyncio.run(graph.ainvoke({}, "thread", signal=controller.signal))
     events_at_the_abort = list(events)
-    finished = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+    finished = asyncio.run(graph.ainvoke(None, "thread"))
 
     assert events_at_the_abort == ["open", "node", "close"], f"Expected the cleanup, got {events_at_the_abort}."
     assert finished == Finished(State(notes=["link"])), f"Expected the write of the second run, got {finished}."
@@ -260,7 +260,7 @@ def test_abort_from_a_different_thread_stops_the_run() -> None:
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
     with pytest.raises(RunAborted):
-        asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}, signal=controller.signal))
+        asyncio.run(graph.ainvoke({}, "thread", signal=controller.signal))
 
 
 def test_run_with_a_signal_that_is_already_aborted_raises_without_a_checkpoint() -> None:
@@ -277,9 +277,9 @@ def test_run_with_a_signal_that_is_already_aborted_raises_without_a_checkpoint()
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
     with pytest.raises(RunAborted):
-        graph.invoke({}, {"thread_id": "thread"}, signal=controller.signal)
+        graph.invoke({}, "thread", signal=controller.signal)
 
-    history = list(graph.get_state_history({"thread_id": "thread"}))
+    history = list(graph.get_state_history("thread"))
     assert history == [], f"Expected no checkpoint, got {history}."
 
 
@@ -302,7 +302,7 @@ def test_grace_period_aborts_a_node_that_does_not_finish() -> None:
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
     with pytest.raises(RunAborted):
-        asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}, signal=controller.signal))
+        asyncio.run(graph.ainvoke({}, "thread", signal=controller.signal))
 
 
 def test_node_that_finishes_in_the_grace_period_gives_a_graceful_stop() -> None:
@@ -324,7 +324,7 @@ def test_node_that_finishes_in_the_grace_period_gives_a_graceful_stop() -> None:
     builder.add_edge("first", "second")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
-    stopped = graph.invoke({}, {"thread_id": "thread"}, signal=controller.signal)
+    stopped = graph.invoke({}, "thread", signal=controller.signal)
 
     assert stopped == Interrupted((), {"notes": ["first"]}, StopReason.shutdown), (
         f"Expected a stop after the first node, got {stopped}."
@@ -351,8 +351,8 @@ def test_node_reads_the_shutdown_signal_of_its_run() -> None:
     builder.add_edge(Endpoint.start, "read")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
-    graph.invoke({}, {"thread_id": "with signal"}, signal=controller.signal)
-    graph.invoke({}, {"thread_id": "without signal"})
+    graph.invoke({}, "with signal", signal=controller.signal)
+    graph.invoke({}, "without signal")
 
     assert seen == [(False, True), (False, False)], f"Expected the request only in the first run, got {seen}."
 
@@ -376,7 +376,7 @@ def test_stream_ends_after_the_current_step_at_a_graceful_shutdown() -> None:
     builder.add_edge("first", "second")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
-    parts = list(graph.stream({}, {"thread_id": "thread"}, signal=controller.signal))
+    parts = list(graph.stream({}, "thread", signal=controller.signal))
 
     names = [part.node for part in parts if isinstance(part, UpdatesPart)]
     stops = [part for part in parts if isinstance(part, InterruptsPart)]
@@ -403,7 +403,7 @@ def test_stream_raises_at_an_abort() -> None:
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
     with pytest.raises(RunAborted):
-        asyncio.run(collect(graph.astream({}, {"thread_id": "thread"}, signal=controller.signal)))
+        asyncio.run(collect(graph.astream({}, "thread", signal=controller.signal)))
 
 
 def test_shutdown_request_after_an_abort_keeps_the_abort() -> None:
@@ -499,7 +499,7 @@ def test_first_interrupt_signal_requests_a_graceful_shutdown() -> None:
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
     with graceful_shutdown() as shutdown:
-        stopped = asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}, signal=shutdown))
+        stopped = asyncio.run(graph.ainvoke({}, "thread", signal=shutdown))
 
     assert stopped == Interrupted((), {"notes": ["first"]}, StopReason.shutdown), (
         f"Expected a stop after the first node, got {stopped}."
@@ -526,7 +526,7 @@ def test_second_interrupt_signal_aborts_the_run() -> None:
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
     with graceful_shutdown() as shutdown, pytest.raises(RunAborted):
-        asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}, signal=shutdown))
+        asyncio.run(graph.ainvoke({}, "thread", signal=shutdown))
 
 
 def test_terminate_signal_requests_a_graceful_shutdown_with_the_grace_period() -> None:
@@ -547,7 +547,7 @@ def test_terminate_signal_requests_a_graceful_shutdown_with_the_grace_period() -
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
     with graceful_shutdown(grace_period=0.01) as shutdown, pytest.raises(RunAborted):
-        asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}, signal=shutdown))
+        asyncio.run(graph.ainvoke({}, "thread", signal=shutdown))
 
 
 def test_caller_that_cancels_a_run_with_a_signal_gets_its_own_cancellation() -> None:
@@ -568,6 +568,4 @@ def test_caller_that_cancels_a_run_with_a_signal_gets_its_own_cancellation() -> 
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
     with pytest.raises(TimeoutError):
-        asyncio.run(
-            asyncio.wait_for(graph.ainvoke({}, {"thread_id": "thread"}, signal=controller.signal), timeout=0.01)
-        )
+        asyncio.run(asyncio.wait_for(graph.ainvoke({}, "thread", signal=controller.signal), timeout=0.01))

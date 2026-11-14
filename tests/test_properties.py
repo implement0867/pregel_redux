@@ -36,7 +36,6 @@ from pregel_redux import (
     ShutdownSignal,
     StateGraph,
     StateSnapshot,
-    ThreadConfig,
     interrupt,
 )
 from pregel_redux.checkpoints import CheckpointSource
@@ -630,7 +629,7 @@ class ThreadMachine(RuleBasedStateMachine):
         self.exits = ExitStack()
         self.runner = self.exits.enter_context(asyncio.Runner())
         self.checkpointer = self.exits.enter_context(self.open_checkpointer())
-        self.config = ThreadConfig(thread_id="thread")
+        self.thread_id = "thread"
         self.threads: list[Thread] = []
 
     def open_checkpointer(self) -> AbstractContextManager[Checkpointer]:
@@ -672,7 +671,7 @@ class ThreadMachine(RuleBasedStateMachine):
     def collect_stream(
         self,
         run_input: State | Command[str] | None,
-        config: ThreadConfig,
+        fork_from: UUID | None,
         mode: CallMode,
         plan: StreamPlan,
         signal: ShutdownSignal,
@@ -681,7 +680,7 @@ class ThreadMachine(RuleBasedStateMachine):
 
         def collect_sync() -> list[StreamPart | ChildPart]:
             taken: list[StreamPart | ChildPart] = []
-            parts = graph.stream(run_input, config, step_limit=1000, signal=signal)
+            parts = graph.stream(run_input, "thread", fork_from=fork_from, step_limit=1000, signal=signal)
             with closing(parts):
                 for part in parts:
                     if len(taken) == plan.stop_after:
@@ -691,7 +690,7 @@ class ThreadMachine(RuleBasedStateMachine):
 
         match mode:
             case CallMode.asynchronous:
-                parts = graph.astream(run_input, config, step_limit=1000, signal=signal)
+                parts = graph.astream(run_input, "thread", fork_from=fork_from, step_limit=1000, signal=signal)
                 return self.runner.run(take(parts, plan.stop_after))
             case CallMode.sync:
                 return collect_sync()
@@ -704,16 +703,16 @@ class ThreadMachine(RuleBasedStateMachine):
         graph = self.thread.graph
         namespaces = {part.ns for part in parts if isinstance(part, ChildPart)}
         for namespace in namespaces:
-            config = ThreadConfig(thread_id="thread", checkpoint_ns="|".join(namespace))
-            found = self.runner.run(graph.aget_state(config))
-            assert found.checkpoint_ns == config.get("checkpoint_ns"), f"Expected the state of {namespace}."
+            checkpoint_ns = "|".join(namespace)
+            found = self.runner.run(graph.aget_state("thread", checkpoint_ns=checkpoint_ns))
+            assert found.checkpoint_ns == checkpoint_ns, f"Expected the state of {namespace}."
         if plan.stop_after is None:
             values = [part.values for part in parts if isinstance(part, ValuesPart)]
-            newest = self.runner.run(graph.aget_state(self.config)).values
+            newest = self.runner.run(graph.aget_state(self.thread_id)).values
             assert not values or values[-1] == newest, f"Expected the last values part {newest}, got {values[-1]}."
 
     def deliver(
-        self, run_input: State | Command[str] | None, config: ThreadConfig, delivery: Delivery
+        self, run_input: State | Command[str] | None, fork_from: UUID | None, delivery: Delivery
     ) -> Finished[State] | Interrupted | None:
         graph = self.thread.graph
         mode = delivery.mode if self.thread.sync_allowed else CallMode.asynchronous
@@ -728,16 +727,22 @@ class ThreadMachine(RuleBasedStateMachine):
         raised: list[BaseException] = []
         try:
             if delivery.stream is not None:
-                parts = self.collect_stream(run_input, config, mode, delivery.stream, signal)
+                parts = self.collect_stream(run_input, fork_from, mode, delivery.stream, signal)
             else:
                 match mode:
                     case CallMode.asynchronous:
-                        result = self.runner.run(graph.ainvoke(run_input, config, step_limit=1000, signal=signal))
+                        result = self.runner.run(
+                            graph.ainvoke(run_input, "thread", fork_from=fork_from, step_limit=1000, signal=signal)
+                        )
                     case CallMode.sync:
-                        result = graph.invoke(run_input, config, step_limit=1000, signal=signal)
+                        result = graph.invoke(run_input, "thread", fork_from=fork_from, step_limit=1000, signal=signal)
                     case CallMode.sync_in_loop:
                         result = self.runner.run(
-                            call_in_loop(lambda: graph.invoke(run_input, config, step_limit=1000, signal=signal))
+                            call_in_loop(
+                                lambda: graph.invoke(
+                                    run_input, "thread", fork_from=fork_from, step_limit=1000, signal=signal
+                                )
+                            )
                         )
                     case _:
                         assert_never(mode)
@@ -752,7 +757,7 @@ class ThreadMachine(RuleBasedStateMachine):
         if delivery.stream is None or delivery.stream.stop_after is None:
             assert reported == failed, f"Expected the errors of all failures {failed}, got {reported}."
         if delivery.stream is None or delivery.stream.stop_after is None:
-            tasks = self.runner.run(graph.aget_state(self.config)).tasks
+            tasks = self.runner.run(graph.aget_state(self.thread_id)).tasks
             for path, phase in trace.fired[fired:]:
                 name = self.thread.spec.nodes[path[0]].name
                 assert phase is Phase.cleanup or any(
@@ -770,12 +775,11 @@ class ThreadMachine(RuleBasedStateMachine):
         if not requests:
             return
         graph = self.thread.graph
-        snapshot = self.runner.run(graph.aget_state(self.config, subgraphs=True))
+        snapshot = self.runner.run(graph.aget_state(self.thread_id, subgraphs=True))
         for namespace in ["", *(child.checkpoint_ns for child in find_namespaces(snapshot))]:
-            config = ThreadConfig(thread_id="thread", checkpoint_ns=namespace)
             later = [
                 item.step
-                for item in self.runner.run(collect(graph.aget_state_history(config)))
+                for item in self.runner.run(collect(graph.aget_state_history("thread", checkpoint_ns=namespace)))
                 if item.source is CheckpointSource.loop and item.created_at > requests[0]
             ]
             assert len(later) <= 1, (
@@ -784,7 +788,7 @@ class ThreadMachine(RuleBasedStateMachine):
 
     def check_stops(self, known: set[UUID]) -> None:
         thread = self.thread
-        thread.history = self.runner.run(collect(thread.graph.aget_state_history(self.config)))
+        thread.history = self.runner.run(collect(thread.graph.aget_state_history(self.thread_id)))
         history = {item.checkpoint_id: item for item in thread.history}
         for reached in thread.history:
             passed = None if reached.parent_id is None else history.get(reached.parent_id)
@@ -812,7 +816,7 @@ class ThreadMachine(RuleBasedStateMachine):
 
     def check_questions_still_wait(self, unanswered: Sequence[Interrupt]) -> None:
         now = {
-            item.id for item in self.runner.run(self.thread.graph.aget_state(self.config, subgraphs=True)).interrupts
+            item.id for item in self.runner.run(self.thread.graph.aget_state(self.thread_id, subgraphs=True)).interrupts
         }
         lost = [item for item in unanswered if item.id not in now]
         assert not lost, f"Expected each question without an answer to wait after the run, lost {lost}."
@@ -821,15 +825,15 @@ class ThreadMachine(RuleBasedStateMachine):
     def send_input(self, delivery: Delivery, origin: str) -> None:
         if self.is_started():
             self.thread.diverge()
-            self.deliver(State(origin=origin), self.config, delivery)
+            self.deliver(State(origin=origin), None, delivery)
         else:
-            self.deliver(State(origin=self.thread.origin), self.config, delivery)
+            self.deliver(State(origin=self.thread.origin), None, delivery)
 
     @precondition(is_started)
     @rule(delivery=deliveries())
     def resume(self, delivery: Delivery) -> None:
         unanswered = self.waiting()
-        self.deliver(None, self.config, delivery)
+        self.deliver(None, None, delivery)
         self.check_questions_still_wait(unanswered)
 
     @precondition(is_started)
@@ -848,7 +852,7 @@ class ThreadMachine(RuleBasedStateMachine):
             {read_question(item): answers[item.id] for item in waiting if item.id in answers}
         )
         unanswered = [item for item in waiting if item.id not in answers]
-        self.deliver(Command(resume_by_interrupt_id=answers), self.config, delivery)
+        self.deliver(Command(resume_by_interrupt_id=answers), None, delivery)
         self.check_questions_still_wait(unanswered)
 
     @precondition(is_started)
@@ -860,16 +864,16 @@ class ThreadMachine(RuleBasedStateMachine):
         match self.waiting():
             case []:
                 thread.trace.plain = answer
-                self.deliver(Command(resume=answer), self.config, delivery)
+                self.deliver(Command(resume=answer), None, delivery)
                 thread.trace.plain = None
             case [waiting]:
                 thread.trace.given[read_question(waiting)] = answer
-                self.deliver(Command(resume=answer), self.config, delivery)
+                self.deliver(Command(resume=answer), None, delivery)
             case _:
-                before = self.runner.run(thread.graph.aget_state(self.config))
+                before = self.runner.run(thread.graph.aget_state(self.thread_id))
                 with pytest.raises(ValueError):
-                    self.deliver(Command(resume=answer), self.config, delivery)
-                after = self.runner.run(thread.graph.aget_state(self.config))
+                    self.deliver(Command(resume=answer), None, delivery)
+                after = self.runner.run(thread.graph.aget_state(self.thread_id))
                 assert after == before, f"Expected a refused answer to leave the state {before}, got {after}."
 
     @precondition(is_started)
@@ -878,7 +882,7 @@ class ThreadMachine(RuleBasedStateMachine):
         notes = [self.thread.make_text(text) for text in texts]
         self.thread.diverged = True
         self.thread.promised.extend(notes)
-        self.deliver(Command(update=State(visits=notes)), self.config, delivery)
+        self.deliver(Command(update=State(visits=notes)), None, delivery)
 
     @precondition(is_started)
     @rule(delivery=deliveries(), data=st.data())
@@ -907,7 +911,7 @@ class ThreadMachine(RuleBasedStateMachine):
                 case _:
                     assert_never(node.work)
         requested = len(thread.trace.requested)
-        result = self.deliver(Command(goto=target), self.config, delivery)
+        result = self.deliver(Command(goto=target), None, delivery)
         if len(thread.trace.requested) > requested:
             return
 
@@ -926,7 +930,7 @@ class ThreadMachine(RuleBasedStateMachine):
         history = self.thread.history
         checkpoint_id = history[data.draw(st.integers(min_value=0)) % len(history)].checkpoint_id
         self.thread.diverge()
-        self.deliver(None, ThreadConfig(thread_id="thread", checkpoint_id=checkpoint_id), delivery)
+        self.deliver(None, checkpoint_id, delivery)
 
     @rule(data=st.data())
     def arm_shutdowns(self, data: st.DataObject) -> None:
@@ -961,14 +965,12 @@ class ThreadMachine(RuleBasedStateMachine):
     def update_state(self, data: st.DataObject, mode: CallMode, texts: list[str]) -> None:
         thread = self.thread
         graph = thread.graph
-        snapshot = self.runner.run(graph.aget_state(self.config, subgraphs=True))
+        snapshot = self.runner.run(graph.aget_state(self.thread_id, subgraphs=True))
         candidates = [snapshot, *find_namespaces(snapshot), *thread.history]
         before = candidates[data.draw(st.integers(min_value=0)) % len(candidates)]
-        config = (
-            ThreadConfig(thread_id="thread", checkpoint_id=before.checkpoint_id)
-            if before in thread.history
-            else ThreadConfig(thread_id="thread", checkpoint_ns=before.checkpoint_ns)
-        )
+        older = before in thread.history
+        checkpoint_id = before.checkpoint_id if older else None
+        checkpoint_ns = "" if older else before.checkpoint_ns
         spec = find_spec(thread.spec, before.checkpoint_ns)
         pick = data.draw(st.one_of(st.none(), st.integers(min_value=0)))
         node = None if pick is None else spec.nodes[pick % len(spec.nodes)]
@@ -981,9 +983,7 @@ class ThreadMachine(RuleBasedStateMachine):
             writer = spec.nodes[0]
         elif node is None and before.source is CheckpointSource.loop and before.parent_id is not None:
             parent = self.runner.run(
-                graph.aget_state(
-                    ThreadConfig(thread_id="thread", checkpoint_ns=before.checkpoint_ns, checkpoint_id=before.parent_id)
-                )
+                graph.aget_state("thread", checkpoint_ns=before.checkpoint_ns, checkpoint_id=before.parent_id)
             )
             if len(parent.tasks) == 1:
                 task = parent.tasks[0]
@@ -998,31 +998,46 @@ class ThreadMachine(RuleBasedStateMachine):
         thread.steered = True
         thread.result = None
 
-        newest_config = ThreadConfig(thread_id="thread", checkpoint_ns=before.checkpoint_ns)
-        newest = self.runner.run(graph.aget_state(newest_config))
+        newest = self.runner.run(graph.aget_state("thread", checkpoint_ns=before.checkpoint_ns))
         updated = True
         try:
             match mode if thread.sync_allowed else CallMode.asynchronous:
                 case CallMode.asynchronous:
-                    self.runner.run(graph.aupdate_state(config, values, as_node=as_node))
+                    self.runner.run(
+                        graph.aupdate_state(
+                            "thread", values, as_node=as_node, checkpoint_ns=checkpoint_ns, checkpoint_id=checkpoint_id
+                        )
+                    )
                 case CallMode.sync:
-                    graph.update_state(config, values, as_node=as_node)
+                    graph.update_state(
+                        "thread", values, as_node=as_node, checkpoint_ns=checkpoint_ns, checkpoint_id=checkpoint_id
+                    )
                 case CallMode.sync_in_loop:
-                    self.runner.run(call_in_loop(lambda: graph.update_state(config, values, as_node=as_node)))
+                    self.runner.run(
+                        call_in_loop(
+                            lambda: graph.update_state(
+                                "thread",
+                                values,
+                                as_node=as_node,
+                                checkpoint_ns=checkpoint_ns,
+                                checkpoint_id=checkpoint_id,
+                            )
+                        )
+                    )
                 case _ as unknown:
                     assert_never(unknown)
         except ValueError:
             assert writer is None, f"Expected the update as the node {writer!r} to be accepted."
             updated = False
 
-        after = self.runner.run(graph.aget_state(newest_config))
+        after = self.runner.run(graph.aget_state("thread", checkpoint_ns=before.checkpoint_ns))
         if not updated:
             assert after == newest, f"Expected a refused update to leave the state {newest}, got {after}."
             return
         finished = [
             task.status.result
             for task in before.tasks
-            if isinstance(task.status, FinishedTask) and "checkpoint_id" not in config
+            if isinstance(task.status, FinishedTask) and checkpoint_id is None
         ]
         event(f"state update over finished tasks: {bool(finished)}")
         expected = [
@@ -1053,7 +1068,7 @@ class ThreadMachine(RuleBasedStateMachine):
                     pass
                 case _:
                     assert_never(result)
-            snapshot = self.runner.run(thread.graph.aget_state(self.config))
+            snapshot = self.runner.run(thread.graph.aget_state(self.thread_id))
             progress = (
                 snapshot.checkpoint_id,
                 snapshot.interrupts,
@@ -1063,12 +1078,12 @@ class ThreadMachine(RuleBasedStateMachine):
             )
             answers = {item.id: thread.make_text("") for item in snapshot.interrupts}
             thread.trace.given.update({read_question(item): answers[item.id] for item in snapshot.interrupts})
-            result = self.deliver(Command(resume_by_interrupt_id=answers) if answers else None, self.config, delivery)
+            result = self.deliver(Command(resume_by_interrupt_id=answers) if answers else None, None, delivery)
             match result:
                 case Finished():
                     pass
                 case Interrupted() | None:
-                    snapshot = self.runner.run(thread.graph.aget_state(self.config))
+                    snapshot = self.runner.run(thread.graph.aget_state(self.thread_id))
                     now = (
                         snapshot.checkpoint_id,
                         snapshot.interrupts,
@@ -1087,11 +1102,9 @@ class ThreadMachine(RuleBasedStateMachine):
             actual = canonize(thread.trace, visits)
             assert actual[0] == thread.expected[0], "Expected the visits of the run without a checkpointer."
             assert actual[1] == thread.expected[1], "Expected the node executions of the run without a checkpointer."
-        history = self.runner.run(collect(thread.graph.aget_state_history(self.config)))
+        history = self.runner.run(collect(thread.graph.aget_state_history(self.thread_id)))
         found = [
-            self.runner.run(
-                thread.graph.aget_state(ThreadConfig(thread_id="thread", checkpoint_id=snapshot.checkpoint_id))
-            )
+            self.runner.run(thread.graph.aget_state("thread", checkpoint_id=snapshot.checkpoint_id))
             for snapshot in history
         ]
         assert found == history, (
@@ -1132,13 +1145,13 @@ class ThreadMachine(RuleBasedStateMachine):
     def thread_is_consistent(self) -> None:
         thread = self.thread
         graph = thread.graph
-        history = self.runner.run(collect(graph.aget_state_history(self.config)))
+        history = self.runner.run(collect(graph.aget_state_history(self.thread_id)))
         thread.history = history
         if not history:
             return
-        snapshot = self.runner.run(graph.aget_state(self.config, subgraphs=True))
+        snapshot = self.runner.run(graph.aget_state(self.thread_id, subgraphs=True))
         thread.snapshot = snapshot
-        newest = self.runner.run(graph.aget_state(self.config))
+        newest = self.runner.run(graph.aget_state(self.thread_id))
         assert history[0] == newest, "Expected the newest state of the history to be the state of the thread."
 
         ids = [item.checkpoint_id for item in history]
@@ -1169,8 +1182,7 @@ class ThreadMachine(RuleBasedStateMachine):
                 assert_never(unknown)
 
         for child in find_namespaces(snapshot):
-            config = ThreadConfig(thread_id="thread", checkpoint_ns=child.checkpoint_ns)
-            found = self.runner.run(graph.aget_state(config, subgraphs=True))
+            found = self.runner.run(graph.aget_state("thread", checkpoint_ns=child.checkpoint_ns, subgraphs=True))
             assert found == child, f"Expected the state of the child graph at {child.checkpoint_ns!r}."
 
         for waiting in snapshot.interrupts:

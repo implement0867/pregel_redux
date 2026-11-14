@@ -102,7 +102,7 @@ def test_thread_deleted_after_a_stop_in_a_checkpoint_save_has_no_checkpoint(file
     controller = ShutdownController()
 
     async def stop_and_delete() -> None:
-        run = asyncio.create_task(graph.ainvoke({}, {"thread_id": "thread"}, signal=controller.signal))
+        run = asyncio.create_task(graph.ainvoke({}, "thread", signal=controller.signal))
         try:
             await asyncio.to_thread(held.reached.wait, 10)
             asyncio.get_running_loop().call_later(0.1, held.release.set)
@@ -150,10 +150,10 @@ def test_history_with_a_negative_limit_is_rejected(checkpointer: Checkpointer) -
     Assert: the read raises ValueError on each checkpointer.
     """
     graph = build_parallel_graph(checkpointer, 1)
-    graph.invoke({}, {"thread_id": "thread"})
+    graph.invoke({}, "thread")
 
     with pytest.raises(ValueError):
-        list(graph.get_state_history({"thread_id": "thread"}, limit=-1))
+        list(graph.get_state_history("thread", limit=-1))
 
 
 def test_thread_id_with_a_lone_surrogate_is_rejected(checkpointer: Checkpointer) -> None:
@@ -165,7 +165,7 @@ def test_thread_id_with_a_lone_surrogate_is_rejected(checkpointer: Checkpointer)
     graph = build_parallel_graph(checkpointer, 1)
 
     with pytest.raises(ValueError):
-        graph.invoke({}, {"thread_id": "\udc80"})
+        graph.invoke({}, "\udc80")
 
 
 def test_pending_write_for_a_checkpoint_that_is_not_stored_is_refused(checkpointer: Checkpointer) -> None:
@@ -174,7 +174,7 @@ def test_pending_write_for_a_checkpoint_that_is_not_stored_is_refused(checkpoint
     Act: put a pending write for a checkpoint id that the thread does not have.
     Assert: the checkpointer raises KeyError, as InMemoryCheckpointer does.
     """
-    build_parallel_graph(checkpointer, 1).invoke({}, {"thread_id": "thread"})
+    build_parallel_graph(checkpointer, 1).invoke({}, "thread")
     record = RunCommandRecord(index=0, command=SavedWrites(fields={}, branches=("node 0",), arrivals=(), sends=()))
 
     with pytest.raises(KeyError):
@@ -187,7 +187,7 @@ def test_put_of_a_stored_checkpoint_id_replaces_the_checkpoint(checkpointer: Che
     Act: put the newest checkpoint again with a different step.
     Assert: the checkpoint with that id has the new step, as on InMemoryCheckpointer.
     """
-    build_parallel_graph(checkpointer, 1).invoke({}, {"thread_id": "thread"})
+    build_parallel_graph(checkpointer, 1).invoke({}, "thread")
     newest = checkpointer.get_tuple("thread", "", None)
     if newest is None:
         raise LookupError("the thread has no checkpoint")

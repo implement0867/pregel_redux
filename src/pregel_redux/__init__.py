@@ -1,7 +1,7 @@
 from pregel_redux.channels import Channel, Reducer
 from pregel_redux.checkpoints import Checkpoint, Checkpointer, InMemoryCheckpointer
 from pregel_redux.commands import Command, Endpoint, Send
-from pregel_redux.configs import ThreadConfig, read_config
+from pregel_redux.configs import RunTarget, read_config
 from pregel_redux.dependencies import Depends, Scope, StateDep
 from pregel_redux.graph import CompiledGraph, PersistentGraph, StateGraph, StateSnapshot
 from pregel_redux.interrupts import Finished, Interrupt, Interrupted, StopReason, interrupt
@@ -23,6 +23,7 @@ __all__ = [
     "PersistentGraph",
     "Reducer",
     "RunAborted",
+    "RunTarget",
     "Scope",
     "Send",
     "ShutdownController",
@@ -31,7 +32,6 @@ __all__ = [
     "StateGraph",
     "StateSnapshot",
     "StopReason",
-    "ThreadConfig",
     "get_stream_writer",
     "graceful_shutdown",
     "interrupt",

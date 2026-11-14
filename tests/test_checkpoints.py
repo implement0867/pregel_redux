@@ -118,7 +118,7 @@ def test_thread_holds_a_checkpoint_for_the_input_and_for_each_step(topics: list[
     checkpointer = InMemoryCheckpointer()
     graph = build_joke_graph(checkpointer, [], [])
 
-    asyncio.run(graph.ainvoke({"topics": topics}, {"thread_id": "thread"}))
+    asyncio.run(graph.ainvoke({"topics": topics}, "thread"))
 
     actual = len(list(checkpointer.list("thread", "", before=None, limit=None)))
     assert actual == steps + 2, f"Expected {steps + 2} checkpoints, got {actual}."
@@ -138,15 +138,13 @@ def test_resume_of_a_failed_run_gives_the_output_of_a_run_that_did_not_fail(
     Assert: the resume gives the output of the run that did not fail.
     """
     expected = asyncio.run(
-        build_joke_graph(InMemoryCheckpointer(), [], [], request_type, read_topic).ainvoke(
-            {"topics": topics}, {"thread_id": "thread"}
-        )
+        build_joke_graph(InMemoryCheckpointer(), [], [], request_type, read_topic).ainvoke({"topics": topics}, "thread")
     )
     graph = build_joke_graph(InMemoryCheckpointer(), [ConnectionError("no network")], [], request_type, read_topic)
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke({"topics": topics}, {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke({"topics": topics}, "thread"))
 
-    actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(None, "thread"))
 
     assert actual == expected, f"Expected {expected}, got {actual}."
 
@@ -161,10 +159,10 @@ def test_resume_starts_at_the_step_that_failed(topics: list[str]) -> None:
     calls: list[str] = []
     graph = build_joke_graph(InMemoryCheckpointer(), [ConnectionError("no network")], calls)
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke({"topics": topics}, {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke({"topics": topics}, "thread"))
     calls.clear()
 
-    asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+    asyncio.run(graph.ainvoke(None, "thread"))
 
     expected = ["review"]
     assert calls == expected, f"Expected the calls {expected}, got {calls}."
@@ -182,15 +180,11 @@ def test_resume_of_a_pending_send_starts_its_node_with_the_stored_payload() -> N
         raise ConnectionError(request["topic"])
 
     with pytest.raises(ConnectionError):
-        asyncio.run(
-            build_joke_graph(checkpointer, [], [], read_topic=fail).ainvoke(
-                {"topics": ["cats"]}, {"thread_id": "thread"}
-            )
-        )
+        asyncio.run(build_joke_graph(checkpointer, [], [], read_topic=fail).ainvoke({"topics": ["cats"]}, "thread"))
     calls: list[str] = []
     graph = build_joke_graph(checkpointer, [], calls)
 
-    actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(None, "thread"))
 
     expected = Finished({"jokes": ["joke about cats", "review"]})
     assert actual == expected, f"Expected {expected}, got {actual}."
@@ -206,10 +200,10 @@ def test_resume_keeps_the_sources_of_a_join_that_finished_before_the_failure() -
     calls: list[str] = []
     graph = build_join_graph(InMemoryCheckpointer(), [ConnectionError("no network")], calls, with_join=True)
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke({}, "thread"))
     calls.clear()
 
-    actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(None, "thread"))
 
     expected = Finished({"jokes": ["first", "second", "last", "target"]})
     assert actual == expected, f"Expected {expected}, got {actual}."
@@ -229,9 +223,9 @@ def test_run_on_a_thread_starts_with_the_values_of_its_latest_checkpoint(
     Assert: only the run on the same thread adds to the stored values.
     """
     graph = build_joke_graph(InMemoryCheckpointer(), [], [])
-    asyncio.run(graph.ainvoke({"topics": ["cats"]}, {"thread_id": "thread"}))
+    asyncio.run(graph.ainvoke({"topics": ["cats"]}, "thread"))
 
-    actual = asyncio.run(graph.ainvoke({"topics": ["dogs"]}, {"thread_id": second_thread}))
+    actual = asyncio.run(graph.ainvoke({"topics": ["dogs"]}, second_thread))
 
     assert actual == Finished({"jokes": expected}), f"Expected {expected}, got {actual}."
 
@@ -245,7 +239,7 @@ def test_resume_of_a_thread_without_a_checkpoint_is_rejected() -> None:
     graph = build_joke_graph(InMemoryCheckpointer(), [], [])
 
     with pytest.raises(LookupError):
-        asyncio.run(graph.ainvoke(None, {"thread_id": "missing"}))
+        asyncio.run(graph.ainvoke(None, "missing"))
 
 
 def build_graph_without_review(checkpointer: InMemoryCheckpointer) -> PersistentGraph[State, State, Output]:
@@ -274,10 +268,10 @@ def test_checkpoint_of_a_different_graph_is_rejected(
     checkpointer = InMemoryCheckpointer()
     graph = build_joke_graph(checkpointer, [ConnectionError("no network")], [])
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke({"topics": ["cats"]}, {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke({"topics": ["cats"]}, "thread"))
 
     with pytest.raises(ValueError):
-        asyncio.run(build_other_graph(checkpointer).ainvoke(None, {"thread_id": "thread"}))
+        asyncio.run(build_other_graph(checkpointer).ainvoke(None, "thread"))
 
 
 def test_checkpoint_with_a_join_that_the_graph_does_not_have_is_rejected() -> None:
@@ -289,10 +283,10 @@ def test_checkpoint_with_a_join_that_the_graph_does_not_have_is_rejected() -> No
     checkpointer = InMemoryCheckpointer()
     graph = build_join_graph(checkpointer, [ConnectionError("no network")], [], with_join=True)
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke({}, "thread"))
 
     with pytest.raises(ValueError):
-        asyncio.run(build_join_graph(checkpointer, [], [], with_join=False).ainvoke(None, {"thread_id": "thread"}))
+        asyncio.run(build_join_graph(checkpointer, [], [], with_join=False).ainvoke(None, "thread"))
 
 
 def test_invoke_without_an_input_gives_the_output_of_ainvoke() -> None:
@@ -301,14 +295,12 @@ def test_invoke_without_an_input_gives_the_output_of_ainvoke() -> None:
     Act: resume the thread with resume.
     Assert: the resume gives the output of the run that did not fail.
     """
-    expected = asyncio.run(
-        build_joke_graph(InMemoryCheckpointer(), [], []).ainvoke({"topics": ["cats"]}, {"thread_id": "thread"})
-    )
+    expected = asyncio.run(build_joke_graph(InMemoryCheckpointer(), [], []).ainvoke({"topics": ["cats"]}, "thread"))
     graph = build_joke_graph(InMemoryCheckpointer(), [ConnectionError("no network")], [])
     with pytest.raises(ConnectionError):
-        graph.invoke({"topics": ["cats"]}, {"thread_id": "thread"})
+        graph.invoke({"topics": ["cats"]}, "thread")
 
-    actual = graph.invoke(None, {"thread_id": "thread"})
+    actual = graph.invoke(None, "thread")
 
     assert actual == expected, f"Expected {expected}, got {actual}."
 
@@ -329,7 +321,7 @@ def test_invoke_without_an_input_rejects_a_graph_that_has_an_async_node() -> Non
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
     with pytest.raises(TypeError):
-        graph.invoke(None, {"thread_id": "thread"})
+        graph.invoke(None, "thread")
 
 
 def build_child_graph(failures: list[Exception], calls: list[str]) -> StateGraph[State, State, NarrowState]:
@@ -391,14 +383,14 @@ def test_resume_does_not_run_the_finished_nodes_of_a_child_graph_again(
     Act: resume the thread.
     Assert: the output is that of the run that did not fail, and no finished node of the child graph runs again.
     """
-    expected = asyncio.run(build_parent_graph([], [], InMemoryCheckpointer()).ainvoke({}, {"thread_id": "thread"}))
+    expected = asyncio.run(build_parent_graph([], [], InMemoryCheckpointer()).ainvoke({}, "thread"))
     calls: list[str] = []
     graph = build_parent_graph(child_failures, calls, FailingCheckpointer(failing_put=failing_put))
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke({}, "thread"))
     calls.clear()
 
-    actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(None, "thread"))
 
     assert actual == expected, f"Expected {expected}, got {actual}."
     assert calls == expected_calls, f"Expected the calls {expected_calls}, got {calls}."
@@ -411,16 +403,14 @@ def test_resume_finds_the_run_of_a_child_graph_for_each_send(topics: list[str]) 
     Act: resume the thread.
     Assert: the output is that of a run that did not fail, and no node of a child graph runs again.
     """
-    expected = asyncio.run(
-        build_fan_out_graph([], InMemoryCheckpointer()).ainvoke({"topics": topics}, {"thread_id": "t"})
-    )
+    expected = asyncio.run(build_fan_out_graph([], InMemoryCheckpointer()).ainvoke({"topics": topics}, "t"))
     calls: list[str] = []
     graph = build_fan_out_graph(calls, FailingCheckpointer(failing_put=4 + 4 * len(topics)))
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke({"topics": topics}, {"thread_id": "t"}))
+        asyncio.run(graph.ainvoke({"topics": topics}, "t"))
     calls.clear()
 
-    actual = asyncio.run(graph.ainvoke(None, {"thread_id": "t"}))
+    actual = asyncio.run(graph.ainvoke(None, "t"))
 
     assert actual == expected, f"Expected {expected}, got {actual}."
     assert calls == [], f"Expected no calls, got {calls}."
@@ -474,9 +464,9 @@ def test_resume_does_not_run_a_node_that_finished_in_the_failed_step(finished_no
             builder.add_edge(Endpoint.start, f"finished {index}")
         graph = builder.compile(checkpointer=SignallingCheckpointer(signal_at_write=1 + finished_nodes, signal=saved))
         with pytest.raises(ConnectionError):
-            await graph.ainvoke({}, {"thread_id": "thread"})
+            await graph.ainvoke({}, "thread")
         calls.clear()
-        return await graph.ainvoke(None, {"thread_id": "thread"})
+        return await graph.ainvoke(None, "thread")
 
     actual = asyncio.run(run_thread())
 
@@ -513,16 +503,14 @@ def test_resume_keeps_the_state_of_a_deferred_node(failing: str, *, with_join: b
     Act: run the thread again without an input.
     Assert: the output is that of a run that did not fail, and the deferred node runs one time after the branch.
     """
-    expected = asyncio.run(
-        build_deferred_graph("none", [], [], with_join=with_join).ainvoke({}, {"thread_id": "thread"})
-    )
+    expected = asyncio.run(build_deferred_graph("none", [], [], with_join=with_join).ainvoke({}, "thread"))
     calls: list[str] = []
     graph = build_deferred_graph(failing, [ConnectionError("no network")], calls, with_join=with_join)
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke({}, "thread"))
     calls.clear()
 
-    actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(None, "thread"))
 
     expected_calls = ["last", "target"] if failing == "last" else ["target"]
     assert actual == expected, f"Expected {expected}, got {actual}."
@@ -540,7 +528,7 @@ def test_checkpoints_of_a_thread_form_a_chain_in_the_order_of_their_ids(runs: in
     graph = build_joke_graph(checkpointer, [], [])
 
     for _ in range(runs):
-        asyncio.run(graph.ainvoke({"topics": ["cats"]}, {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke({"topics": ["cats"]}, "thread"))
 
     stored = [saved.checkpoint for saved in checkpointer.list("thread", "", before=None, limit=None)][::-1]
     ids = [checkpoint.id for checkpoint in stored]
@@ -557,15 +545,11 @@ def test_latest_checkpoint_is_the_one_with_the_greatest_id() -> None:
     Act: run the thread again without an input.
     Assert: the run continues from the checkpoint with the greatest id, so only the node that failed runs.
     """
-    expected = asyncio.run(
-        build_joke_graph(InMemoryCheckpointer(), [], []).ainvoke({"topics": ["cats"]}, {"thread_id": "thread"})
-    )
+    expected = asyncio.run(build_joke_graph(InMemoryCheckpointer(), [], []).ainvoke({"topics": ["cats"]}, "thread"))
     source = InMemoryCheckpointer()
     with pytest.raises(ConnectionError):
         asyncio.run(
-            build_joke_graph(source, [ConnectionError("no network")], []).ainvoke(
-                {"topics": ["cats"]}, {"thread_id": "thread"}
-            )
+            build_joke_graph(source, [ConnectionError("no network")], []).ainvoke({"topics": ["cats"]}, "thread")
         )
     checkpointer = InMemoryCheckpointer()
     for saved in source.list("thread", "", before=None, limit=None):
@@ -575,7 +559,7 @@ def test_latest_checkpoint_is_the_one_with_the_greatest_id() -> None:
     calls: list[str] = []
     graph = build_joke_graph(checkpointer, [], calls)
 
-    actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(None, "thread"))
 
     assert actual == expected, f"Expected {expected}, got {actual}."
     assert calls == ["review"], f"Expected the calls ['review'], got {calls}."
@@ -589,12 +573,12 @@ def test_checkpoint_of_another_format_version_is_rejected() -> None:
     """
     checkpointer = InMemoryCheckpointer()
     graph = build_joke_graph(checkpointer, [], [])
-    asyncio.run(graph.ainvoke({"topics": ["cats"]}, {"thread_id": "thread"}))
+    asyncio.run(graph.ainvoke({"topics": ["cats"]}, "thread"))
     records = checkpointer.threads["thread"][""]
     checkpointer.threads["thread"][""] = {key: record.replace('"v":1', '"v":2') for key, record in records.items()}
 
     with pytest.raises(ValidationError):
-        asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke(None, "thread"))
 
 
 def test_failure_of_a_node_lets_the_other_nodes_of_its_step_finish() -> None:
@@ -624,10 +608,10 @@ def test_failure_of_a_node_lets_the_other_nodes_of_its_step_finish() -> None:
     builder.add_edge(Endpoint.start, "fail")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke({}, "thread"))
 
-    saved = {task.name: task.status for task in asyncio.run(graph.aget_state({"thread_id": "thread"})).tasks}
-    actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+    saved = {task.name: task.status for task in asyncio.run(graph.aget_state("thread")).tasks}
+    actual = asyncio.run(graph.ainvoke(None, "thread"))
 
     expected = {"fail": FailedTask("ConnectionError()", ()), "slow": FinishedTask({"jokes": ["slow"]})}
     assert saved == expected, f"Expected the error of one node and the result of the slow node, got {saved}."

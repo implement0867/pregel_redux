@@ -191,7 +191,7 @@ def test_sync_stream_rejects_a_graph_that_has_an_async_node() -> None:
     with pytest.raises(TypeError):
         builder.compile().stream({})
     with pytest.raises(TypeError):
-        builder.compile(checkpointer=InMemoryCheckpointer()).stream({}, {"thread_id": "thread"})
+        builder.compile(checkpointer=InMemoryCheckpointer()).stream({}, "thread")
 
 
 @pytest.mark.parametrize("sync", [False, True])
@@ -258,8 +258,8 @@ def test_stream_of_a_thread_gives_the_interrupt_and_continues_with_a_resume_valu
     """
     graph = build_builder(("first", build_writer("first")), ("ask", ask)).compile(checkpointer=InMemoryCheckpointer())
 
-    stopped = asyncio.run(collect(graph.astream({}, {"thread_id": "thread"})))
-    resumed = list(graph.stream(Command(resume="answer"), {"thread_id": "thread"}))
+    stopped = asyncio.run(collect(graph.astream({}, "thread")))
+    resumed = list(graph.stream(Command(resume="answer"), "thread"))
 
     values = [part.interrupts[0].value for part in stopped[-2:] if isinstance(part, ValuesPart | InterruptsPart)]
     kinds = [type(part) for part in stopped[-2:]]
@@ -341,7 +341,7 @@ def test_task_result_part_gives_the_interrupts_of_a_node_that_stops() -> None:
     """
     graph = build_builder(("ask", ask)).compile(checkpointer=InMemoryCheckpointer())
 
-    actual = list(graph.stream({}, {"thread_id": "thread"}))
+    actual = list(graph.stream({}, "thread"))
 
     results = [part for part in actual if isinstance(part, TaskResultPart)]
     values = [[item.value for item in part.interrupts] for part in results]
@@ -360,15 +360,13 @@ def test_checkpoint_parts_give_the_state_of_each_checkpoint() -> None:
         checkpointer=InMemoryCheckpointer()
     )
 
-    parts = asyncio.run(collect(graph.astream({}, {"thread_id": "thread"})))
+    parts = asyncio.run(collect(graph.astream({}, "thread")))
 
     actual = [part for part in parts if isinstance(part, CheckpointPart)]
     steps = [(part.state.step, part.state.next) for part in actual]
     expected = [(-1, ("__start__",)), (0, ("first",)), (1, ("second",)), (2, ())]
     assert steps == expected, f"Expected {expected}, got {steps}."
-    assert actual[-1].state == graph.get_state({"thread_id": "thread"}), (
-        "Expected the state of the thread in the last part."
-    )
+    assert actual[-1].state == graph.get_state("thread"), "Expected the state of the thread in the last part."
 
 
 def test_stream_gives_no_checkpoint_part_for_a_run_that_continues_without_a_new_checkpoint() -> None:
@@ -378,9 +376,9 @@ def test_stream_gives_no_checkpoint_part_for_a_run_that_continues_without_a_new_
     Assert: the stream has only the checkpoint that the resumed node made.
     """
     graph = build_builder(("first", build_writer("first")), ("ask", ask)).compile(checkpointer=InMemoryCheckpointer())
-    graph.invoke({}, {"thread_id": "thread"})
+    graph.invoke({}, "thread")
 
-    actual = list(graph.stream(Command(resume="answer"), {"thread_id": "thread"}))
+    actual = list(graph.stream(Command(resume="answer"), "thread"))
 
     steps = [part.state.step for part in actual if isinstance(part, CheckpointPart)]
     assert steps == [2], f"Expected only the checkpoint of step 2, got {steps}."

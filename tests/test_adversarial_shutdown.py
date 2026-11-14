@@ -95,7 +95,7 @@ def test_keyboard_interrupt_in_the_reader_of_a_sync_stream_stops_the_run() -> No
 
     try:
         with pytest.raises(KeyboardInterrupt):
-            list(graph.stream({}, {"thread_id": "thread"}))
+            list(graph.stream({}, "thread"))
     finally:
         signal.signal(signal.SIGINT, earlier)
 
@@ -133,7 +133,7 @@ def test_abort_after_a_request_with_a_grace_period_runs_the_whole_cleanup() -> N
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
     with pytest.raises(RunAborted):
-        asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}, signal=controller.signal))
+        asyncio.run(graph.ainvoke({}, "thread", signal=controller.signal))
 
     assert events == ["open", "close"], (
         f"Expected the whole cleanup after the abort, got {events}. "
@@ -172,7 +172,7 @@ def test_grace_period_that_ends_in_the_cleanup_of_a_graceful_stop_does_not_cut_t
 
     async def run() -> object:
         try:
-            return await graph.ainvoke({}, {"thread_id": "thread"}, signal=controller.signal)
+            return await graph.ainvoke({}, "thread", signal=controller.signal)
         except RunAborted as error:
             return error
 
@@ -258,8 +258,8 @@ def test_stream_gives_no_task_result_for_a_child_graph_that_a_graceful_shutdown_
     builder.add_edge(Endpoint.start, "child")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
-    parts = list(graph.stream({}, {"thread_id": "thread"}, signal=controller.signal))
-    snapshot = graph.get_state({"thread_id": "thread"})
+    parts = list(graph.stream({}, "thread", signal=controller.signal))
+    snapshot = graph.get_state("thread")
 
     results = [part for part in parts if isinstance(part, TaskResultPart) and part.name == "child"]
     assert snapshot.next == ("child",), f"Expected the child graph task to wait, got {snapshot.next}."

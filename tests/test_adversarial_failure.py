@@ -19,7 +19,6 @@ from pregel_redux import (
     Send,
     ShutdownController,
     StateGraph,
-    ThreadConfig,
     interrupt,
 )
 from tests.conftest import join_lists, read_error
@@ -134,7 +133,7 @@ def test_run_scoped_provider_that_suppresses_the_exception_of_its_node_is_reject
 
     with pytest.raises(RuntimeError):
         if with_checkpointer:
-            asyncio.run(builder.compile(checkpointer=InMemoryCheckpointer()).ainvoke({}, {"thread_id": "thread"}))
+            asyncio.run(builder.compile(checkpointer=InMemoryCheckpointer()).ainvoke({}, "thread"))
         else:
             asyncio.run(builder.compile().ainvoke({}))
 
@@ -155,16 +154,16 @@ def test_answer_that_is_not_of_the_response_schema_leaves_the_question_waiting()
     builder.add_node("decide", decide)
     builder.add_edge(Endpoint.start, "decide")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    config = ThreadConfig(thread_id="thread")
-    asked = asyncio.run(graph.ainvoke({}, config))
+    thread_id = "thread"
+    asked = asyncio.run(graph.ainvoke({}, thread_id))
     assert isinstance(asked, Interrupted), f"Expected a waiting question, got {asked}."
     questions = asked.interrupts
     with pytest.raises(ValidationError):
-        asyncio.run(graph.ainvoke(Command(resume="text"), config))
+        asyncio.run(graph.ainvoke(Command(resume="text"), thread_id))
 
-    waiting = asyncio.run(graph.aget_state(config)).interrupts
+    waiting = asyncio.run(graph.aget_state(thread_id)).interrupts
     answers: dict[str, JsonValue] = {item.id: {"approved": True} for item in questions}
-    actual = asyncio.run(graph.ainvoke(Command[str](resume_by_interrupt_id=answers), config))
+    actual = asyncio.run(graph.ainvoke(Command[str](resume_by_interrupt_id=answers), thread_id))
 
     assert waiting == questions, f"Expected the question {questions} to wait after the rejected answer, got {waiting}."
     assert actual == Finished(State(notes=["approved"])), f"Expected the second answer to finish the run, got {actual}."
@@ -222,13 +221,13 @@ def test_abort_after_an_answer_keeps_the_error_of_the_task() -> None:
     builder.add_node("ask", fail_then_ask)
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    config = ThreadConfig(thread_id="thread")
+    thread_id = "thread"
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke({}, config))
+        asyncio.run(graph.ainvoke({}, thread_id))
     with pytest.raises(RunAborted):
-        asyncio.run(graph.ainvoke(Command(resume="yes"), config, signal=controller.signal))
+        asyncio.run(graph.ainvoke(Command(resume="yes"), thread_id, signal=controller.signal))
 
-    errors = [read_error(task) for task in asyncio.run(graph.aget_state(config)).tasks]
+    errors = [read_error(task) for task in asyncio.run(graph.aget_state(thread_id)).tasks]
 
     assert errors == ["ConnectionError('first run')"], f"Expected the error of the first run, got {errors}."
 
@@ -266,12 +265,12 @@ def test_graceful_stop_of_a_child_graph_keeps_the_error_of_its_task() -> None:
     builder.add_edge(Endpoint.start, "a_stop")
     builder.add_edge(Endpoint.start, "child")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    config = ThreadConfig(thread_id="thread")
+    thread_id = "thread"
     with pytest.raises(ExceptionGroup):
-        asyncio.run(graph.ainvoke({}, config))
+        asyncio.run(graph.ainvoke({}, thread_id))
 
-    stopped = asyncio.run(graph.ainvoke(None, config, signal=controller.signal))
-    state = asyncio.run(graph.aget_state(config, subgraphs=True))
+    stopped = asyncio.run(graph.ainvoke(None, thread_id, signal=controller.signal))
+    state = asyncio.run(graph.aget_state(thread_id, subgraphs=True))
 
     task = next(task for task in state.tasks if task.name == "child")
     assert task.state is not None, f"Expected the state of the child graph, got {task}."

@@ -22,7 +22,6 @@ from pregel_redux import (
     Send,
     ShutdownController,
     StateGraph,
-    ThreadConfig,
     graceful_shutdown,
     interrupt,
 )
@@ -115,14 +114,14 @@ def test_command_with_a_send_keeps_the_send_tasks_that_wait_for_an_answer() -> N
     builder.add_node("write", build_writer("write"))
     builder.add_edge(Endpoint.start, "route")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    config = ThreadConfig(thread_id="thread")
-    graph.invoke({}, config)
-    before = graph.get_state(config).interrupts
+    thread_id = "thread"
+    graph.invoke({}, thread_id)
+    before = graph.get_state(thread_id).interrupts
 
-    graph.invoke(Command(goto=[Send("write", {})]), config)
-    after = graph.get_state(config).interrupts
+    graph.invoke(Command(goto=[Send("write", {})]), thread_id)
+    after = graph.get_state(thread_id).interrupts
     answers: dict[str, JsonValue] = {item.id: f"answer {index}" for index, item in enumerate(before)}
-    actual = graph.invoke(Command[str](resume_by_interrupt_id=answers), config)
+    actual = graph.invoke(Command[str](resume_by_interrupt_id=answers), thread_id)
 
     expected = Finished(State(notes=["answer 0", "answer 1", "write"]))
     assert len(before) == 2, f"Expected two waiting questions before the Command, got {before}."
@@ -150,13 +149,13 @@ def test_command_with_an_update_keeps_a_deferred_node_after_the_node_that_waits_
     builder.add_edge(Endpoint.start, "ask")
     builder.add_edge(Endpoint.start, "late")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    config = ThreadConfig(thread_id="thread")
-    graph.invoke({}, config)
+    thread_id = "thread"
+    graph.invoke({}, thread_id)
 
-    graph.invoke(Command(update=State(notes=["update"])), config)
+    graph.invoke(Command(update=State(notes=["update"])), thread_id)
     calls_of_the_command = list(calls)
-    waiting = graph.get_state(config).next
-    actual = graph.invoke(Command(resume="yes"), config)
+    waiting = graph.get_state(thread_id).next
+    actual = graph.invoke(Command(resume="yes"), thread_id)
 
     expected = Finished(State(notes=["update", "yes", "late saw ['update', 'yes']"]))
     assert calls_of_the_command == [], (
@@ -187,12 +186,12 @@ def test_task_that_finished_after_a_failure_has_a_result_and_no_error() -> None:
     builder.add_edge(Endpoint.start, "ask")
     builder.add_edge(Endpoint.start, "recover")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    config = ThreadConfig(thread_id="thread")
+    thread_id = "thread"
     with pytest.raises(ConnectionError):
-        graph.invoke({}, config)
+        graph.invoke({}, thread_id)
 
-    graph.invoke(None, config)
-    state = graph.get_state(config)
+    graph.invoke(None, thread_id)
+    state = graph.get_state(thread_id)
 
     actual = [(task.name, task.status) for task in state.tasks if task.name == "recover"]
     expected = [("recover", FinishedTask({"notes": ["recovered"]}))]
@@ -211,11 +210,11 @@ def test_state_update_without_a_node_after_two_nodes_of_one_step_is_rejected() -
     builder.add_edge(Endpoint.start, "left")
     builder.add_edge(Endpoint.start, "right")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    config = ThreadConfig(thread_id="thread")
-    graph.invoke({}, config)
+    thread_id = "thread"
+    graph.invoke({}, thread_id)
 
     with pytest.raises(ValueError):
-        graph.update_state(config, State(notes=["update"]))
+        graph.update_state(thread_id, State(notes=["update"]))
 
 
 @pytest.mark.parametrize("provider_kind", ["generator", "function"])
@@ -262,7 +261,7 @@ def test_abort_during_the_setup_of_a_sync_provider_stops_the_sync_node_before_it
 
     async def run_with_a_guard() -> object:
         async with asyncio.timeout(10):
-            return await graph.ainvoke({}, {"thread_id": "thread"}, signal=controller.signal)
+            return await graph.ainvoke({}, "thread", signal=controller.signal)
 
     with pytest.raises(RunAborted):
         asyncio.run(run_with_a_guard())
@@ -285,7 +284,7 @@ def test_checkpoint_that_is_stored_again_after_the_delete_of_its_thread_has_no_p
     builder.add_node("ask", ask)
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=checkpointer)
-    graph.invoke({}, {"thread_id": "thread"})
+    graph.invoke({}, "thread")
     stopped = checkpointer.get_tuple("thread", "", None)
     assert stopped is not None, "Expected a checkpoint of the thread that stopped at an interrupt, got None."
     assert stopped.pending_writes, f"Expected a pending write before the delete, got {stopped.pending_writes}."
@@ -352,7 +351,7 @@ def test_grace_period_of_a_second_shutdown_request_aborts_a_run_that_does_not_st
 
     async def run_with_a_guard() -> object:
         async with asyncio.timeout(5):
-            return await graph.ainvoke({}, {"thread_id": "thread"}, signal=controller.signal)
+            return await graph.ainvoke({}, "thread", signal=controller.signal)
 
     with pytest.raises(RunAborted):
         asyncio.run(run_with_a_guard())
@@ -380,13 +379,13 @@ def test_answer_of_a_node_that_an_abort_cancelled_reaches_the_node_in_the_next_r
     builder.add_node("ask", ask_then_wait)
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    config = ThreadConfig(thread_id="thread")
+    thread_id = "thread"
 
     async def run_with_a_guard(command: Command[str] | None) -> object:
         async with asyncio.timeout(5):
-            return await graph.ainvoke(command, config, signal=controller.signal if command else None)
+            return await graph.ainvoke(command, thread_id, signal=controller.signal if command else None)
 
-    asyncio.run(graph.ainvoke({}, config))
+    asyncio.run(graph.ainvoke({}, thread_id))
     with pytest.raises(RunAborted):
         asyncio.run(run_with_a_guard(Command(resume="yes")))
 
@@ -418,19 +417,19 @@ def test_answer_of_a_node_that_failed_stays_and_its_later_question_waits_after_a
     builder.add_node("ask", ask_two_questions)
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    config = ThreadConfig(thread_id="thread")
-    graph.invoke({}, config)
+    thread_id = "thread"
+    graph.invoke({}, thread_id)
     with pytest.raises(ConnectionError):
-        graph.invoke(Command(resume="one"), config)
+        graph.invoke(Command(resume="one"), thread_id)
 
-    third = graph.invoke(None, config)
+    third = graph.invoke(None, thread_id)
     assert isinstance(third, Interrupted), f"Expected the third run to stop at a question, got {third}."
     asked = [item.value for item in third.interrupts]
     assert asked == ["second question"], f"Expected the third run to ask only the second question, got {asked}."
     with pytest.raises(ConnectionError):
-        graph.invoke(None, config)
-    state = graph.get_state(config)
-    actual = graph.invoke(Command(resume="two"), config)
+        graph.invoke(None, thread_id)
+    state = graph.get_state(thread_id)
+    actual = graph.invoke(Command(resume="two"), thread_id)
 
     waiting = [item.value for item in state.interrupts]
     errors = [read_error(task) for task in state.tasks]

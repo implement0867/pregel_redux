@@ -1,12 +1,6 @@
 from dataclasses import dataclass
-from typing import NotRequired, TypedDict, assert_never
+from typing import assert_never
 from uuid import UUID
-
-
-class ThreadConfig(TypedDict):
-    thread_id: str
-    checkpoint_id: NotRequired[UUID | str]
-    checkpoint_ns: NotRequired[str]
 
 
 @dataclass(frozen=True)
@@ -22,8 +16,7 @@ class StateAddress:
     checkpoint_id: UUID | None
 
 
-def parse_thread_id(config: ThreadConfig) -> str:
-    thread_id = config["thread_id"]
+def parse_thread_id(thread_id: str) -> str:
     try:
         thread_id.encode()
     except UnicodeEncodeError as error:
@@ -31,27 +24,21 @@ def parse_thread_id(config: ThreadConfig) -> str:
     return thread_id
 
 
-def parse_checkpoint_id(config: ThreadConfig) -> UUID | None:
-    match config.get("checkpoint_id"):
-        case None:
-            return None
-        case UUID() as checkpoint_id:
+def parse_checkpoint_id(checkpoint_id: UUID | None) -> UUID | None:
+    match checkpoint_id:
+        case None | UUID():
             return checkpoint_id
-        case str() as text:
-            return UUID(text)
         case other:
             assert_never(other)
 
 
-def parse_run_target(config: ThreadConfig) -> RunTarget:
-    if config.get("checkpoint_ns"):
-        raise ValueError("a run starts at the root graph, so its config cannot have a checkpoint_ns")
-    return RunTarget(parse_thread_id(config), parse_checkpoint_id(config))
+def parse_run_target(thread_id: str, fork_from: UUID | None) -> RunTarget:
+    return RunTarget(parse_thread_id(thread_id), parse_checkpoint_id(fork_from))
 
 
-def parse_state_address(config: ThreadConfig) -> StateAddress:
-    return StateAddress(parse_thread_id(config), config.get("checkpoint_ns", ""), parse_checkpoint_id(config))
+def parse_state_address(thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None) -> StateAddress:
+    return StateAddress(parse_thread_id(thread_id), checkpoint_ns, parse_checkpoint_id(checkpoint_id))
 
 
-def read_config() -> ThreadConfig:
+def read_config() -> RunTarget:
     raise RuntimeError("read_config supplies a value only in a run of a graph that has a checkpointer")

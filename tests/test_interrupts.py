@@ -94,7 +94,7 @@ def test_interrupt_stops_the_run_and_gives_its_value(
     calls: list[str] = []
     graph = build_asking_graph(1, 1, calls, build_node)
 
-    actual = asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke({}, "thread"))
 
     values = [value for _, value in read_interrupts(actual)]
     assert values == ["ask 0 question 0"], f"Expected the value of one interrupt, got {actual}."
@@ -112,10 +112,10 @@ def test_resume_gives_the_answer_to_the_interrupt_and_runs_only_the_stopped_node
     """
     calls: list[str] = []
     graph = build_asking_graph(1, 1, calls, build_node)
-    asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    asyncio.run(graph.ainvoke({}, "thread"))
     calls.clear()
 
-    actual = asyncio.run(graph.ainvoke(Command(resume="yes"), {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(Command(resume="yes"), "thread"))
 
     expected = Finished({"notes": ["ask 0 got yes", "sibling", "after"]})
     assert actual == expected, f"Expected {expected}, got {actual}."
@@ -130,11 +130,10 @@ def test_node_with_more_than_one_interrupt_stops_at_each_of_them(questions: int)
     Assert: each run stops at the next interrupt, and the last run gives all answers to the node.
     """
     graph = build_asking_graph(1, questions, [])
-    results = [asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))]
+    results = [asyncio.run(graph.ainvoke({}, "thread"))]
 
     results.extend(
-        asyncio.run(graph.ainvoke(Command(resume=f"answer {index}"), {"thread_id": "thread"}))
-        for index in range(questions)
+        asyncio.run(graph.ainvoke(Command(resume=f"answer {index}"), "thread")) for index in range(questions)
     )
 
     stops = [[value for _, value in read_interrupts(result)] for result in results]
@@ -152,10 +151,10 @@ def test_resume_by_interrupt_id_answers_the_interrupts_of_one_step(asking_nodes:
     Assert: each node receives the value for its interrupt.
     """
     graph = build_asking_graph(asking_nodes, 1, [])
-    stopped = read_interrupts(asyncio.run(graph.ainvoke({}, {"thread_id": "thread"})))
+    stopped = read_interrupts(asyncio.run(graph.ainvoke({}, "thread")))
     answers = {interrupt_id: f"answer to {value}" for interrupt_id, value in stopped}
 
-    actual = asyncio.run(graph.ainvoke(Command(resume_by_interrupt_id=answers), {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(Command(resume_by_interrupt_id=answers), "thread"))
 
     notes = [f"ask {index} got answer to ask {index} question 0" for index in range(asking_nodes)]
     expected = Finished({"notes": [*notes, "sibling", "after"]})
@@ -170,11 +169,9 @@ def test_resume_by_interrupt_id_for_one_of_two_interrupts_leaves_the_other_waiti
     Assert: the run stops again, at only the second interrupt.
     """
     graph = build_asking_graph(2, 1, [])
-    stopped = read_interrupts(asyncio.run(graph.ainvoke({}, {"thread_id": "thread"})))
+    stopped = read_interrupts(asyncio.run(graph.ainvoke({}, "thread")))
 
-    actual = asyncio.run(
-        graph.ainvoke(Command(resume_by_interrupt_id={stopped[0][0]: "answer"}), {"thread_id": "thread"})
-    )
+    actual = asyncio.run(graph.ainvoke(Command(resume_by_interrupt_id={stopped[0][0]: "answer"}), "thread"))
 
     assert read_interrupts(actual) == [stopped[1]], f"Expected only {stopped[1]}, got {actual}."
 
@@ -186,10 +183,10 @@ def test_one_resume_value_for_more_than_one_waiting_interrupt_is_rejected() -> N
     Assert: the run raises a ValueError.
     """
     graph = build_asking_graph(2, 1, [])
-    asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    asyncio.run(graph.ainvoke({}, "thread"))
 
     with pytest.raises(ValueError):
-        asyncio.run(graph.ainvoke(Command(resume="answer"), {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke(Command(resume="answer"), "thread"))
 
 
 @pytest.mark.parametrize(
@@ -212,9 +209,9 @@ def test_interrupt_returns_the_resume_value_as_its_response_schema(expected: str
     builder.add_node("decide", decide)
     builder.add_edge(Endpoint.start, "decide")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    asyncio.run(graph.ainvoke({}, "thread"))
 
-    actual = asyncio.run(graph.ainvoke(Command(resume={"approved": answer}), {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(Command(resume={"approved": answer}), "thread"))
 
     assert actual == Finished({"notes": [expected]}), f"Expected the note {expected!r}, got {actual}."
 
@@ -234,10 +231,10 @@ def test_resume_value_that_is_not_of_the_response_schema_fails_the_node() -> Non
     builder.add_node("decide", decide)
     builder.add_edge(Endpoint.start, "decide")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    asyncio.run(graph.ainvoke({}, "thread"))
 
     with pytest.raises(ValidationError):
-        asyncio.run(graph.ainvoke(Command(resume="text"), {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke(Command(resume="text"), "thread"))
 
 
 def test_run_without_an_input_keeps_the_resume_value_of_a_run_that_failed() -> None:
@@ -258,11 +255,11 @@ def test_run_without_an_input_keeps_the_resume_value_of_a_run_that_failed() -> N
     builder.add_node("ask", ask_then_fail)
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    asyncio.run(graph.ainvoke({}, "thread"))
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke(Command(resume="stored answer"), {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke(Command(resume="stored answer"), "thread"))
 
-    actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(None, "thread"))
 
     assert actual == Finished({"notes": ["stored answer"]}), f"Expected the stored answer, got {actual}."
 
@@ -290,9 +287,9 @@ def test_interrupt_in_a_child_graph_stops_the_run_and_resumes_inside_the_child_g
     builder.add_edge(Endpoint.start, "child")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
-    stopped = asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    stopped = asyncio.run(graph.ainvoke({}, "thread"))
     calls.clear()
-    actual = asyncio.run(graph.ainvoke(Command(resume="yes"), {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(Command(resume="yes"), "thread"))
 
     values = [value for _, value in read_interrupts(stopped)]
     assert values == ["ask question 0"], f"Expected the value of one interrupt, got {stopped}."
@@ -341,12 +338,12 @@ def test_run_with_a_command_applies_its_update_and_its_goto(command: Command[str
     Assert: the state has the note of the update one time, or two notes of the node that goto names.
     """
     graph = build_asking_graph(1, 1, [])
-    asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    asyncio.run(graph.ainvoke({}, "thread"))
 
-    asyncio.run(graph.ainvoke(command, {"thread_id": "thread"}))
-    asyncio.run(graph.ainvoke(Command(resume="yes"), {"thread_id": "thread"}))
+    asyncio.run(graph.ainvoke(command, "thread"))
+    asyncio.run(graph.ainvoke(Command(resume="yes"), "thread"))
 
-    values = asyncio.run(graph.aget_state({"thread_id": "thread"})).values
+    values = asyncio.run(graph.aget_state("thread")).values
     notes = TypeAdapter(list[str]).validate_python(values["notes"])
     assert notes.count(note) == count, f"Expected the note {note!r} {count} time(s), got {notes}."
 
@@ -364,10 +361,10 @@ def test_goto_of_a_command_runs_a_deferred_node(interrupt_before: list[str]) -> 
     builder.add_edge(Endpoint.start, "late")
     builder.add_edge(Endpoint.start, "other")
     graph = builder.compile(checkpointer=InMemoryCheckpointer(), interrupt_before=interrupt_before)
-    asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
-    before = asyncio.run(graph.aget_state({"thread_id": "thread"})).values.get("notes", [])
+    asyncio.run(graph.ainvoke({}, "thread"))
+    before = asyncio.run(graph.aget_state("thread")).values.get("notes", [])
 
-    actual = asyncio.run(graph.ainvoke(Command(goto="late"), {"thread_id": "thread"}))
+    actual = asyncio.run(graph.ainvoke(Command(goto="late"), "thread"))
 
     expected = Finished(State(notes=["late", "other", "late"] if before else ["late", "other"]))
     assert actual == expected, f"Expected {expected}, got {actual}."
@@ -395,14 +392,14 @@ def test_failure_of_a_child_graph_after_an_answer_keeps_the_answer() -> None:
     builder.add_node("child", child)
     builder.add_edge(Endpoint.start, "child")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    stopped = asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    stopped = asyncio.run(graph.ainvoke({}, "thread"))
     assert isinstance(stopped, Interrupted), f"Expected a stop at the question, got {stopped}."
     answers = {item.id: "yes" for item in stopped.interrupts}
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke(Command(resume_by_interrupt_id=answers), {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke(Command(resume_by_interrupt_id=answers), "thread"))
 
-    waiting = asyncio.run(graph.aget_state({"thread_id": "thread"})).interrupts
-    actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+    waiting = asyncio.run(graph.aget_state("thread")).interrupts
+    actual = asyncio.run(graph.ainvoke(None, "thread"))
 
     expected = Finished(State(notes=["yes"]))
     assert waiting == (), f"Expected no waiting interrupt after the answer, got {waiting}."
@@ -438,13 +435,13 @@ def test_child_graph_that_got_its_answer_finishes_when_another_node_fails() -> N
     builder.add_edge(Endpoint.start, "child")
     builder.add_edge(Endpoint.start, "sibling")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    stopped = asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
+    stopped = asyncio.run(graph.ainvoke({}, "thread"))
     assert isinstance(stopped, Interrupted), f"Expected a stop at the question, got {stopped}."
     asked = [item for item in stopped.interrupts if item.value == "question"]
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke(Command(resume_by_interrupt_id={asked[0].id: "yes"}), {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke(Command(resume_by_interrupt_id={asked[0].id: "yes"}), "thread"))
 
-    waiting = [item.value for item in asyncio.run(graph.aget_state({"thread_id": "thread"})).interrupts]
+    waiting = [item.value for item in asyncio.run(graph.aget_state("thread")).interrupts]
 
     assert waiting == ["other question"], f"Expected only the question without an answer, got {waiting}."
 
@@ -467,12 +464,12 @@ def test_failure_before_a_question_keeps_the_question_waiting() -> None:
     builder.add_node("ask", ask)
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
-    asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
-    expected = asyncio.run(graph.aget_state({"thread_id": "thread"})).interrupts
+    asyncio.run(graph.ainvoke({}, "thread"))
+    expected = asyncio.run(graph.aget_state("thread")).interrupts
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
+        asyncio.run(graph.ainvoke(None, "thread"))
 
-    state = asyncio.run(graph.aget_state({"thread_id": "thread"}))
+    state = asyncio.run(graph.aget_state("thread"))
     errors = [read_error(task) for task in state.tasks]
 
     assert [item.value for item in expected] == ["question"], f"Expected one waiting question, got {expected}."
@@ -501,13 +498,13 @@ def test_plain_answer_goes_to_the_one_interrupt_that_waits() -> None:
     builder.add_edge(Endpoint.start, "second")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     with pytest.raises(ConnectionError):
-        graph.invoke({}, {"thread_id": "thread"})
-    waiting = [item.value for item in graph.get_state({"thread_id": "thread"}).interrupts]
+        graph.invoke({}, "thread")
+    waiting = [item.value for item in graph.get_state("thread").interrupts]
 
-    stopped = graph.invoke(Command(resume="yes"), {"thread_id": "thread"})
+    stopped = graph.invoke(Command(resume="yes"), "thread")
     assert isinstance(stopped, Interrupted), f"Expected a stop at the question of the first node, got {stopped}."
     answers = {item.id: "no" for item in stopped.interrupts}
-    actual = graph.invoke(Command(resume_by_interrupt_id=answers), {"thread_id": "thread"})
+    actual = graph.invoke(Command(resume_by_interrupt_id=answers), "thread")
 
     expected = Finished(Output(notes=["first got no", "second got yes"]))
     assert waiting == ["second question 0"], f"Expected only the second node to wait, got {waiting}."
