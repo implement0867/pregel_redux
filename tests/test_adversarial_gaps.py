@@ -22,13 +22,13 @@ from pregel_redux import (
     Send,
     ShutdownController,
     StateGraph,
-    StreamMode,
     ThreadConfig,
     graceful_shutdown,
     interrupt,
 )
 from pregel_redux.snapshots import FinishedTask
 from pregel_redux.sqlite import SqliteCheckpointer
+from pregel_redux.streams import ChildPart, ValuesPart
 from tests.conftest import join_lists, read_error
 
 
@@ -74,16 +74,20 @@ def build_parent_of_a_child_graph() -> StateGraph[State, State, State]:
 def test_values_parts_of_a_child_graph_have_the_namespace_of_the_child_graph() -> None:
     """
     Arrange: a parent graph whose only node is a child graph of two nodes.
-    Act: stream a run in the values mode with subgraphs.
-    Assert: the parts with the root namespace have only the states of the parent graph, and the parts with
-    the states of the child graph have the namespace of the child graph.
+    Act: stream a run.
+    Assert: the values parts of the parent graph have only the states of the parent graph, and the states of
+    the child graph are in child parts with the namespace of the child graph.
     """
     graph = build_parent_of_a_child_graph().compile()
 
-    parts = list(graph.stream({}, stream_mode=StreamMode.values, subgraphs=True))
+    parts = list(graph.stream({}))
 
-    outer = [part.values for part in parts if not part.ns]
-    inner = [(part.ns[0].split(":")[0], part.values) for part in parts if part.ns]
+    outer = [part.values for part in parts if isinstance(part, ValuesPart)]
+    inner = [
+        (part.ns[0].split(":")[0], part.part.values)
+        for part in parts
+        if isinstance(part, ChildPart) and isinstance(part.part, ValuesPart)
+    ]
     expected_outer = [State(notes=[]), State(notes=["first", "second"])]
     expected_inner = [
         ("child", State(notes=[])),
@@ -92,21 +96,6 @@ def test_values_parts_of_a_child_graph_have_the_namespace_of_the_child_graph() -
     ]
     assert outer == expected_outer, f"Expected the root parts {expected_outer}, got {outer}."
     assert inner == expected_inner, f"Expected the child graph parts {expected_inner}, got {inner}."
-
-
-def test_values_stream_without_subgraphs_has_no_state_of_a_child_graph() -> None:
-    """
-    Arrange: a parent graph whose only node is a child graph of two nodes.
-    Act: stream a run in the values mode without subgraphs.
-    Assert: the stream has only the states of the parent graph.
-    """
-    graph = build_parent_of_a_child_graph().compile()
-
-    parts = list(graph.stream({}, stream_mode=StreamMode.values))
-
-    actual = [(part.ns, part.values) for part in parts]
-    expected = [((), State(notes=[])), ((), State(notes=["first", "second"]))]
-    assert actual == expected, f"Expected only the states of the parent graph {expected}, got {actual}."
 
 
 def test_command_with_a_send_keeps_the_send_tasks_that_wait_for_an_answer() -> None:

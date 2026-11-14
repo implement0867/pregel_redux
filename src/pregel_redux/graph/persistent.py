@@ -1,6 +1,5 @@
-from collections.abc import AsyncGenerator, AsyncIterator, Collection, Generator, Iterator
+from collections.abc import AsyncGenerator, AsyncIterator, Generator, Iterator
 from dataclasses import dataclass
-from typing import Literal, overload
 from uuid import UUID
 
 from pregel_redux.channels import (
@@ -32,17 +31,9 @@ from pregel_redux.pregel import (
 from pregel_redux.shutdown import RunAborted, ShutdownController, ShutdownSignal, read_shutdown
 from pregel_redux.snapshots import StateSnapshot
 from pregel_redux.streams import (
-    CheckpointPart,
-    CustomPart,
-    InterruptsPart,
+    ChildPart,
     Stream,
-    StreamMode,
     StreamPart,
-    TaskResultPart,
-    TaskStartPart,
-    UpdatesPart,
-    ValuesPart,
-    parse_stream_modes,
 )
 from pregel_redux.task_refs import refer_task
 
@@ -137,7 +128,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         step_limit: int | None = None,
         signal: ShutdownSignal | None = None,
     ) -> Finished[OutputT] | Interrupted:
-        stream = Stream(frozenset(), subgraphs=False, emit=lambda part: None)
+        stream = Stream(lambda part: None)
         return await self.run(self.checkpointer, input, config, step_limit, stream, signal)
 
     def invoke(
@@ -149,176 +140,38 @@ class PersistentGraph[StateT, InputT, OutputT]:
         signal: ShutdownSignal | None = None,
     ) -> Finished[OutputT] | Interrupted:
         self.graph.reject_async_nodes("ainvoke")
-        stream = Stream(frozenset(), subgraphs=False, emit=lambda part: None)
+        stream = Stream(lambda part: None)
         checkpointer = ThreadedCheckpointer(self.checkpointer)
         return run_in_new_loop(lambda: self.run(checkpointer, input, config, step_limit, stream, signal))
 
-    @overload
     def astream(
         self,
         input: InputT | Command[str] | None,
         config: ThreadConfig,
         *,
-        stream_mode: Literal[StreamMode.values],
-        subgraphs: bool = False,
         step_limit: int | None = None,
         signal: ShutdownSignal | None = None,
-    ) -> AsyncGenerator[ValuesPart]: ...
-    @overload
-    def astream(
-        self,
-        input: InputT | Command[str] | None,
-        config: ThreadConfig,
-        *,
-        stream_mode: Literal[StreamMode.updates],
-        subgraphs: bool = False,
-        step_limit: int | None = None,
-        signal: ShutdownSignal | None = None,
-    ) -> AsyncGenerator[UpdatesPart | InterruptsPart]: ...
-    @overload
-    def astream(
-        self,
-        input: InputT | Command[str] | None,
-        config: ThreadConfig,
-        *,
-        stream_mode: Literal[StreamMode.custom],
-        subgraphs: bool = False,
-        step_limit: int | None = None,
-        signal: ShutdownSignal | None = None,
-    ) -> AsyncGenerator[CustomPart]: ...
-    @overload
-    def astream(
-        self,
-        input: InputT | Command[str] | None,
-        config: ThreadConfig,
-        *,
-        stream_mode: Literal[StreamMode.tasks],
-        subgraphs: bool = False,
-        step_limit: int | None = None,
-        signal: ShutdownSignal | None = None,
-    ) -> AsyncGenerator[TaskStartPart | TaskResultPart]: ...
-    @overload
-    def astream(
-        self,
-        input: InputT | Command[str] | None,
-        config: ThreadConfig,
-        *,
-        stream_mode: Literal[StreamMode.checkpoints],
-        subgraphs: bool = False,
-        step_limit: int | None = None,
-        signal: ShutdownSignal | None = None,
-    ) -> AsyncGenerator[CheckpointPart]: ...
-    @overload
-    def astream(
-        self,
-        input: InputT | Command[str] | None,
-        config: ThreadConfig,
-        *,
-        stream_mode: Collection[StreamMode],
-        subgraphs: bool = False,
-        step_limit: int | None = None,
-        signal: ShutdownSignal | None = None,
-    ) -> AsyncGenerator[StreamPart]: ...
-    def astream(
-        self,
-        input: InputT | Command[str] | None,
-        config: ThreadConfig,
-        *,
-        stream_mode: StreamMode | Collection[StreamMode],
-        subgraphs: bool = False,
-        step_limit: int | None = None,
-        signal: ShutdownSignal | None = None,
-    ) -> AsyncGenerator[StreamPart]:
-        modes = parse_stream_modes(stream_mode)
+    ) -> AsyncGenerator[StreamPart | ChildPart]:
         return stream_run(
             lambda emit: self.run(
                 self.checkpointer,
                 input,
                 config,
                 step_limit,
-                Stream(modes, subgraphs=subgraphs, emit=emit),
+                Stream(emit),
                 signal,
             )
         )
 
-    @overload
     def stream(
         self,
         input: InputT | Command[str] | None,
         config: ThreadConfig,
         *,
-        stream_mode: Literal[StreamMode.values],
-        subgraphs: bool = False,
         step_limit: int | None = None,
         signal: ShutdownSignal | None = None,
-    ) -> Generator[ValuesPart]: ...
-    @overload
-    def stream(
-        self,
-        input: InputT | Command[str] | None,
-        config: ThreadConfig,
-        *,
-        stream_mode: Literal[StreamMode.updates],
-        subgraphs: bool = False,
-        step_limit: int | None = None,
-        signal: ShutdownSignal | None = None,
-    ) -> Generator[UpdatesPart | InterruptsPart]: ...
-    @overload
-    def stream(
-        self,
-        input: InputT | Command[str] | None,
-        config: ThreadConfig,
-        *,
-        stream_mode: Literal[StreamMode.custom],
-        subgraphs: bool = False,
-        step_limit: int | None = None,
-        signal: ShutdownSignal | None = None,
-    ) -> Generator[CustomPart]: ...
-    @overload
-    def stream(
-        self,
-        input: InputT | Command[str] | None,
-        config: ThreadConfig,
-        *,
-        stream_mode: Literal[StreamMode.tasks],
-        subgraphs: bool = False,
-        step_limit: int | None = None,
-        signal: ShutdownSignal | None = None,
-    ) -> Generator[TaskStartPart | TaskResultPart]: ...
-    @overload
-    def stream(
-        self,
-        input: InputT | Command[str] | None,
-        config: ThreadConfig,
-        *,
-        stream_mode: Literal[StreamMode.checkpoints],
-        subgraphs: bool = False,
-        step_limit: int | None = None,
-        signal: ShutdownSignal | None = None,
-    ) -> Generator[CheckpointPart]: ...
-    @overload
-    def stream(
-        self,
-        input: InputT | Command[str] | None,
-        config: ThreadConfig,
-        *,
-        stream_mode: Collection[StreamMode],
-        subgraphs: bool = False,
-        step_limit: int | None = None,
-        signal: ShutdownSignal | None = None,
-    ) -> Generator[StreamPart]: ...
-    def stream(
-        self,
-        input: InputT | Command[str] | None,
-        config: ThreadConfig,
-        *,
-        stream_mode: StreamMode | Collection[StreamMode],
-        subgraphs: bool = False,
-        step_limit: int | None = None,
-        signal: ShutdownSignal | None = None,
-    ) -> Generator[StreamPart]:
+    ) -> Generator[StreamPart | ChildPart]:
         self.graph.reject_async_nodes("astream")
-        modes = parse_stream_modes(stream_mode)
         checkpointer = ThreadedCheckpointer(self.checkpointer)
         return iterate_in_new_loop(
             lambda: stream_run(
@@ -327,7 +180,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
                     input,
                     config,
                     step_limit,
-                    Stream(modes, subgraphs=subgraphs, emit=emit),
+                    Stream(emit),
                     signal,
                 )
             )

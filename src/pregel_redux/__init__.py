@@ -6,7 +6,7 @@ from pregel_redux.dependencies import Depends, Scope, StateDep
 from pregel_redux.graph import CompiledGraph, PersistentGraph, StateGraph, StateSnapshot
 from pregel_redux.interrupts import Finished, Interrupt, Interrupted, StopReason, interrupt
 from pregel_redux.shutdown import RunAborted, ShutdownController, ShutdownSignal, graceful_shutdown, read_shutdown
-from pregel_redux.streams import StreamMode, get_stream_writer
+from pregel_redux.streams import get_stream_writer
 
 __all__ = [
     "Channel",
@@ -31,7 +31,6 @@ __all__ = [
     "StateGraph",
     "StateSnapshot",
     "StopReason",
-    "StreamMode",
     "ThreadConfig",
     "get_stream_writer",
     "graceful_shutdown",

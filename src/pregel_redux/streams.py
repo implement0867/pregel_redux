@@ -1,65 +1,40 @@
-from collections.abc import Callable, Collection, Mapping
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
-from enum import StrEnum
 
 from pregel_redux.interrupts import Interrupt
 from pregel_redux.snapshots import StateSnapshot
 
 
-class StreamMode(StrEnum):
-    values = "values"
-    updates = "updates"
-    custom = "custom"
-    checkpoints = "checkpoints"
-    tasks = "tasks"
-
-
-def parse_stream_modes(stream_mode: object) -> frozenset[StreamMode]:
-    match stream_mode:
-        case str():
-            return frozenset({StreamMode(stream_mode)})
-        case Collection():
-            return frozenset(StreamMode(mode) for mode in stream_mode)
-        case _:
-            raise TypeError(f"stream_mode must be a mode or a collection of modes, got {stream_mode!r}")
-
-
 @dataclass(frozen=True)
 class ValuesPart:
-    ns: tuple[str, ...]
     values: Mapping[str, object]
     interrupts: tuple[Interrupt, ...]
 
 
 @dataclass(frozen=True)
 class UpdatesPart:
-    ns: tuple[str, ...]
     node: str
     update: Mapping[str, object]
 
 
 @dataclass(frozen=True)
 class InterruptsPart:
-    ns: tuple[str, ...]
     interrupts: tuple[Interrupt, ...]
 
 
 @dataclass(frozen=True)
 class CustomPart:
-    ns: tuple[str, ...]
     data: object
 
 
 @dataclass(frozen=True)
 class CheckpointPart:
-    ns: tuple[str, ...]
     state: StateSnapshot
 
 
 @dataclass(frozen=True)
 class TaskStartPart:
-    ns: tuple[str, ...]
     id: str
     name: str
     input: object
@@ -67,7 +42,6 @@ class TaskStartPart:
 
 @dataclass(frozen=True)
 class TaskResultPart:
-    ns: tuple[str, ...]
     id: str
     name: str
     update: Mapping[str, object]
@@ -80,14 +54,23 @@ type StreamPart = (
 
 
 @dataclass(frozen=True)
-class Stream:
-    modes: frozenset[StreamMode]
-    subgraphs: bool
-    emit: Callable[[StreamPart], None]
+class ChildPart:
+    ns: tuple[str, *tuple[str, ...]]
+    part: StreamPart
 
-    def send(self, mode: StreamMode, part: StreamPart) -> None:
-        if mode in self.modes and (self.subgraphs or not part.ns):
-            self.emit(part)
+
+@dataclass(frozen=True)
+class Stream:
+    emit: Callable[[StreamPart | ChildPart], None]
+
+    def send(self, ns: tuple[str, ...], part: StreamPart) -> None:
+        match ns:
+            case ():
+                self.emit(part)
+            case (first, *rest):
+                self.emit(ChildPart((first, *rest), part))
+            case _:
+                raise TypeError(f"the namespace {ns!r} is not a tuple")
 
 
 current_stream_writer = ContextVar[Callable[[object], None]]("current_stream_writer")

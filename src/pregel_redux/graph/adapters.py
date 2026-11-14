@@ -7,6 +7,7 @@ from queue import SimpleQueue
 
 from pregel_redux.channels import Stored
 from pregel_redux.streams import (
+    ChildPart,
     StreamPart,
 )
 
@@ -61,12 +62,12 @@ def iterate_in_new_loop[ItemT](start: Callable[[], AsyncIterator[ItemT]]) -> Gen
 
 
 async def stream_run[ResultT](
-    start_run: Callable[[Callable[[StreamPart], None]], Coroutine[object, object, ResultT]],
-) -> AsyncGenerator[StreamPart]:
-    parts = asyncio.Queue[StreamPart | None]()
+    start_run: Callable[[Callable[[StreamPart | ChildPart], None]], Coroutine[object, object, ResultT]],
+) -> AsyncGenerator[StreamPart | ChildPart]:
+    parts = asyncio.Queue[StreamPart | ChildPart | None]()
     loop = asyncio.get_running_loop()
 
-    def emit(part: StreamPart | None) -> None:
+    def emit(part: StreamPart | ChildPart | None) -> None:
         loop.call_soon_threadsafe(parts.put_nowait, part)
 
     async def work() -> ResultT:

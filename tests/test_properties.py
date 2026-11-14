@@ -36,14 +36,13 @@ from pregel_redux import (
     ShutdownSignal,
     StateGraph,
     StateSnapshot,
-    StreamMode,
     ThreadConfig,
     interrupt,
 )
 from pregel_redux.checkpoints import CheckpointSource
 from pregel_redux.snapshots import FailedTask, FinishedTask
 from pregel_redux.sqlite import SqliteCheckpointer
-from pregel_redux.streams import StreamPart, ValuesPart
+from pregel_redux.streams import ChildPart, StreamPart, ValuesPart
 from pregel_redux.task_refs import PullRef, PushRef, StartRef
 from tests.conftest import collect, join_lists
 
@@ -526,8 +525,6 @@ class CallMode(Enum):
 
 @dataclass(frozen=True)
 class StreamPlan:
-    modes: frozenset[StreamMode]
-    subgraphs: bool
     stop_after: int | None
 
 
@@ -540,15 +537,13 @@ class Delivery:
 def deliveries() -> st.SearchStrategy[Delivery]:
     plan = st.builds(
         StreamPlan,
-        modes=st.frozensets(st.sampled_from(StreamMode)),
-        subgraphs=st.booleans(),
         stop_after=st.one_of(st.none(), st.integers(min_value=0)),
     )
     return st.builds(Delivery, mode=st.sampled_from(CallMode), stream=st.one_of(st.none(), plan))
 
 
-async def take(parts: AsyncGenerator[StreamPart], count: int | None) -> list[StreamPart]:
-    taken: list[StreamPart] = []
+async def take(parts: AsyncGenerator[StreamPart | ChildPart], count: int | None) -> list[StreamPart | ChildPart]:
+    taken: list[StreamPart | ChildPart] = []
     async with aclosing(parts):
         async for part in parts:
             if len(taken) == count:
@@ -681,14 +676,12 @@ class ThreadMachine(RuleBasedStateMachine):
         mode: CallMode,
         plan: StreamPlan,
         signal: ShutdownSignal,
-    ) -> list[StreamPart]:
+    ) -> list[StreamPart | ChildPart]:
         graph = self.thread.graph
 
-        def collect_sync() -> list[StreamPart]:
-            taken: list[StreamPart] = []
-            parts = graph.stream(
-                run_input, config, stream_mode=plan.modes, subgraphs=plan.subgraphs, step_limit=1000, signal=signal
-            )
+        def collect_sync() -> list[StreamPart | ChildPart]:
+            taken: list[StreamPart | ChildPart] = []
+            parts = graph.stream(run_input, config, step_limit=1000, signal=signal)
             with closing(parts):
                 for part in parts:
                     if len(taken) == plan.stop_after:
@@ -698,9 +691,7 @@ class ThreadMachine(RuleBasedStateMachine):
 
         match mode:
             case CallMode.asynchronous:
-                parts = graph.astream(
-                    run_input, config, stream_mode=plan.modes, subgraphs=plan.subgraphs, step_limit=1000, signal=signal
-                )
+                parts = graph.astream(run_input, config, step_limit=1000, signal=signal)
                 return self.runner.run(take(parts, plan.stop_after))
             case CallMode.sync:
                 return collect_sync()
@@ -709,16 +700,15 @@ class ThreadMachine(RuleBasedStateMachine):
             case _:
                 assert_never(mode)
 
-    def check_stream(self, parts: Sequence[StreamPart], plan: StreamPlan) -> None:
+    def check_stream(self, parts: Sequence[StreamPart | ChildPart], plan: StreamPlan) -> None:
         graph = self.thread.graph
-        namespaces = {part.ns for part in parts}
-        assert plan.subgraphs or namespaces <= {()}, f"Expected parts of the root graph only, got {namespaces}."
+        namespaces = {part.ns for part in parts if isinstance(part, ChildPart)}
         for namespace in namespaces:
             config = ThreadConfig(thread_id="thread", checkpoint_ns="|".join(namespace))
             found = self.runner.run(graph.aget_state(config))
             assert found.checkpoint_ns == config.get("checkpoint_ns"), f"Expected the state of {namespace}."
-        if plan.stop_after is None and StreamMode.values in plan.modes:
-            values = [part.values for part in parts if isinstance(part, ValuesPart) and not part.ns]
+        if plan.stop_after is None:
+            values = [part.values for part in parts if isinstance(part, ValuesPart)]
             newest = self.runner.run(graph.aget_state(self.config)).values
             assert not values or values[-1] == newest, f"Expected the last values part {newest}, got {values[-1]}."
 
@@ -734,7 +724,7 @@ class ThreadMachine(RuleBasedStateMachine):
         signal = trace.controller.signal
         known = {item.checkpoint_id for item in self.thread.history}
         result: Finished[State] | Interrupted | None = None
-        parts: list[StreamPart] | None = None
+        parts: list[StreamPart | ChildPart] | None = None
         raised: list[BaseException] = []
         try:
             if delivery.stream is not None:

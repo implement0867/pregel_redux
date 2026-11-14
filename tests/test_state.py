@@ -20,7 +20,6 @@ from pregel_redux import (
     StateGraph,
     StateSnapshot,
     StopReason,
-    StreamMode,
     ThreadConfig,
     interrupt,
     read_config,
@@ -644,7 +643,7 @@ def run_with_invoke(graph: PersistentGraph[State, State, Output], config: Thread
 
 
 def run_with_stream(graph: PersistentGraph[State, State, Output], config: ThreadConfig) -> object:
-    return list(graph.stream({}, config, stream_mode=StreamMode.values))
+    return list(graph.stream({}, config))
 
 
 @pytest.mark.parametrize("run", [run_with_invoke, run_with_stream])

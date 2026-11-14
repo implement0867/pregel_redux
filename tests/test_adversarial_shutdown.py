@@ -18,11 +18,10 @@ from pregel_redux import (
     Send,
     ShutdownController,
     StateGraph,
-    StreamMode,
     get_stream_writer,
     graceful_shutdown,
 )
-from pregel_redux.streams import TaskResultPart, TaskStartPart
+from pregel_redux.streams import ChildPart, TaskResultPart, TaskStartPart
 from tests.conftest import join_lists
 
 
@@ -53,11 +52,11 @@ def test_custom_part_of_a_sync_node_reaches_the_reader_while_the_node_runs(*, sy
     graph = builder.compile()
 
     async def read() -> None:
-        async for _ in graph.astream({}, stream_mode=StreamMode.custom):
+        async for _ in graph.astream({}):
             confirmed.set()
 
     if sync:
-        for _ in graph.stream({}, stream_mode=StreamMode.custom):
+        for _ in graph.stream({}):
             confirmed.set()
     else:
         asyncio.run(read())
@@ -96,7 +95,7 @@ def test_keyboard_interrupt_in_the_reader_of_a_sync_stream_stops_the_run() -> No
 
     try:
         with pytest.raises(KeyboardInterrupt):
-            list(graph.stream({}, {"thread_id": "thread"}, stream_mode=StreamMode.updates))
+            list(graph.stream({}, {"thread_id": "thread"}))
     finally:
         signal.signal(signal.SIGINT, earlier)
 
@@ -209,7 +208,7 @@ def test_graceful_shutdown_that_cannot_bind_a_signal_keeps_the_earlier_handlers(
 def test_tasks_of_two_sends_to_a_child_graph_have_different_ids_and_namespaces() -> None:
     """
     Arrange: a graph without a checkpointer whose first node sends two inputs to a child graph of one node.
-    Act: stream a run in the tasks mode with subgraphs.
+    Act: stream a run.
     Assert: the start parts of the two inner tasks have different ids and different namespaces.
     """
     child = StateGraph(State)
@@ -223,9 +222,13 @@ def test_tasks_of_two_sends_to_a_child_graph_have_different_ids_and_namespaces()
     builder.add_edge(Endpoint.start, "route")
     graph = builder.compile()
 
-    parts = list(graph.stream({}, stream_mode=StreamMode.tasks, subgraphs=True))
+    parts = list(graph.stream({}))
 
-    inner = [(part.ns, part.id) for part in parts if isinstance(part, TaskStartPart) and part.name == "inner"]
+    inner = [
+        (part.ns, part.part.id)
+        for part in parts
+        if isinstance(part, ChildPart) and isinstance(part.part, TaskStartPart) and part.part.name == "inner"
+    ]
     ids = {task_id for _, task_id in inner}
     namespaces = {ns for ns, _ in inner}
     assert len(inner) == 2, f"Expected two inner tasks, got {inner}."
@@ -233,10 +236,10 @@ def test_tasks_of_two_sends_to_a_child_graph_have_different_ids_and_namespaces()
     assert len(namespaces) == 2, f"Expected a different namespace for each child graph, got {inner}."
 
 
-def test_tasks_mode_gives_no_result_for_a_child_graph_that_a_graceful_shutdown_stopped() -> None:
+def test_stream_gives_no_task_result_for_a_child_graph_that_a_graceful_shutdown_stopped() -> None:
     """
     Arrange: a child graph of two nodes where the first node requests a graceful shutdown.
-    Act: stream a run with the signal in the tasks mode.
+    Act: stream a run with the signal.
     Assert: the stream has no result part that reports the unfinished child graph task as a task with an update.
     """
     controller = ShutdownController()
@@ -255,7 +258,7 @@ def test_tasks_mode_gives_no_result_for_a_child_graph_that_a_graceful_shutdown_s
     builder.add_edge(Endpoint.start, "child")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
-    parts = list(graph.stream({}, {"thread_id": "thread"}, stream_mode=StreamMode.tasks, signal=controller.signal))
+    parts = list(graph.stream({}, {"thread_id": "thread"}, signal=controller.signal))
     snapshot = graph.get_state({"thread_id": "thread"})
 
     results = [part for part in parts if isinstance(part, TaskResultPart) and part.name == "child"]

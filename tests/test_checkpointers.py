@@ -16,11 +16,11 @@ from pregel_redux import (
     PersistentGraph,
     Reducer,
     StateGraph,
-    StreamMode,
     interrupt,
 )
 from pregel_redux.checkpoints import Checkpoint, CheckpointTuple, PendingWrite, RunCommandRecord, SavedWrites
 from pregel_redux.sqlite import SqliteCheckpointer
+from pregel_redux.streams import InterruptsPart, UpdatesPart
 from tests.conftest import collect, join_lists
 
 
@@ -191,14 +191,17 @@ def test_sync_functions_of_the_graph_use_the_sync_functions_of_the_checkpointer(
     Assert: the run finishes with the notes of the nodes, the update and the answer, and the history has each step.
     """
     graph = build_graph(SyncOnlyCheckpointer())
-    stopped = list(graph.stream({}, {"thread_id": "thread"}, stream_mode=StreamMode.updates))
+    stopped = list(graph.stream({}, {"thread_id": "thread"}))
     graph.update_state({"thread_id": "thread"}, {"notes": ["update"]}, as_node="first")
 
     actual = graph.invoke(Command(resume="answer"), {"thread_id": "thread"})
 
     steps = [snapshot.step for snapshot in graph.get_state_history({"thread_id": "thread"})]
     expected = Finished(Output(notes=["first", "update", "answer", "last"]))
-    assert len(stopped) == 2, f"Expected a part for the first node and a part for the interrupt, got {stopped}."
+    kinds = [type(part) for part in stopped if isinstance(part, UpdatesPart | InterruptsPart)]
+    assert kinds == [UpdatesPart, InterruptsPart], (
+        f"Expected the update of the first node and then the interrupt, got {stopped}."
+    )
     assert actual == expected, f"Expected {expected}, got {actual}."
     assert steps == [4, 3, 2, 1, 0, -1], f"Expected the steps from 4 to -1, got {steps}."
     assert graph.get_state({"thread_id": "thread"}).step == 4, "Expected the state of the last step."

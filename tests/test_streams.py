@@ -11,11 +11,12 @@ from pregel_redux import (
     InMemoryCheckpointer,
     Reducer,
     StateGraph,
-    StreamMode,
     get_stream_writer,
     interrupt,
 )
 from pregel_redux.streams import (
+    CheckpointPart,
+    ChildPart,
     CustomPart,
     InterruptsPart,
     StreamPart,
@@ -23,7 +24,6 @@ from pregel_redux.streams import (
     TaskStartPart,
     UpdatesPart,
     ValuesPart,
-    parse_stream_modes,
 )
 from tests.conftest import collect, join_lists
 
@@ -83,97 +83,82 @@ def build_parent() -> CompiledGraph[State, State, Output]:
     return parent.compile()
 
 
-def test_values_mode_gives_the_state_after_each_step() -> None:
+def test_stream_gives_each_part_in_the_order_of_the_run() -> None:
     """
-    Arrange: a graph of two nodes in a chain.
-    Act: stream a run in the values mode.
-    Assert: the stream has the state after the input and after each node.
+    Arrange: a graph with one node that writes to the stream writer.
+    Act: stream a run.
+    Assert: the stream has the state after the input, then the start, the data, the update and the result
+    of the node, then the state after the node.
     """
-    graph = build_chain()
+    graph = build_builder(("first", build_writer("first"))).compile()
 
-    actual = asyncio.run(collect(graph.astream({"notes": ["input"]}, stream_mode=StreamMode.values)))
+    actual = asyncio.run(collect(graph.astream({})))
 
-    expected = [
-        ValuesPart((), {"notes": ["input"]}, ()),
-        ValuesPart((), {"notes": ["input", "first"]}, ()),
-        ValuesPart((), {"notes": ["input", "first", "second"]}, ()),
+    ids = [part.id for part in actual if isinstance(part, TaskStartPart)]
+    expected: list[StreamPart | ChildPart] = [
+        ValuesPart({"notes": []}, ()),
+        TaskStartPart(ids[0], "first", {"notes": []}),
+        CustomPart("first works"),
+        UpdatesPart("first", {"notes": ["first"]}),
+        TaskResultPart(ids[0], "first", {"notes": ["first"]}, ()),
+        ValuesPart({"notes": ["first"]}, ()),
     ]
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 
-def test_updates_mode_gives_the_update_of_each_node() -> None:
+def test_values_parts_give_the_state_after_each_step() -> None:
     """
     Arrange: a graph of two nodes in a chain.
-    Act: stream a run in the updates mode.
-    Assert: the stream has one part for each node with the update of that node.
+    Act: stream a run.
+    Assert: the values parts have the state after the input and after each node.
     """
     graph = build_chain()
 
-    actual = asyncio.run(collect(graph.astream({"notes": ["input"]}, stream_mode=StreamMode.updates)))
+    parts = asyncio.run(collect(graph.astream({"notes": ["input"]})))
 
-    expected = [UpdatesPart((), "first", {"notes": ["first"]}), UpdatesPart((), "second", {"notes": ["second"]})]
+    actual = [part for part in parts if isinstance(part, ValuesPart)]
+    expected = [
+        ValuesPart({"notes": ["input"]}, ()),
+        ValuesPart({"notes": ["input", "first"]}, ()),
+        ValuesPart({"notes": ["input", "first", "second"]}, ()),
+    ]
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 
-def test_custom_mode_gives_the_data_that_a_node_writes() -> None:
+def test_custom_parts_give_the_data_that_a_node_writes() -> None:
     """
     Arrange: a graph with a sync node and an async node that write to the stream writer.
-    Act: stream a run in the custom mode.
-    Assert: the stream has the data of each node in the order of the nodes.
+    Act: stream a run.
+    Assert: the custom parts have the data of each node in the order of the nodes.
     """
     graph = build_builder(("first", build_writer("first")), ("async", write_async)).compile()
 
-    actual = asyncio.run(collect(graph.astream({}, stream_mode=StreamMode.custom)))
+    parts = asyncio.run(collect(graph.astream({})))
 
-    expected = [CustomPart((), "first works"), CustomPart((), "async works")]
+    actual = [part for part in parts if isinstance(part, CustomPart)]
+    expected = [CustomPart("first works"), CustomPart("async works")]
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 
-def test_several_modes_give_the_parts_of_each_mode_in_the_order_of_the_run() -> None:
-    """
-    Arrange: a graph with one node.
-    Act: stream a run in the custom, updates and values modes.
-    Assert: the stream has the parts of all modes in the order in which the run made them.
-    """
-    graph = build_builder(("first", build_writer("first"))).compile()
-    modes = [StreamMode.custom, StreamMode.updates, StreamMode.values]
-
-    actual = asyncio.run(collect(graph.astream({}, stream_mode=modes)))
-
-    expected: list[StreamPart] = [
-        ValuesPart((), {"notes": []}, ()),
-        CustomPart((), "first works"),
-        UpdatesPart((), "first", {"notes": ["first"]}),
-        ValuesPart((), {"notes": ["first"]}, ()),
-    ]
-    assert actual == expected, f"Expected {expected}, got {actual}."
-
-
-@pytest.mark.parametrize(
-    ("subgraphs", "expected"),
-    [
-        (False, [((), "child"), ((), "last")]),
-        (True, [(("child",), "inner"), ((), "child"), ((), "last")]),
-    ],
-)
-def test_parts_of_a_child_graph_are_in_the_stream_only_when_subgraphs_is_set(
-    *, subgraphs: bool, expected: list[tuple[tuple[str, ...], str]]
-) -> None:
+def test_parts_of_a_child_graph_are_child_parts_with_the_namespace_of_the_child_graph() -> None:
     """
     Arrange: a parent graph with a child graph that has one node.
-    Act: stream a run in the updates mode, with and without subgraphs.
-    Assert: the parts of the child graph have the namespace of the child and are present only with subgraphs.
+    Act: stream a run.
+    Assert: the update of the inner node is in a child part with the namespace of the child graph, and the
+    updates of the parent graph are not in child parts.
     """
     graph = build_parent()
 
-    parts = asyncio.run(collect(graph.astream({}, stream_mode=StreamMode.updates, subgraphs=subgraphs)))
+    parts = asyncio.run(collect(graph.astream({})))
 
-    actual = [
-        (tuple(segment.split(":")[0] for segment in part.ns), part.node)
+    outer = [part.node for part in parts if isinstance(part, UpdatesPart)]
+    inner = [
+        (tuple(segment.split(":")[0] for segment in part.ns), part.part.node)
         for part in parts
-        if isinstance(part, UpdatesPart)
+        if isinstance(part, ChildPart) and isinstance(part.part, UpdatesPart)
     ]
-    assert actual == expected, f"Expected {expected}, got {actual}."
+    assert outer == ["child", "last"], f"Expected the updates of the parent graph, got {outer}."
+    assert inner == [(("child",), "inner")], f"Expected the update of the inner node, got {inner}."
 
 
 def test_sync_stream_gives_the_parts_of_the_async_stream() -> None:
@@ -183,13 +168,12 @@ def test_sync_stream_gives_the_parts_of_the_async_stream() -> None:
     Assert: each stream is equal to the async stream.
     """
     graph = build_chain()
-    modes = [StreamMode.custom, StreamMode.updates, StreamMode.values]
-    expected = asyncio.run(collect(graph.astream({}, stream_mode=modes)))
+    expected = asyncio.run(collect(graph.astream({})))
 
-    async def stream_inside_a_loop() -> list[StreamPart]:
-        return list(graph.stream({}, stream_mode=modes))
+    async def stream_inside_a_loop() -> list[StreamPart | ChildPart]:
+        return list(graph.stream({}))
 
-    actual = list(graph.stream({}, stream_mode=modes))
+    actual = list(graph.stream({}))
     inside = asyncio.run(stream_inside_a_loop())
 
     assert actual == expected, f"Expected {expected}, got {actual}."
@@ -205,32 +189,30 @@ def test_sync_stream_rejects_a_graph_that_has_an_async_node() -> None:
     builder = build_builder(("async", write_async))
 
     with pytest.raises(TypeError):
-        builder.compile().stream({}, stream_mode=StreamMode.values)
+        builder.compile().stream({})
     with pytest.raises(TypeError):
-        builder.compile(checkpointer=InMemoryCheckpointer()).stream(
-            {}, {"thread_id": "thread"}, stream_mode=StreamMode.values
-        )
+        builder.compile(checkpointer=InMemoryCheckpointer()).stream({}, {"thread_id": "thread"})
 
 
 @pytest.mark.parametrize("sync", [False, True])
 def test_stream_raises_the_exception_of_a_node_after_the_parts_before_it(*, sync: bool) -> None:
     """
     Arrange: a graph in which the second node raises.
-    Act: stream a run in the updates mode, with the async function or the sync function.
-    Assert: the stream gives the part of the first node, then raises the exception of the second node.
+    Act: read a stream to its end, with the async function or the sync function.
+    Assert: the stream gives the update of the first node, then raises the exception of the second node.
     """
     graph = build_builder(("first", build_writer("first")), ("fail", fail)).compile()
-    actual: list[object] = []
+    actual: list[UpdatesPart] = []
 
     async def read() -> None:
-        stream = graph.astream({}, stream_mode=StreamMode.updates)
-        actual.append(await anext(stream))
-        await anext(stream)
+        stream = graph.astream({})
+        actual.append(await anext(part async for part in stream if isinstance(part, UpdatesPart)))
+        await collect(stream)
 
     def read_sync() -> None:
-        stream = graph.stream({}, stream_mode=StreamMode.updates)
-        actual.append(next(stream))
-        next(stream)
+        stream = graph.stream({})
+        actual.append(next(part for part in stream if isinstance(part, UpdatesPart)))
+        list(stream)
 
     with pytest.raises(ConnectionError):
         if sync:
@@ -238,7 +220,7 @@ def test_stream_raises_the_exception_of_a_node_after_the_parts_before_it(*, sync
         else:
             asyncio.run(read())
 
-    expected = [UpdatesPart((), "first", {"notes": ["first"]})]
+    expected = [UpdatesPart("first", {"notes": ["first"]})]
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 
@@ -257,7 +239,7 @@ def test_stream_that_the_reader_leaves_cancels_the_run() -> None:
     graph = build_builder(("first", build_writer("first")), ("second", record)).compile()
 
     async def read_one_part() -> None:
-        stream = graph.astream({}, stream_mode=StreamMode.updates)
+        stream = graph.astream({})
         async for _ in stream:
             break
         await stream.aclose()
@@ -270,20 +252,21 @@ def test_stream_that_the_reader_leaves_cancels_the_run() -> None:
 def test_stream_of_a_thread_gives_the_interrupt_and_continues_with_a_resume_value() -> None:
     """
     Arrange: a graph with a checkpointer whose second node calls interrupt.
-    Act: stream a run in the updates and values modes, then stream a run with a resume value.
-    Assert: the first stream ends with the interrupt in each mode, and the second stream has the answer.
+    Act: stream a run, then stream a run with a resume value.
+    Assert: the first stream ends with a values part and an interrupts part that have the interrupt, and the
+    second stream has the update with the answer.
     """
     graph = build_builder(("first", build_writer("first")), ("ask", ask)).compile(checkpointer=InMemoryCheckpointer())
-    modes = [StreamMode.updates, StreamMode.values]
 
-    stopped = asyncio.run(collect(graph.astream({}, {"thread_id": "thread"}, stream_mode=modes)))
-    resumed = list(graph.stream(Command(resume="answer"), {"thread_id": "thread"}, stream_mode=StreamMode.updates))
+    stopped = asyncio.run(collect(graph.astream({}, {"thread_id": "thread"})))
+    resumed = list(graph.stream(Command(resume="answer"), {"thread_id": "thread"}))
 
     values = [part.interrupts[0].value for part in stopped[-2:] if isinstance(part, ValuesPart | InterruptsPart)]
     kinds = [type(part) for part in stopped[-2:]]
+    updates = [part for part in resumed if isinstance(part, UpdatesPart)]
     assert kinds == [ValuesPart, InterruptsPart], f"Expected a values part and an interrupts part, got {kinds}."
     assert values == ["question", "question"], f"Expected the value of the interrupt in each part, got {values}."
-    assert resumed == [UpdatesPart((), "ask", {"notes": ["answer"]})], f"Expected the answer, got {resumed}."
+    assert updates == [UpdatesPart("ask", {"notes": ["answer"]})], f"Expected the answer, got {updates}."
 
 
 def test_stream_without_a_checkpointer_rejects_an_interrupt() -> None:
@@ -295,7 +278,7 @@ def test_stream_without_a_checkpointer_rejects_an_interrupt() -> None:
     graph = build_builder(("ask", ask)).compile()
 
     with pytest.raises(RuntimeError):
-        list(graph.stream({}, stream_mode=StreamMode.values))
+        list(graph.stream({}))
 
 
 def test_stream_writer_outside_a_run_is_rejected() -> None:
@@ -319,16 +302,17 @@ def test_invoke_ignores_the_data_that_a_node_writes() -> None:
     assert actual == Output(notes=["first", "second"]), f"Expected the notes of two nodes, got {actual}."
 
 
-def test_tasks_mode_gives_the_start_and_the_result_of_each_node() -> None:
+def test_task_parts_give_the_start_and_the_result_of_each_node() -> None:
     """
     Arrange: a graph of two nodes in a chain.
-    Act: stream a run in the tasks mode.
+    Act: stream a run.
     Assert: each node has a start part with its input and then a result part with its update and the same id.
     """
     graph = build_chain()
 
-    actual = list(graph.stream({"notes": ["input"]}, stream_mode=StreamMode.tasks))
+    parts = list(graph.stream({"notes": ["input"]}))
 
+    actual = [part for part in parts if isinstance(part, TaskStartPart | TaskResultPart)]
     starts = [part for part in actual if isinstance(part, TaskStartPart)]
     results = [part for part in actual if isinstance(part, TaskResultPart)]
     kinds = [(type(part), part.name) for part in actual]
@@ -349,15 +333,15 @@ def test_tasks_mode_gives_the_start_and_the_result_of_each_node() -> None:
     assert len({part.id for part in starts}) == 2, f"Expected a different id for each task, got {starts}."
 
 
-def test_tasks_mode_gives_the_interrupts_of_a_node_that_stops() -> None:
+def test_task_result_part_gives_the_interrupts_of_a_node_that_stops() -> None:
     """
     Arrange: a graph with a checkpointer whose node calls interrupt.
-    Act: stream a run in the tasks mode.
+    Act: stream a run.
     Assert: the result part of the node has the interrupt and no update.
     """
     graph = build_builder(("ask", ask)).compile(checkpointer=InMemoryCheckpointer())
 
-    actual = list(graph.stream({}, {"thread_id": "thread"}, stream_mode=StreamMode.tasks))
+    actual = list(graph.stream({}, {"thread_id": "thread"}))
 
     results = [part for part in actual if isinstance(part, TaskResultPart)]
     values = [[item.value for item in part.interrupts] for part in results]
@@ -365,18 +349,20 @@ def test_tasks_mode_gives_the_interrupts_of_a_node_that_stops() -> None:
     assert [part.update for part in results] == [{}], f"Expected no update, got {results}."
 
 
-def test_checkpoints_mode_gives_the_state_of_each_checkpoint() -> None:
+def test_checkpoint_parts_give_the_state_of_each_checkpoint() -> None:
     """
     Arrange: a graph of two nodes in a chain with a checkpointer.
-    Act: stream a run in the checkpoints mode.
-    Assert: the stream has the state of each checkpoint in the order of the steps, and the last is the thread state.
+    Act: stream a run.
+    Assert: the checkpoint parts have the state of each checkpoint in the order of the steps, and the last is
+    the thread state.
     """
     graph = build_builder(("first", build_writer("first")), ("second", build_writer("second"))).compile(
         checkpointer=InMemoryCheckpointer()
     )
 
-    actual = asyncio.run(collect(graph.astream({}, {"thread_id": "thread"}, stream_mode=StreamMode.checkpoints)))
+    parts = asyncio.run(collect(graph.astream({}, {"thread_id": "thread"})))
 
+    actual = [part for part in parts if isinstance(part, CheckpointPart)]
     steps = [(part.state.step, part.state.next) for part in actual]
     expected = [(-1, ("__start__",)), (0, ("first",)), (1, ("second",)), (2, ())]
     assert steps == expected, f"Expected {expected}, got {steps}."
@@ -385,77 +371,30 @@ def test_checkpoints_mode_gives_the_state_of_each_checkpoint() -> None:
     )
 
 
-def test_checkpoints_mode_gives_no_part_for_a_run_that_continues_without_a_new_checkpoint() -> None:
+def test_stream_gives_no_checkpoint_part_for_a_run_that_continues_without_a_new_checkpoint() -> None:
     """
     Arrange: a thread that stopped at an interrupt after its first node.
-    Act: resume the thread with a stream in the checkpoints mode with subgraphs.
+    Act: resume the thread with a stream.
     Assert: the stream has only the checkpoint that the resumed node made.
     """
     graph = build_builder(("first", build_writer("first")), ("ask", ask)).compile(checkpointer=InMemoryCheckpointer())
     graph.invoke({}, {"thread_id": "thread"})
 
-    actual = list(
-        graph.stream(
-            Command(resume="answer"), {"thread_id": "thread"}, stream_mode=StreamMode.checkpoints, subgraphs=True
-        )
-    )
+    actual = list(graph.stream(Command(resume="answer"), {"thread_id": "thread"}))
 
-    steps = [part.state.step for part in actual]
+    steps = [part.state.step for part in actual if isinstance(part, CheckpointPart)]
     assert steps == [2], f"Expected only the checkpoint of step 2, got {steps}."
 
 
-def test_checkpoints_mode_without_a_checkpointer_gives_no_part() -> None:
+def test_stream_without_a_checkpointer_gives_no_checkpoint_part() -> None:
     """
     Arrange: a graph without a checkpointer.
-    Act: stream a run in the checkpoints mode and the updates mode.
-    Assert: the stream has only the parts of the updates mode.
+    Act: stream a run.
+    Assert: the stream has no checkpoint part.
     """
     graph = build_chain()
 
-    actual = list(graph.stream({}, stream_mode=[StreamMode.checkpoints, StreamMode.updates]))
+    actual = list(graph.stream({}))
 
-    kinds = {type(part) for part in actual}
-    assert kinds == {UpdatesPart}, f"Expected only update parts, got {kinds}."
-
-
-@pytest.mark.parametrize(
-    ("stream_mode", "expected"),
-    [
-        (StreamMode.values, {StreamMode.values}),
-        ("values", {StreamMode.values}),
-        (["values", StreamMode.updates], {StreamMode.values, StreamMode.updates}),
-        ((), set[StreamMode]()),
-    ],
-    ids=["member", "string", "list", "empty"],
-)
-def test_stream_modes_are_parsed_into_a_set_of_modes(stream_mode: object, expected: set[StreamMode]) -> None:
-    """
-    Arrange: a stream mode given as a member, as its string, or as a collection.
-    Act: parse it.
-    Assert: the result is the set of the given modes.
-    """
-    actual = parse_stream_modes(stream_mode)
-
-    assert actual == expected, f"Expected the modes {expected}, got {actual}."
-
-
-@pytest.mark.parametrize("stream_mode", ["value", ["values", "nope"]], ids=["string", "list"])
-def test_unknown_stream_mode_is_rejected(stream_mode: object) -> None:
-    """
-    Arrange: a stream mode that is not a mode, alone or in a list.
-    Act: parse it.
-    Assert: the parse raises ValueError.
-    """
-    with pytest.raises(ValueError):
-        parse_stream_modes(stream_mode)
-
-
-@pytest.mark.parametrize("stream_mode", [5, None], ids=["number", "none"])
-def test_stream_mode_of_another_type_is_rejected(stream_mode: object) -> None:
-    """
-    Arrange: a value that is not a mode and not a collection.
-    Act: parse it.
-    Assert: the parse raises TypeError.
-    """
-    with pytest.raises(TypeError):
-        parse_stream_modes(stream_mode)
+    checkpoints = [part for part in actual if isinstance(part, CheckpointPart)]
+    assert checkpoints == [], f"Expected no checkpoint part, got {checkpoints}."

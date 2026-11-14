@@ -6,7 +6,7 @@ from typing import Annotated, TypedDict
 
 import pytest
 
-from pregel_redux import Depends, Endpoint, Reducer, Scope, StateGraph, StreamMode
+from pregel_redux import Depends, Endpoint, Reducer, Scope, StateGraph
 from tests.conftest import Journal, join_lists
 
 
@@ -256,7 +256,7 @@ def test_stream_stops_the_run_when_the_reader_stops(journal: Journal, nodes_afte
     for index in range(nodes_after_the_break):
         builder.add_node(f"later-{index}", lambda state: journal.events.append("later"))
         builder.add_edge("second" if index == 0 else f"later-{index - 1}", f"later-{index}")
-    parts = builder.compile().stream({}, stream_mode=StreamMode.updates)
+    parts = builder.compile().stream({})
     next(parts)
     started.wait(timeout=1)
     timer = threading.Timer(0.05, release.set)

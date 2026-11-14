@@ -2,7 +2,7 @@ import asyncio
 import signal
 import threading
 from collections.abc import AsyncIterator
-from typing import Annotated, TypedDict, assert_never
+from typing import Annotated, TypedDict
 
 import pytest
 
@@ -18,20 +18,13 @@ from pregel_redux import (
     ShutdownSignal,
     StateGraph,
     StopReason,
-    StreamMode,
     graceful_shutdown,
     interrupt,
     read_shutdown,
 )
 from pregel_redux.streams import (
-    CheckpointPart,
-    CustomPart,
     InterruptsPart,
-    StreamPart,
-    TaskResultPart,
-    TaskStartPart,
     UpdatesPart,
-    ValuesPart,
 )
 from tests.conftest import collect, join_lists
 
@@ -383,19 +376,12 @@ def test_stream_ends_after_the_current_step_at_a_graceful_shutdown() -> None:
     builder.add_edge("first", "second")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
-    parts = list(graph.stream({}, {"thread_id": "thread"}, stream_mode=StreamMode.updates, signal=controller.signal))
+    parts = list(graph.stream({}, {"thread_id": "thread"}, signal=controller.signal))
 
-    def read_node(part: StreamPart) -> str | None:
-        match part:
-            case UpdatesPart(node=node):
-                return node
-            case ValuesPart() | InterruptsPart() | CustomPart() | CheckpointPart() | TaskStartPart() | TaskResultPart():
-                return None
-            case _:
-                assert_never(part)
-
-    names = [read_node(part) for part in parts]
-    assert names == ["first", None], f"Expected the update of the first node and the stop, got {parts}."
+    names = [part.node for part in parts if isinstance(part, UpdatesPart)]
+    stops = [part for part in parts if isinstance(part, InterruptsPart)]
+    assert names == ["first"], f"Expected only the update of the first node, got {parts}."
+    assert len(stops) == 1, f"Expected one stop, got {parts}."
 
 
 def test_stream_raises_at_an_abort() -> None:
@@ -417,11 +403,7 @@ def test_stream_raises_at_an_abort() -> None:
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
 
     with pytest.raises(RunAborted):
-        asyncio.run(
-            collect(
-                graph.astream({}, {"thread_id": "thread"}, stream_mode=StreamMode.updates, signal=controller.signal)
-            )
-        )
+        asyncio.run(collect(graph.astream({}, {"thread_id": "thread"}, signal=controller.signal)))
 
 
 def test_shutdown_request_after_an_abort_keeps_the_abort() -> None:
