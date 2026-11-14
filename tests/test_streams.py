@@ -1,6 +1,6 @@
 import asyncio
 from collections.abc import Callable
-from typing import Annotated, TypedDict
+from typing import Annotated, Concatenate, TypedDict
 
 import pytest
 
@@ -11,7 +11,7 @@ from pregel_redux import (
     InMemoryCheckpointer,
     Reducer,
     StateGraph,
-    get_stream_writer,
+    StreamWriter,
     interrupt,
 )
 from pregel_redux.streams import (
@@ -36,16 +36,16 @@ class Output(TypedDict):
     notes: list[str]
 
 
-def build_writer(name: str) -> Callable[[State], State]:
-    def write(state: State) -> State:
-        get_stream_writer()(f"{name} works")
+def build_writer(name: str) -> Callable[Concatenate[State, ...], State]:
+    def write(state: State, writer: StreamWriter) -> State:
+        writer(f"{name} works")
         return {"notes": [name]}
 
     return write
 
 
-async def write_async(state: State) -> State:
-    get_stream_writer()("async works")
+async def write_async(state: State, writer: StreamWriter) -> State:
+    writer("async works")
     return {"notes": ["async"]}
 
 
@@ -57,7 +57,7 @@ def fail(state: State) -> State:
     raise ConnectionError("no network")
 
 
-def build_builder(*nodes: tuple[str, Callable[[State], object]]) -> StateGraph[State, State, Output]:
+def build_builder(*nodes: tuple[str, Callable[Concatenate[State, ...], object]]) -> StateGraph[State, State, Output]:
     builder = StateGraph(State, output_schema=Output)
     previous: str | None = None
     for name, node in nodes:
@@ -279,16 +279,6 @@ def test_stream_without_a_checkpointer_rejects_an_interrupt() -> None:
 
     with pytest.raises(RuntimeError):
         list(graph.stream({}))
-
-
-def test_stream_writer_outside_a_run_is_rejected() -> None:
-    """
-    Arrange: no running graph.
-    Act: ask for the stream writer.
-    Assert: the call raises RuntimeError.
-    """
-    with pytest.raises(RuntimeError):
-        get_stream_writer()
 
 
 def test_invoke_ignores_the_data_that_a_node_writes() -> None:

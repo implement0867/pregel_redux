@@ -20,7 +20,6 @@ from pregel_redux import (
     StopReason,
     graceful_shutdown,
     interrupt,
-    read_shutdown,
 )
 from pregel_redux.streams import (
     InterruptsPart,
@@ -340,7 +339,7 @@ def test_node_reads_the_shutdown_signal_of_its_run() -> None:
     controller = ShutdownController()
     seen: list[tuple[bool, bool]] = []
 
-    def read(state: State, shutdown: Annotated[ShutdownSignal, Depends(read_shutdown)]) -> State:
+    def read(state: State, shutdown: ShutdownSignal) -> State:
         before = shutdown.requested
         controller.shutdown()
         seen.append((before, shutdown.requested))

@@ -149,10 +149,6 @@ async def run_until_abort[ResultT](shutdown: ShutdownSignal, work: Coroutine[obj
             timer.cancel()
 
 
-def read_shutdown() -> ShutdownSignal:
-    raise RuntimeError("read_shutdown supplies a value only in a run of a graph that has a checkpointer")
-
-
 @contextmanager
 def graceful_shutdown(
     *,

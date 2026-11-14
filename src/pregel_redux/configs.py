@@ -38,7 +38,3 @@ def parse_run_target(thread_id: str, fork_from: UUID | None) -> RunTarget:
 
 def parse_state_address(thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None) -> StateAddress:
     return StateAddress(parse_thread_id(thread_id), checkpoint_ns, parse_checkpoint_id(checkpoint_id))
-
-
-def read_config() -> RunTarget:
-    raise RuntimeError("read_config supplies a value only in a run of a graph that has a checkpointer")

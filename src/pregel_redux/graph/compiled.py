@@ -15,7 +15,7 @@ from pregel_redux.checkpoints import CheckpointSource
 from pregel_redux.commands import Send, read_outcome
 from pregel_redux.dependencies import (
     CallPlan,
-    Depends,
+    Request,
     ShieldedExitStack,
     close_at_exit,
     execute_plan,
@@ -59,15 +59,14 @@ from pregel_redux.snapshots import StateSnapshot
 from pregel_redux.streams import (
     CheckpointPart,
     ChildPart,
-    CustomPart,
     InterruptsPart,
     Stream,
     StreamPart,
+    StreamWriter,
     TaskResultPart,
     TaskStartPart,
     UpdatesPart,
     ValuesPart,
-    current_stream_writer,
 )
 from pregel_redux.task_refs import NodeCall, PullRef, PushRef, StartRef, TaskRef, name_task, refer_task
 
@@ -134,7 +133,7 @@ class NoJournal:
 
 @dataclass(frozen=True)
 class Run:
-    values: dict[Depends, object]
+    values: dict[Request, object]
     exits: AsyncExitStack
     lock: asyncio.Lock
     step_limit: int
@@ -218,7 +217,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         journal: Journal,
         resume: ResumeInput,
         stream: Stream,
-        provided: dict[Depends, object],
+        provided: dict[Request, object],
         shutdown: ShutdownSignal,
         *,
         resumed: bool,
@@ -391,7 +390,6 @@ class CompiledGraph[StateT, InputT, OutputT]:
             return saved
         scratchpad = journal.open_scratchpad(call.task, run.resume)
         current_scratchpad.set(scratchpad)
-        current_stream_writer.set(lambda data: run.stream.send(journal.ns, CustomPart(data)))
         name = call.task.name
         task_id = journal.make_task_id(call.task)
         match call.task:
@@ -442,7 +440,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
                 action = self.nodes[name].action
                 match action:
                     case CallPlan():
-                        return await self.call_function(action, name, call, run, step_exits)
+                        return await self.call_function(action, name, call, run, journal.ns, step_exits)
                     case CompiledGraph():
                         entry = await journal.enter_child(action, call)
                         result = await action.run_steps(entry.position, run, entry.journal, resumed=entry.resumed)
@@ -469,12 +467,12 @@ class CompiledGraph[StateT, InputT, OutputT]:
         )
 
     async def call_function(
-        self, plan: CallPlan, name: str, call: NodeCall, run: Run, step_exits: AsyncExitStack
+        self, plan: CallPlan, name: str, call: NodeCall, run: Run, ns: tuple[str, ...], step_exits: AsyncExitStack
     ) -> TaskWrites:
         if plan.run_providers:
             async with run.lock:
                 await open_providers(plan.run_providers, run.values, run.exits)
-        node_values = ChainMap[Depends, object]({}, dict(run.values))
+        node_values = ChainMap[Request, object]({StreamWriter: StreamWriter(run.stream, ns)}, dict(run.values))
         writes: TaskWrites | None = None
         async with AsyncExitStack[bool]() as node_exits:
             result = await execute_plan(plan, call.node_input, node_values, node_exits)

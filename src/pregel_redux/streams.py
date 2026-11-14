@@ -1,5 +1,4 @@
 from collections.abc import Callable, Mapping
-from contextvars import ContextVar
 from dataclasses import dataclass
 
 from pregel_redux.interrupts import Interrupt
@@ -73,11 +72,10 @@ class Stream:
                 raise TypeError(f"the namespace {ns!r} is not a tuple")
 
 
-current_stream_writer = ContextVar[Callable[[object], None]]("current_stream_writer")
+@dataclass(frozen=True)
+class StreamWriter:
+    stream: Stream
+    ns: tuple[str, ...]
 
-
-def get_stream_writer() -> Callable[[object], None]:
-    try:
-        return current_stream_writer.get()
-    except LookupError:
-        raise RuntimeError("get_stream_writer works only inside a node of a running graph") from None
+    def __call__(self, data: object) -> None:
+        self.stream.send(self.ns, CustomPart(data))

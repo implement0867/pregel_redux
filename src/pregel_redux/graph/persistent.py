@@ -12,8 +12,8 @@ from pregel_redux.checkpoints import (
     ThreadedCheckpointer,
 )
 from pregel_redux.commands import Command
-from pregel_redux.configs import RunTarget, StateAddress, parse_run_target, parse_state_address, read_config
-from pregel_redux.dependencies import Depends, Scope
+from pregel_redux.configs import RunTarget, StateAddress, parse_run_target, parse_state_address
+from pregel_redux.dependencies import Request
 from pregel_redux.graph.adapters import iterate_in_new_loop, run_in_new_loop, stream_run
 from pregel_redux.graph.compiled import CompiledGraph
 from pregel_redux.graph.threads import ThreadJournal, ThreadScope, find_graph, infer_writer
@@ -28,7 +28,7 @@ from pregel_redux.pregel import (
     plan_tasks,
     read_command_writes,
 )
-from pregel_redux.shutdown import RunAborted, ShutdownController, ShutdownSignal, read_shutdown
+from pregel_redux.shutdown import RunAborted, ShutdownController, ShutdownSignal
 from pregel_redux.snapshots import StateSnapshot
 from pregel_redux.streams import (
     ChildPart,
@@ -111,10 +111,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         shutdown: ShutdownSignal,
     ) -> Finished[OutputT] | Interrupted:
         start = await self.start(checkpointer, input, target)
-        provided: dict[Depends, object] = {
-            **{Depends(read_config, scope=scope): target for scope in Scope},
-            **{Depends(read_shutdown, scope=scope): shutdown for scope in Scope},
-        }
+        provided: dict[Request, object] = {RunTarget: target, ShutdownSignal: shutdown}
         return await self.graph.run(
             start.position, step_limit, start.journal, start.resume, stream, provided, shutdown, resumed=start.resumed
         )

@@ -6,8 +6,8 @@ from typing import Annotated, TypedDict
 
 import pytest
 
-from pregel_redux import Depends, Endpoint, Reducer, Scope, StateDep, StateGraph
-from pregel_redux.dependencies import read_dependency_parameters, read_state
+from pregel_redux import Depends, Endpoint, Reducer, Scope, StateDep, StateGraph, StreamWriter
+from pregel_redux.dependencies import read_dependency_parameters
 from pregel_redux.graph import Node
 from tests.conftest import Journal, join_lists
 
@@ -102,8 +102,11 @@ def build_graph_with_state_in_run_scope() -> StateGraph[State, State, State]:
     return build_one_node_graph(use_value)
 
 
-def build_graph_with_run_scoped_state() -> StateGraph[State, State, State]:
-    def use_value(state: State, copy: Annotated[State, Depends(read_state, scope=Scope.run)]) -> None:
+def build_graph_with_stream_writer_in_run_scope() -> StateGraph[State, State, State]:
+    def provide_writer(writer: StreamWriter) -> StreamWriter:
+        return writer
+
+    def use_value(state: State, value: Annotated[StreamWriter, Depends(provide_writer, scope=Scope.run)]) -> None:
         return None
 
     return build_one_node_graph(use_value)
@@ -432,7 +435,7 @@ def test_override_replaces_a_provider_for_every_node(
         (build_graph_with_scope_conflict, ValueError),
         (build_graph_with_dependency_cycle, ValueError),
         (build_graph_with_state_in_run_scope, ValueError),
-        (build_graph_with_run_scoped_state, ValueError),
+        (build_graph_with_stream_writer_in_run_scope, ValueError),
         (build_graph_with_plain_parameter, TypeError),
         (build_graph_with_plain_provider_parameter, TypeError),
         (build_graph_with_two_markers, TypeError),
@@ -469,7 +472,7 @@ def test_one_provider_requested_with_two_scopes_gives_two_values(journal: Journa
 @pytest.mark.parametrize("state_parameters", [1, 2])
 def test_function_with_too_few_parameters_for_the_state_is_rejected(state_parameters: int) -> None:
     with pytest.raises(TypeError):
-        read_dependency_parameters(lambda: None, state_parameters=state_parameters)
+        read_dependency_parameters(lambda: None, {}, state_parameters=state_parameters)
 
 
 @pytest.mark.parametrize(
@@ -604,8 +607,3 @@ def test_type_alias_with_depends_supplies_its_value() -> None:
     actual = asyncio.run(build_one_node_graph(use_value).compile().ainvoke({}))
 
     assert actual == {"seen": [7]}, f"Expected the alias to supply 7, got {actual}."
-
-
-def test_read_state_outside_a_graph_raises() -> None:
-    with pytest.raises(RuntimeError):
-        read_state()

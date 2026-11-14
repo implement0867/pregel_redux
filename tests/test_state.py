@@ -21,7 +21,6 @@ from pregel_redux import (
     StateSnapshot,
     StopReason,
     interrupt,
-    read_config,
 )
 from pregel_redux.checkpoints import CheckpointSource
 from pregel_redux.snapshots import FailedTask, FinishedTask, PendingTask, WaitingTask
@@ -580,16 +579,16 @@ def test_state_task_of_a_send_has_the_index_of_the_send_as_path(sends: int) -> N
     assert paths == expected, f"Expected the paths {expected}, got {paths}."
 
 
-def read_thread(state: State, config: Annotated[RunTarget, Depends(read_config)]) -> State:
-    return {"notes": [config.thread_id]}
+def read_thread(state: State, target: RunTarget) -> State:
+    return {"notes": [target.thread_id]}
 
 
-async def read_thread_async(state: State, config: Annotated[RunTarget, Depends(read_config)]) -> State:
-    return {"notes": [config.thread_id]}
+async def read_thread_async(state: State, target: RunTarget) -> State:
+    return {"notes": [target.thread_id]}
 
 
-def provide_thread(config: Annotated[RunTarget, Depends(read_config, scope=Scope.run)]) -> str:
-    return config.thread_id
+def provide_thread(target: RunTarget) -> str:
+    return target.thread_id
 
 
 def read_provided_thread(state: State, thread: Annotated[str, Depends(provide_thread, scope=Scope.run)]) -> State:
@@ -621,18 +620,18 @@ def test_node_reads_the_thread_id_of_the_run(node: Callable[..., object], depth:
 
 
 @pytest.mark.parametrize("node", [read_thread, read_thread_async, read_provided_thread])
-def test_node_of_a_graph_without_a_checkpointer_cannot_read_the_config(node: Callable[..., object]) -> None:
+def test_graph_without_a_checkpointer_rejects_a_node_that_requests_the_run_target(node: Callable[..., object]) -> None:
     """
-    Arrange: a graph without a checkpointer and a node that requests the thread_id.
-    Act: run the graph.
-    Assert: the run raises RuntimeError.
+    Arrange: a graph builder with a node that requests the run target.
+    Act: compile the graph without a checkpointer.
+    Assert: the compile raises TypeError.
     """
     builder = StateGraph(State, output_schema=State)
     builder.add_node("read", node)
     builder.add_edge(Endpoint.start, "read")
 
-    with pytest.raises(RuntimeError):
-        asyncio.run(builder.compile().ainvoke({}))
+    with pytest.raises(TypeError):
+        builder.compile()
 
 
 def test_state_history_of_a_child_graph_is_read_by_its_namespace() -> None:

@@ -25,12 +25,13 @@ class Depends:
     scope: Scope = field(default=Scope.node, kw_only=True)
 
 
-def read_state() -> object:
-    """Marker that requests the state of the current node call."""
-    raise RuntimeError("read_state supplies a value only as a node-scoped dependency of a graph")
+class NodeValue(Enum):
+    state = "state"
 
 
-type StateDep[StateT] = Annotated[StateT, Depends(read_state)]
+type StateDep[StateT] = Annotated[StateT, NodeValue.state]
+type Supplied = NodeValue | type[object]
+type Request = Depends | Supplied
 
 
 def expand_alias(annotation: object) -> object:
@@ -47,25 +48,34 @@ class ResolvedProvider:
     request: Depends
     function: Callable[..., object]
     open_value: Callable[..., AbstractAsyncContextManager[object]]
-    parameters: Mapping[str, Depends]
+    parameters: Mapping[str, Request]
 
 
 @dataclass(frozen=True)
 class CallPlan:
     function: Callable[..., object]
-    parameters: Mapping[str, Depends]
+    parameters: Mapping[str, Request]
     run_providers: tuple[ResolvedProvider, ...]
     node_providers: tuple[ResolvedProvider, ...]
 
 
-def read_request(function: Callable[..., object], parameter: inspect.Parameter) -> Depends:
+def read_request(
+    function: Callable[..., object], parameter: inspect.Parameter, supplied: Mapping[Supplied, Scope]
+) -> Request:
     if parameter.kind not in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY):
         raise TypeError(f"parameter {parameter.name!r} of {function!r} cannot receive a dependency by keyword")
     annotation = expand_alias(parameter.annotation)
+    if isinstance(annotation, type):
+        if annotation not in supplied:
+            raise TypeError(
+                f"parameter {parameter.name!r} of {function!r} is not annotated with Depends, "
+                f"and this graph does not supply a value of type {annotation!r}"
+            )
+        return annotation
     metadata = get_args(annotation)[1:] if get_origin(annotation) is Annotated else ()
-    markers = [item for item in metadata if isinstance(item, Depends)]
+    markers = [item for item in metadata if isinstance(item, Depends | NodeValue)]
     match markers:
-        case [Depends() as request]:
+        case [Depends() | NodeValue() as request]:
             return request
         case []:
             raise TypeError(f"parameter {parameter.name!r} of {function!r} is not annotated with Depends")
@@ -73,11 +83,13 @@ def read_request(function: Callable[..., object], parameter: inspect.Parameter) 
             raise TypeError(f"parameter {parameter.name!r} of {function!r} has more than one Depends annotation")
 
 
-def read_dependency_parameters(function: Callable[..., object], *, state_parameters: int) -> dict[str, Depends]:
+def read_dependency_parameters(
+    function: Callable[..., object], supplied: Mapping[Supplied, Scope], *, state_parameters: int
+) -> dict[str, Request]:
     parameters = list(inspect.signature(function, eval_str=True).parameters.values())
     if len(parameters) < state_parameters:
         raise TypeError(f"{function!r} must accept the state as its first parameter")
-    return {parameter.name: read_request(function, parameter) for parameter in parameters[state_parameters:]}
+    return {parameter.name: read_request(function, parameter, supplied) for parameter in parameters[state_parameters:]}
 
 
 async def finish_despite_cancellation[ResultT](work: Awaitable[ResultT]) -> ResultT:
@@ -180,6 +192,7 @@ def build_value_opener(function: Callable[..., object]) -> Callable[..., Abstrac
 def resolve_provider(
     request: Depends,
     overrides: Mapping[Callable[..., object], Callable[..., object]],
+    supplied: Mapping[Supplied, Scope],
     resolved: dict[Depends, ResolvedProvider],
     path: tuple[Depends, ...],
 ) -> ResolvedProvider:
@@ -187,28 +200,37 @@ def resolve_provider(
         return resolved[request]
     if request in path:
         raise ValueError(f"dependency cycle through {request.dependency!r}")
-    if request.dependency is read_state and request.scope is Scope.run:
-        raise ValueError("the state changes at each step, so a run-scoped dependency cannot request it")
     function = overrides.get(request.dependency, request.dependency)
-    parameters = read_dependency_parameters(function, state_parameters=0)
+    parameters = read_dependency_parameters(function, supplied, state_parameters=0)
     for name, child in parameters.items():
-        if request.scope is Scope.run and child.scope is Scope.node:
+        match child:
+            case Depends():
+                child_scope, child_name = child.scope, repr(child.dependency)
+                resolve_provider(child, overrides, supplied, resolved, (*path, request))
+            case _:
+                child_scope, child_name = supplied[child], f"the value {child!r} of a node call"
+        if request.scope is Scope.run and child_scope is Scope.node:
             raise ValueError(
-                f"run-scoped dependency {function!r} requests node-scoped dependency {child.dependency!r} "
+                f"run-scoped dependency {function!r} requests node-scoped dependency {child_name} "
                 f"through parameter {name!r}"
             )
-        resolve_provider(child, overrides, resolved, (*path, request))
     resolved[request] = ResolvedProvider(request, function, build_value_opener(function), parameters)
     return resolved[request]
 
 
 def plan_call(
-    function: Callable[..., object], overrides: Mapping[Callable[..., object], Callable[..., object]]
+    function: Callable[..., object],
+    overrides: Mapping[Callable[..., object], Callable[..., object]],
+    supplied: Mapping[Supplied, Scope],
 ) -> CallPlan:
-    parameters = read_dependency_parameters(function, state_parameters=1)
+    parameters = read_dependency_parameters(function, supplied, state_parameters=1)
     resolved: dict[Depends, ResolvedProvider] = {}
     for request in parameters.values():
-        resolve_provider(request, overrides, resolved, ())
+        match request:
+            case Depends():
+                resolve_provider(request, overrides, supplied, resolved, ())
+            case _:
+                pass
     return CallPlan(
         function,
         parameters,
@@ -218,7 +240,7 @@ def plan_call(
 
 
 async def open_providers(
-    providers: Iterable[ResolvedProvider], values: MutableMapping[Depends, object], exits: AsyncExitStack
+    providers: Iterable[ResolvedProvider], values: MutableMapping[Request, object], exits: AsyncExitStack
 ) -> None:
     for item in providers:
         if item.request in values:
@@ -228,9 +250,9 @@ async def open_providers(
 
 
 async def execute_plan(
-    plan: CallPlan, state: object, values: MutableMapping[Depends, object], exits: AsyncExitStack
+    plan: CallPlan, state: object, values: MutableMapping[Request, object], exits: AsyncExitStack
 ) -> object:
-    values[Depends(read_state)] = state
+    values[NodeValue.state] = state
     await open_providers(plan.node_providers, values, exits)
     return await call_without_blocking(
         plan.function, state, **{name: values[request] for name, request in plan.parameters.items()}

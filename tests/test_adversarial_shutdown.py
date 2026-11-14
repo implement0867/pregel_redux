@@ -18,7 +18,7 @@ from pregel_redux import (
     Send,
     ShutdownController,
     StateGraph,
-    get_stream_writer,
+    StreamWriter,
     graceful_shutdown,
 )
 from pregel_redux.streams import ChildPart, TaskResultPart, TaskStartPart
@@ -40,9 +40,9 @@ def test_custom_part_of_a_sync_node_reaches_the_reader_while_the_node_runs(*, sy
     confirmed = threading.Event()
     seen: list[bool] = []
 
-    def write_and_wait(state: State) -> State:
+    def write_and_wait(state: State, writer: StreamWriter) -> State:
         time.sleep(0.1)
-        get_stream_writer()("progress")
+        writer("progress")
         seen.append(confirmed.wait(timeout=1))
         return {"notes": ["done"]}
 
