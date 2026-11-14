@@ -1,10 +1,13 @@
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
+from enum import Enum
 from uuid import NAMESPACE_OID, uuid5
 
 from pydantic import BaseModel, ConfigDict, JsonValue, TypeAdapter
 from typing_extensions import TypeForm
+
+from pregel_redux.channels import Stored
 
 
 class Interrupt(BaseModel):
@@ -25,9 +28,21 @@ class Finished[OutputT]:
     output: OutputT
 
 
+class StopReason(Enum):
+    question = "question"
+    breakpoint = "breakpoint"
+    shutdown = "shutdown"
+
+
 @dataclass(frozen=True)
 class Interrupted:
     interrupts: tuple[Interrupt, ...]
+    values: Mapping[str, object]
+    reason: StopReason
+
+
+def make_interrupt_id(task_ns: str, index: int) -> str:
+    return str(uuid5(NAMESPACE_OID, f"{task_ns}|{index}"))
 
 
 @dataclass
@@ -43,20 +58,19 @@ class Scratchpad:
     run_resume: ResumeInput
     interrupt_counter: int
 
-    def make_interrupt_id(self, index: int) -> str:
-        return str(uuid5(NAMESPACE_OID, f"{self.task_ns}|{index}"))
-
-    def find_resume(self, index: int) -> bool:
+    def take_resume[ResponseT](self, index: int, parse: Callable[[JsonValue], ResponseT]) -> Stored[ResponseT] | None:
+        interrupt_id = make_interrupt_id(self.task_ns, index)
+        if interrupt_id in self.run_resume.by_interrupt_id and index <= len(self.resume):
+            answer = Stored(parse(self.run_resume.by_interrupt_id[interrupt_id]))
+            self.resume[index:] = [self.run_resume.by_interrupt_id[interrupt_id]]
+            return answer
         if index < len(self.resume):
-            return True
-        interrupt_id = self.make_interrupt_id(index)
-        if interrupt_id in self.run_resume.by_interrupt_id:
-            self.resume.append(self.run_resume.by_interrupt_id[interrupt_id])
-            return True
+            return Stored(parse(self.resume[index]))
         if self.run_resume.values:
+            answer = Stored(parse(self.run_resume.values[-1]))
             self.resume.append(self.run_resume.values.pop())
-            return True
-        return False
+            return answer
+        return None
 
 
 current_scratchpad = ContextVar[Scratchpad]("current_scratchpad")
@@ -69,6 +83,7 @@ def interrupt[ResponseT](value: JsonValue, *, response_schema: TypeForm[Response
         raise RuntimeError("interrupt works only inside a node of a running graph") from None
     index = scratchpad.interrupt_counter
     scratchpad.interrupt_counter += 1
-    if scratchpad.find_resume(index):
-        return TypeAdapter[ResponseT](response_schema).validate_python(scratchpad.resume[index])
-    raise GraphInterrupt((Interrupt(value=value, id=scratchpad.make_interrupt_id(index)),))
+    answer = scratchpad.take_resume(index, TypeAdapter[ResponseT](response_schema).validate_python)
+    if answer is not None:
+        return answer.value
+    raise GraphInterrupt((Interrupt(value=value, id=make_interrupt_id(scratchpad.task_ns, index)),))

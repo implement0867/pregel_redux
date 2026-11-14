@@ -10,21 +10,32 @@ dependencies = [
     "typing-extensions>=4.16.0",
 ]
 
+[project.optional-dependencies]
+sqlite = [
+    "sqlalchemy>=2.1.8",
+]
+
 [build-system]
 requires = ["uv_build>=0.13.7,<0.14.0"]
 build-backend = "uv_build"
 
 [dependency-groups]
 dev = [
+    "ast-grep-cli>=0.51.2",
     "basedpyright>=1.40.2",
-    "pytest>=9.2.0",
+    "hypothesis>=6.170.15",
+    "pytest>=9.1.1,<9.2",
     "pytest-cov>=7.1.0",
+    "pytest-xdist>=3.8.0",
     "ruff>=0.17.4",
+    "sqlalchemy>=2.1.8",
 ]
 
-[tool.pytest.ini_options]
+[tool.pytest]
+minversion = "9.1"
+strict = true
 testpaths = ["tests"]
-addopts = ["-ra", "--strict-markers", "--strict-config", "--cov", "--cov-report=term-missing"]
+addopts = ["-ra", "--cov", "--cov-report=term-missing", "--numprocesses=2", "--dist=loadgroup"]
 filterwarnings = ["error"]
 
 [tool.basedpyright]
