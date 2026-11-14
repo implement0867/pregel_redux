@@ -1240,6 +1240,7 @@ class ThreadMachine(RuleBasedStateMachine):
         thread = self.thread
         delivery = Delivery(CallMode.asynchronous, None)
         result = None if thread.trace.faults else thread.result
+        answered: set[str] = set()
         while True:
             match result:
                 case Finished():
@@ -1256,9 +1257,15 @@ class ThreadMachine(RuleBasedStateMachine):
                 len(thread.trace.consumed),
                 len(thread.trace.shutdowns),
             )
+            again = [item for item in snapshot.interrupts if item.id in answered]
+            assert not again, f"Expected no question to wait again after its answer, got {again}."
             answers = {item.id: thread.make_text("") for item in snapshot.interrupts}
             thread.trace.given.update({read_question(item): answers[item.id] for item in snapshot.interrupts})
+            trace = thread.trace
+            stops = (len(trace.fired), len(trace.requested), trace.aborts)
             result = self.deliver(Command(resume_by_interrupt_id=answers) if answers else None, None, delivery)
+            if (len(trace.fired), len(trace.requested), trace.aborts) == stops:
+                answered.update(answers)
             match result:
                 case Finished():
                     pass
