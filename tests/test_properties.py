@@ -1123,6 +1123,9 @@ class ThreadMachine(RuleBasedStateMachine):
         snapshot = self.runner.run(graph.aget_state(self.thread_id, subgraphs=True))
         candidates = [snapshot, *find_namespaces(snapshot), *thread.history]
         before = candidates[data.draw(st.integers(min_value=0)) % len(candidates)]
+        first_steps = [item for item in thread.history if item.step == 1 and item.source is CheckpointSource.loop]
+        if data.draw(st.booleans(), label="after the first step") and first_steps:
+            before = first_steps[-1]
         older = before in thread.history
         checkpoint_id = before.checkpoint_id if older else None
         checkpoint_ns = () if older else before.checkpoint_ns
