@@ -12,7 +12,7 @@ from pregel_redux.checkpoints import (
     ThreadedCheckpointer,
 )
 from pregel_redux.commands import Command
-from pregel_redux.configs import RunTarget, StateAddress, parse_run_target, parse_state_address
+from pregel_redux.configs import Namespace, RunTarget, StateAddress, parse_run_target, parse_state_address
 from pregel_redux.dependencies import Request
 from pregel_redux.graph.adapters import iterate_in_new_loop, run_in_new_loop, stream_run
 from pregel_redux.graph.compiled import CompiledGraph
@@ -58,7 +58,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         target: RunTarget,
     ) -> RunStart:
         thread_id = target.thread_id
-        scope = ThreadScope(self.graph, checkpointer, thread_id, "")
+        scope = ThreadScope(self.graph, checkpointer, thread_id, ())
         match input:
             case Command() as command:
                 answers = command.resume is not None or bool(command.resume_by_interrupt_id)
@@ -195,19 +195,29 @@ class PersistentGraph[StateT, InputT, OutputT]:
     ) -> StateSnapshot:
         graph = find_graph(self.graph, address.checkpoint_ns)
         scope = ThreadScope(graph, checkpointer, address.thread_id, address.checkpoint_ns)
-        saved = await checkpointer.aget_tuple(address.thread_id, address.checkpoint_ns, address.checkpoint_id)
+        saved = await checkpointer.aget_tuple(address.thread_id, scope.stored_ns, address.checkpoint_id)
         if saved is None:
             raise LookupError(f"thread {address.thread_id!r} has no such checkpoint")
         return await scope.read_snapshot(saved, subgraphs=subgraphs)
 
     async def aget_state(
-        self, thread_id: str, *, checkpoint_ns: str = "", checkpoint_id: UUID | None = None, subgraphs: bool = False
+        self,
+        thread_id: str,
+        *,
+        checkpoint_ns: Namespace = (),
+        checkpoint_id: UUID | None = None,
+        subgraphs: bool = False,
     ) -> StateSnapshot:
         address = parse_state_address(thread_id, checkpoint_ns, checkpoint_id)
         return await self.read_state(self.checkpointer, address, subgraphs=subgraphs)
 
     def get_state(
-        self, thread_id: str, *, checkpoint_ns: str = "", checkpoint_id: UUID | None = None, subgraphs: bool = False
+        self,
+        thread_id: str,
+        *,
+        checkpoint_ns: Namespace = (),
+        checkpoint_id: UUID | None = None,
+        subgraphs: bool = False,
     ) -> StateSnapshot:
         address = parse_state_address(thread_id, checkpoint_ns, checkpoint_id)
         checkpointer = ThreadedCheckpointer(self.checkpointer)
@@ -220,17 +230,17 @@ class PersistentGraph[StateT, InputT, OutputT]:
         if limit is not None and limit < 0:
             raise ValueError(f"limit is {limit}, and the number of checkpoints to read cannot be negative")
         scope = ThreadScope(find_graph(self.graph, checkpoint_ns), checkpointer, thread_id, checkpoint_ns)
-        async for saved in checkpointer.alist(thread_id, checkpoint_ns, before=before, limit=limit):
+        async for saved in checkpointer.alist(thread_id, scope.stored_ns, before=before, limit=limit):
             yield await scope.read_snapshot(saved, subgraphs=False)
 
     def aget_state_history(
-        self, thread_id: str, *, checkpoint_ns: str = "", before: UUID | None = None, limit: int | None = None
+        self, thread_id: str, *, checkpoint_ns: Namespace = (), before: UUID | None = None, limit: int | None = None
     ) -> AsyncIterator[StateSnapshot]:
         address = parse_state_address(thread_id, checkpoint_ns, None)
         return self.read_state_history(self.checkpointer, address, before, limit)
 
     def get_state_history(
-        self, thread_id: str, *, checkpoint_ns: str = "", before: UUID | None = None, limit: int | None = None
+        self, thread_id: str, *, checkpoint_ns: Namespace = (), before: UUID | None = None, limit: int | None = None
     ) -> Iterator[StateSnapshot]:
         address = parse_state_address(thread_id, checkpoint_ns, None)
         checkpointer = ThreadedCheckpointer(self.checkpointer)
@@ -276,7 +286,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         values: object,
         *,
         as_node: str | None = None,
-        checkpoint_ns: str = "",
+        checkpoint_ns: Namespace = (),
         checkpoint_id: UUID | None = None,
     ) -> UUID:
         address = parse_state_address(thread_id, checkpoint_ns, checkpoint_id)
@@ -288,7 +298,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         values: object,
         *,
         as_node: str | None = None,
-        checkpoint_ns: str = "",
+        checkpoint_ns: Namespace = (),
         checkpoint_id: UUID | None = None,
     ) -> UUID:
         address = parse_state_address(thread_id, checkpoint_ns, checkpoint_id)

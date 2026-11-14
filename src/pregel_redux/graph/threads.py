@@ -24,6 +24,7 @@ from pregel_redux.checkpoints import (
     TriggerVersions,
 )
 from pregel_redux.commands import Command
+from pregel_redux.configs import Namespace, Segment, encode_namespace
 from pregel_redux.dependencies import finish_despite_cancellation
 from pregel_redux.graph.compiled import ChildEntry, CompiledGraph
 from pregel_redux.graph.conversion import (
@@ -59,7 +60,11 @@ class ThreadScope:
     graph: AnyGraph
     checkpointer: AsyncCheckpointer
     thread_id: str
-    checkpoint_ns: str
+    checkpoint_ns: Namespace
+
+    @property
+    def stored_ns(self) -> str:
+        return encode_namespace(self.checkpoint_ns)
 
     def read_position(self, saved: CheckpointTuple) -> Position:
         position = load_position(self.graph, saved.checkpoint)
@@ -77,7 +82,7 @@ class ThreadScope:
         self, position: Position, step: int, source: CheckpointSource, parent_id: UUID | None, newest_id: UUID | None
     ) -> Checkpoint:
         stamp = CheckpointStamp(make_checkpoint_id(newest_id), parent_id, datetime.now(UTC))
-        checkpoint = dump_position(self.graph, position, stamp, self.checkpoint_ns, step, source)
+        checkpoint = dump_position(self.graph, position, stamp, self.stored_ns, step, source)
         await finish_despite_cancellation(self.checkpointer.aput(self.thread_id, checkpoint))
         return checkpoint
 
@@ -86,10 +91,10 @@ class ThreadScope:
         return ThreadJournal(self, CheckpointTuple(checkpoint=checkpoint, pending_writes=()), checkpoint.id)
 
     async def find(self, checkpoint_id: UUID | None) -> "Loaded | None":
-        newest = await self.checkpointer.aget_tuple(self.thread_id, self.checkpoint_ns, None)
+        newest = await self.checkpointer.aget_tuple(self.thread_id, self.stored_ns, None)
         if checkpoint_id is None:
             return None if newest is None else Loaded(newest, newest.checkpoint.id)
-        saved = await self.checkpointer.aget_tuple(self.thread_id, self.checkpoint_ns, checkpoint_id)
+        saved = await self.checkpointer.aget_tuple(self.thread_id, self.stored_ns, checkpoint_id)
         if saved is None or newest is None:
             raise LookupError(f"thread {self.thread_id!r} has no checkpoint {checkpoint_id}")
         return Loaded(saved, newest.checkpoint.id)
@@ -124,7 +129,7 @@ class ThreadScope:
         if not isinstance(child, CompiledGraph):
             return None
         scope = ThreadScope(child, self.checkpointer, self.thread_id, journal.make_task_ns(task))
-        saved = await self.checkpointer.aget_tuple(scope.thread_id, scope.checkpoint_ns, None)
+        saved = await self.checkpointer.aget_tuple(scope.thread_id, scope.stored_ns, None)
         return None if saved is None else await scope.read_snapshot(saved, subgraphs=True)
 
     async def read_task_snapshot(self, journal: "ThreadJournal", task: TaskRef, *, subgraphs: bool) -> TaskSnapshot:
@@ -181,12 +186,12 @@ class ThreadJournal:
     newest_id: UUID
 
     @property
-    def ns(self) -> tuple[str, ...]:
-        return tuple(self.scope.checkpoint_ns.split("|")) if self.scope.checkpoint_ns else ()
+    def ns(self) -> Namespace:
+        return self.scope.checkpoint_ns
 
     def make_task_id(self, task: TaskRef) -> str:
         checkpoint = self.saved.checkpoint
-        return str(uuid5(checkpoint.id, f"{self.scope.checkpoint_ns}|{checkpoint.step + 1}|{name_task(task)}"))
+        return str(uuid5(checkpoint.id, f"{self.scope.stored_ns}|{checkpoint.step + 1}|{name_task(task)}"))
 
     async def save(self, position: Position, source: CheckpointSource) -> None:
         parent = self.saved.checkpoint
@@ -197,15 +202,14 @@ class ThreadJournal:
     async def read_snapshot(self) -> StateSnapshot:
         return await self.scope.read_snapshot(self.saved, subgraphs=False)
 
-    def make_task_ns(self, task: TaskRef) -> str:
-        parent_ns = f"{self.scope.checkpoint_ns}|" if self.scope.checkpoint_ns else ""
-        return f"{parent_ns}{task.name}:{self.make_task_id(task)}"
+    def make_task_ns(self, task: TaskRef) -> Namespace:
+        return (*self.scope.checkpoint_ns, Segment(task.name, self.make_task_id(task)))
 
     async def put_write(self, write: PendingWrite) -> None:
         scope = self.scope
         checkpoint = self.saved.checkpoint
         await finish_despite_cancellation(
-            scope.checkpointer.aput_writes(scope.thread_id, scope.checkpoint_ns, checkpoint.id, write)
+            scope.checkpointer.aput_writes(scope.thread_id, scope.stored_ns, checkpoint.id, write)
         )
         kept = (kept for kept in self.saved.pending_writes if kept.key != write.key)
         self.saved = CheckpointTuple(checkpoint=checkpoint, pending_writes=(*kept, write))
@@ -257,12 +261,12 @@ class ThreadJournal:
         stop = self.find_stop(task)
         if stop is None:
             return ()
-        task_ns = self.make_task_ns(task)
+        task_ns = encode_namespace(self.make_task_ns(task))
         answered = {make_interrupt_id(task_ns, index) for index in range(len(self.find_answers(task)))}
         return tuple(interrupt for interrupt in stop.interrupts if interrupt.id not in answered)
 
     def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad:
-        return Scratchpad(self.make_task_ns(task), list(self.find_answers(task)), resume, 0)
+        return Scratchpad(encode_namespace(self.make_task_ns(task)), list(self.find_answers(task)), resume, 0)
 
     async def read_resume(self, command: Command[str] | None) -> ResumeInput:
         if command is None:
@@ -311,10 +315,10 @@ def infer_writer(graph: AnyGraph, versions_seen: Mapping[str, TriggerVersions]) 
     raise ValueError("the node that made the last update is not clear, so give as_node")
 
 
-def find_graph(graph: AnyGraph, checkpoint_ns: str) -> AnyGraph:
+def find_graph(graph: AnyGraph, checkpoint_ns: Namespace) -> AnyGraph:
     found = graph
-    for part in checkpoint_ns.split("|") if checkpoint_ns else ():
-        name = part.rsplit(":", 1)[0]
+    for segment in checkpoint_ns:
+        name = segment.node
         match found.nodes[name].action if name in found.nodes else None:
             case CompiledGraph() as child:
                 found = child

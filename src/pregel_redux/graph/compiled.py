@@ -13,6 +13,7 @@ from pydantic import JsonValue, TypeAdapter
 from pregel_redux.channels import Channel, extract_writes, parse_updates
 from pregel_redux.checkpoints import CheckpointSource
 from pregel_redux.commands import Send, read_outcome
+from pregel_redux.configs import Namespace, Segment, encode_namespace
 from pregel_redux.dependencies import (
     CallPlan,
     Request,
@@ -80,7 +81,7 @@ class ChildEntry:
 
 class Journal(Protocol):
     @property
-    def ns(self) -> tuple[str, ...]: ...
+    def ns(self) -> Namespace: ...
     async def save(self, position: Position, source: CheckpointSource) -> None: ...
     async def record(self, task: TaskRef, writes: TaskWrites) -> None: ...
     async def record_waiting(self, task: TaskRef, interrupts: Sequence[Interrupt]) -> None: ...
@@ -95,14 +96,14 @@ class Journal(Protocol):
 
 @dataclass
 class NoJournal:
-    ns: tuple[str, ...]
+    ns: Namespace
     step: int
 
     async def save(self, position: Position, source: CheckpointSource) -> None:
         self.step += 1
 
     def make_task_id(self, task: TaskRef) -> str:
-        return str(uuid5(NAMESPACE_OID, f"{'|'.join(self.ns)}|{self.step}|{name_task(task)}"))
+        return str(uuid5(NAMESPACE_OID, f"{encode_namespace(self.ns)}|{self.step}|{name_task(task)}"))
 
     async def read_snapshot(self) -> None:
         return None
@@ -127,7 +128,7 @@ class NoJournal:
 
     async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> ChildEntry:
         start = child.feed(child.open(extract_writes(call.node_input)), {})
-        child_ns = (*self.ns, f"{call.task.name}:{self.make_task_id(call.task)}")
+        child_ns = (*self.ns, Segment(call.task.name, self.make_task_id(call.task)))
         return ChildEntry(start, NoJournal(child_ns, 0), resumed=False)
 
 
@@ -467,7 +468,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         )
 
     async def call_function(
-        self, plan: CallPlan, name: str, call: NodeCall, run: Run, ns: tuple[str, ...], step_exits: AsyncExitStack
+        self, plan: CallPlan, name: str, call: NodeCall, run: Run, ns: Namespace, step_exits: AsyncExitStack
     ) -> TaskWrites:
         if plan.run_providers:
             async with run.lock:

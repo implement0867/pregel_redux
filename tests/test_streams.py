@@ -153,7 +153,7 @@ def test_parts_of_a_child_graph_are_child_parts_with_the_namespace_of_the_child_
 
     outer = [part.node for part in parts if isinstance(part, UpdatesPart)]
     inner = [
-        (tuple(segment.split(":")[0] for segment in part.ns), part.part.node)
+        (tuple(segment.node for segment in part.ns), part.part.node)
         for part in parts
         if isinstance(part, ChildPart) and isinstance(part.part, UpdatesPart)
     ]

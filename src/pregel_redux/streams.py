@@ -1,6 +1,7 @@
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
+from pregel_redux.configs import Namespace, Segment
 from pregel_redux.interrupts import Interrupt
 from pregel_redux.snapshots import StateSnapshot
 
@@ -54,7 +55,7 @@ type StreamPart = (
 
 @dataclass(frozen=True)
 class ChildPart:
-    ns: tuple[str, *tuple[str, ...]]
+    ns: tuple[Segment, *tuple[Segment, ...]]
     part: StreamPart
 
 
@@ -62,7 +63,7 @@ class ChildPart:
 class Stream:
     emit: Callable[[StreamPart | ChildPart], None]
 
-    def send(self, ns: tuple[str, ...], part: StreamPart) -> None:
+    def send(self, ns: Namespace, part: StreamPart) -> None:
         match ns:
             case ():
                 self.emit(part)
@@ -75,7 +76,7 @@ class Stream:
 @dataclass(frozen=True)
 class StreamWriter:
     stream: Stream
-    ns: tuple[str, ...]
+    ns: Namespace
 
     def __call__(self, data: object) -> None:
         self.stream.send(self.ns, CustomPart(data))

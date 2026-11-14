@@ -5,6 +5,7 @@ from typing import assert_never
 from uuid import UUID
 
 from pregel_redux.checkpoints import CheckpointSource
+from pregel_redux.configs import Namespace
 from pregel_redux.interrupts import Interrupt
 from pregel_redux.task_refs import TaskRef
 
@@ -58,7 +59,7 @@ class TaskSnapshot:
 @dataclass(frozen=True)
 class StateSnapshot:
     values: Mapping[str, object]
-    checkpoint_ns: str
+    checkpoint_ns: Namespace
     checkpoint_id: UUID
     parent_id: UUID | None
     created_at: datetime

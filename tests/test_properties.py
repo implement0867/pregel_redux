@@ -39,6 +39,7 @@ from pregel_redux import (
     interrupt,
 )
 from pregel_redux.checkpoints import CheckpointSource
+from pregel_redux.configs import Namespace
 from pregel_redux.snapshots import FailedTask, FinishedTask
 from pregel_redux.sqlite import SqliteCheckpointer
 from pregel_redux.streams import ChildPart, StreamPart, ValuesPart
@@ -446,10 +447,10 @@ def has_async_function(spec: GraphSpec) -> bool:
     )
 
 
-def find_spec(spec: GraphSpec, checkpoint_ns: str) -> GraphSpec:
+def find_spec(spec: GraphSpec, checkpoint_ns: Namespace) -> GraphSpec:
     found = spec
-    for part in checkpoint_ns.split("|") if checkpoint_ns else ():
-        name = part.rsplit(":", 1)[0]
+    for segment in checkpoint_ns:
+        name = segment.node
         match next(node.work for node in found.nodes if node.name == name):
             case ChildSpec(graph=graph):
                 found = graph
@@ -703,9 +704,8 @@ class ThreadMachine(RuleBasedStateMachine):
         graph = self.thread.graph
         namespaces = {part.ns for part in parts if isinstance(part, ChildPart)}
         for namespace in namespaces:
-            checkpoint_ns = "|".join(namespace)
-            found = self.runner.run(graph.aget_state("thread", checkpoint_ns=checkpoint_ns))
-            assert found.checkpoint_ns == checkpoint_ns, f"Expected the state of {namespace}."
+            found = self.runner.run(graph.aget_state("thread", checkpoint_ns=namespace))
+            assert found.checkpoint_ns == namespace, f"Expected the state of {namespace}."
         if plan.stop_after is None:
             values = [part.values for part in parts if isinstance(part, ValuesPart)]
             newest = self.runner.run(graph.aget_state(self.thread_id)).values
@@ -776,7 +776,7 @@ class ThreadMachine(RuleBasedStateMachine):
             return
         graph = self.thread.graph
         snapshot = self.runner.run(graph.aget_state(self.thread_id, subgraphs=True))
-        for namespace in ["", *(child.checkpoint_ns for child in find_namespaces(snapshot))]:
+        for namespace in [(), *(child.checkpoint_ns for child in find_namespaces(snapshot))]:
             later = [
                 item.step
                 for item in self.runner.run(collect(graph.aget_state_history("thread", checkpoint_ns=namespace)))
@@ -970,7 +970,7 @@ class ThreadMachine(RuleBasedStateMachine):
         before = candidates[data.draw(st.integers(min_value=0)) % len(candidates)]
         older = before in thread.history
         checkpoint_id = before.checkpoint_id if older else None
-        checkpoint_ns = "" if older else before.checkpoint_ns
+        checkpoint_ns = () if older else before.checkpoint_ns
         spec = find_spec(thread.spec, before.checkpoint_ns)
         pick = data.draw(st.one_of(st.none(), st.integers(min_value=0)))
         node = None if pick is None else spec.nodes[pick % len(spec.nodes)]

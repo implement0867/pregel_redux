@@ -4,6 +4,19 @@ from uuid import UUID
 
 
 @dataclass(frozen=True)
+class Segment:
+    node: str
+    task_id: str
+
+
+type Namespace = tuple[Segment, ...]
+
+
+def encode_namespace(ns: Namespace) -> str:
+    return "|".join(f"{segment.node}:{segment.task_id}" for segment in ns)
+
+
+@dataclass(frozen=True)
 class RunTarget:
     thread_id: str
     fork_from: UUID | None
@@ -12,7 +25,7 @@ class RunTarget:
 @dataclass(frozen=True)
 class StateAddress:
     thread_id: str
-    checkpoint_ns: str
+    checkpoint_ns: Namespace
     checkpoint_id: UUID | None
 
 
@@ -36,5 +49,5 @@ def parse_run_target(thread_id: str, fork_from: UUID | None) -> RunTarget:
     return RunTarget(parse_thread_id(thread_id), parse_checkpoint_id(fork_from))
 
 
-def parse_state_address(thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None) -> StateAddress:
+def parse_state_address(thread_id: str, checkpoint_ns: Namespace, checkpoint_id: UUID | None) -> StateAddress:
     return StateAddress(parse_thread_id(thread_id), checkpoint_ns, parse_checkpoint_id(checkpoint_id))

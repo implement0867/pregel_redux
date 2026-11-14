@@ -16,6 +16,7 @@ from pregel_redux import (
     Reducer,
     RunTarget,
     Scope,
+    Segment,
     Send,
     StateGraph,
     StateSnapshot,
@@ -471,7 +472,7 @@ def test_state_with_subgraphs_has_the_state_of_a_child_graph_that_stopped(depth:
 
     actual = read_deepest_state(with_children)
     values = [item.value for item in actual.interrupts]
-    assert len(actual.checkpoint_ns.split("|")) == depth, f"Expected a namespace of depth {depth}, got {actual}."
+    assert len(actual.checkpoint_ns) == depth, f"Expected a namespace of depth {depth}, got {actual}."
     assert actual.values == {"notes": ["first"]}, f"Expected the note of the first node, got {actual.values}."
     assert actual.next == ("ask",), f"Expected the next node ask, got {actual.next}."
     assert values == ["question"], f"Expected the interrupt of the child graph, got {values}."
@@ -492,7 +493,7 @@ def test_state_of_a_child_graph_is_read_by_its_namespace() -> None:
 
     assert actual == expected, f"Expected {expected}, got {actual}."
     with pytest.raises(LookupError):
-        graph.get_state("thread", checkpoint_ns="missing:1")
+        graph.get_state("thread", checkpoint_ns=(Segment("missing", "1"),))
 
 
 def test_update_of_the_state_of_a_child_graph_is_in_the_output() -> None:

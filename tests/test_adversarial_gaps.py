@@ -83,7 +83,7 @@ def test_values_parts_of_a_child_graph_have_the_namespace_of_the_child_graph() -
 
     outer = [part.values for part in parts if isinstance(part, ValuesPart)]
     inner = [
-        (part.ns[0].split(":")[0], part.part.values)
+        (part.ns[0].node, part.part.values)
         for part in parts
         if isinstance(part, ChildPart) and isinstance(part.part, ValuesPart)
     ]
