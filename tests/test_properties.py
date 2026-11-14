@@ -742,17 +742,7 @@ class ThreadMachine(RuleBasedStateMachine):
 
     def check_stream(self, parts: Sequence[StreamPart | ChildPart], plan: StreamPlan, begun: int) -> None:
         graph = self.thread.graph
-        written = [
-            data
-            for part in parts
-            for data in ([part.data] if isinstance(part, CustomPart) else [])
-            + ([part.part.data] if isinstance(part, ChildPart) and isinstance(part.part, CustomPart) else [])
-        ]
-        labels = [f"#{index}" for index in range(begun, len(self.thread.trace.executions))]
-        if plan.stop_after is None:
-            assert sorted(written, key=repr) == sorted(labels), (
-                f"Expected one custom part for each node execution {labels}, got {written}."
-            )
+        written: list[object] = []
         namespaces = {part.ns for part in parts if isinstance(part, ChildPart)}
         for namespace in namespaces:
             found = self.runner.run(graph.aget_state(self.thread_id, checkpoint_ns=namespace))
@@ -760,12 +750,19 @@ class ThreadMachine(RuleBasedStateMachine):
         levels: dict[Namespace, list[object]] = {}
         for part in parts:
             match part:
+                case ChildPart(part=CustomPart(data=data)) | CustomPart(data=data):
+                    written.append(data)
                 case ChildPart(ns=ns, part=ValuesPart(values=child_values)):
                     levels.setdefault(ns, []).append(child_values)
                 case ValuesPart(values=root_values):
                     levels.setdefault((), []).append(root_values)
                 case _:
                     pass
+        labels = [f"#{index}" for index in range(begun, len(self.thread.trace.executions))]
+        if plan.stop_after is None:
+            assert sorted(written, key=repr) == sorted(labels), (
+                f"Expected one custom part for each node execution {labels}, got {written}."
+            )
         for namespace, sent in levels.items():
             saved = [
                 item.values
