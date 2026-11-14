@@ -23,6 +23,7 @@ from pregel_redux.streams import (
     TaskStartPart,
     UpdatesPart,
     ValuesPart,
+    parse_stream_modes,
 )
 from tests.conftest import collect, join_lists
 
@@ -415,3 +416,46 @@ def test_checkpoints_mode_without_a_checkpointer_gives_no_part() -> None:
 
     kinds = {type(part) for part in actual}
     assert kinds == {UpdatesPart}, f"Expected only update parts, got {kinds}."
+
+
+@pytest.mark.parametrize(
+    ("stream_mode", "expected"),
+    [
+        (StreamMode.values, {StreamMode.values}),
+        ("values", {StreamMode.values}),
+        (["values", StreamMode.updates], {StreamMode.values, StreamMode.updates}),
+        ((), set[StreamMode]()),
+    ],
+    ids=["member", "string", "list", "empty"],
+)
+def test_stream_modes_are_parsed_into_a_set_of_modes(stream_mode: object, expected: set[StreamMode]) -> None:
+    """
+    Arrange: a stream mode given as a member, as its string, or as a collection.
+    Act: parse it.
+    Assert: the result is the set of the given modes.
+    """
+    actual = parse_stream_modes(stream_mode)
+
+    assert actual == expected, f"Expected the modes {expected}, got {actual}."
+
+
+@pytest.mark.parametrize("stream_mode", ["value", ["values", "nope"]], ids=["string", "list"])
+def test_unknown_stream_mode_is_rejected(stream_mode: object) -> None:
+    """
+    Arrange: a stream mode that is not a mode, alone or in a list.
+    Act: parse it.
+    Assert: the parse raises ValueError.
+    """
+    with pytest.raises(ValueError):
+        parse_stream_modes(stream_mode)
+
+
+@pytest.mark.parametrize("stream_mode", [5, None], ids=["number", "none"])
+def test_stream_mode_of_another_type_is_rejected(stream_mode: object) -> None:
+    """
+    Arrange: a value that is not a mode and not a collection.
+    Act: parse it.
+    Assert: the parse raises TypeError.
+    """
+    with pytest.raises(TypeError):
+        parse_stream_modes(stream_mode)

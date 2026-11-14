@@ -157,7 +157,8 @@ def test_answer_that_is_not_of_the_response_schema_leaves_the_question_waiting()
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     config = ThreadConfig(thread_id="thread")
     asked = asyncio.run(graph.ainvoke({}, config))
-    questions = asked.interrupts if isinstance(asked, Interrupted) else ()
+    assert isinstance(asked, Interrupted), f"Expected a waiting question, got {asked}."
+    questions = asked.interrupts
     with pytest.raises(ValidationError):
         asyncio.run(graph.ainvoke(Command(resume="text"), config))
 
@@ -273,7 +274,8 @@ def test_graceful_stop_of_a_child_graph_keeps_the_error_of_its_task() -> None:
     state = asyncio.run(graph.aget_state(config, subgraphs=True))
 
     task = next(task for task in state.tasks if task.name == "child")
-    inner = [] if task.state is None else [read_error(item) for item in task.state.tasks]
+    assert task.state is not None, f"Expected the state of the child graph, got {task}."
+    inner = [read_error(item) for item in task.state.tasks]
     assert isinstance(stopped, Interrupted), f"Expected a graceful stop, got {stopped}."
     assert runs.count("fail") == 1, f"Expected the failed node of the child graph not to run again, got {runs}."
     assert inner == ["ConnectionError('no network')"], f"Expected the error in the child graph, got {inner}."

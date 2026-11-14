@@ -28,7 +28,7 @@ from pregel_redux import (
 from pregel_redux.checkpoints import CheckpointSource
 from pregel_redux.snapshots import FailedTask, FinishedTask, PendingTask, WaitingTask
 from pregel_redux.task_refs import PullRef, PushRef, StartRef, name_task
-from tests.conftest import collect, join_lists, read_error, read_result
+from tests.conftest import collect, join_lists
 
 
 class State(TypedDict, total=False):
@@ -392,6 +392,27 @@ def test_unknown_node_in_an_interrupt_list_is_rejected(interrupt_before: list[st
         )
 
 
+@pytest.mark.parametrize(("interrupt_before", "interrupt_after"), [("ab", ()), ((), "ab")], ids=["before", "after"])
+def test_node_names_given_as_one_string_in_an_interrupt_list_are_rejected(
+    interrupt_before: str | tuple[str, ...], interrupt_after: str | tuple[str, ...]
+) -> None:
+    """
+    Arrange: a builder with the nodes "a" and "b".
+    Act: compile it with interrupt_before or interrupt_after given as the string "ab".
+    Assert: compile raises TypeError.
+    """
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("a", build_writer("a", []))
+    builder.add_node("b", build_writer("b", []))
+    builder.add_edge(Endpoint.start, "a")
+    builder.add_edge("a", "b")
+
+    with pytest.raises(TypeError):
+        builder.compile(
+            checkpointer=InMemoryCheckpointer(), interrupt_before=interrupt_before, interrupt_after=interrupt_after
+        )
+
+
 def test_resume_value_continues_a_thread_that_stopped_before_a_node() -> None:
     """
     Arrange: a graph that stops before a node that calls interrupt.
@@ -526,12 +547,16 @@ def test_state_tasks_have_the_result_of_a_finished_task_and_the_path() -> None:
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     graph.invoke({}, {"thread_id": "thread"})
-    expected = {"write": (PullRef("write"), {"notes": ["write"]}), "ask": (PullRef("ask"), None)}
+    expected = {"write": (PullRef("write"), FinishedTask), "ask": (PullRef("ask"), WaitingTask)}
 
     actual = graph.get_state({"thread_id": "thread"})
 
-    summary = {task.name: (task.path, read_result(task)) for task in actual.tasks}
+    summary = {task.name: (task.path, type(task.status)) for task in actual.tasks}
+    finished = [task.status for task in actual.tasks if task.name == "write"]
     assert summary == expected, f"Expected {expected}, got {summary}."
+    assert finished == [FinishedTask({"notes": ["write"]})], (
+        f"Expected the update of the node as result, got {finished}."
+    )
 
 
 @pytest.mark.parametrize("sends", [1, 2, 3])
@@ -748,9 +773,12 @@ def test_state_after_a_failure_has_the_error_of_the_failed_task() -> None:
     with pytest.raises(ConnectionError):
         graph.invoke({}, config)
 
-    actual = {task.name: read_error(task) for task in graph.get_state(config).tasks}
+    actual = {task.name: task.status for task in graph.get_state(config).tasks}
 
-    expected = {"failed": "ConnectionError('no network')", "finished": None}
+    expected = {
+        "failed": FailedTask("ConnectionError('no network')", ()),
+        "finished": FinishedTask({"notes": ["finished"]}),
+    }
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 
@@ -777,9 +805,9 @@ def test_error_of_a_task_is_removed_when_the_task_asks_a_question_in_the_next_ru
         graph.invoke({}, config)
     graph.invoke(None, config)
 
-    actual = [([item.value for item in task.interrupts], read_error(task)) for task in graph.get_state(config).tasks]
+    actual = [([item.value for item in task.interrupts], type(task.status)) for task in graph.get_state(config).tasks]
 
-    expected = [(["question"], None)]
+    expected = [(["question"], WaitingTask)]
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 

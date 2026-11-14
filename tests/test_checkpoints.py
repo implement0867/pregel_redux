@@ -21,7 +21,8 @@ from pregel_redux import (
     StateGraph,
 )
 from pregel_redux.checkpoints import PendingWrite
-from tests.conftest import join_lists, read_result
+from pregel_redux.snapshots import FailedTask, FinishedTask
+from tests.conftest import join_lists
 
 
 class State(TypedDict, total=False):
@@ -625,10 +626,11 @@ def test_failure_of_a_node_lets_the_other_nodes_of_its_step_finish() -> None:
     with pytest.raises(ConnectionError):
         asyncio.run(graph.ainvoke({}, {"thread_id": "thread"}))
 
-    saved = {task.name: read_result(task) for task in asyncio.run(graph.aget_state({"thread_id": "thread"})).tasks}
+    saved = {task.name: task.status for task in asyncio.run(graph.aget_state({"thread_id": "thread"})).tasks}
     actual = asyncio.run(graph.ainvoke(None, {"thread_id": "thread"}))
 
-    assert saved == {"fail": None, "slow": {"jokes": ["slow"]}}, f"Expected the result of the slow node, got {saved}."
+    expected = {"fail": FailedTask("ConnectionError()", ()), "slow": FinishedTask({"jokes": ["slow"]})}
+    assert saved == expected, f"Expected the error of one node and the result of the slow node, got {saved}."
     assert actual == Finished(Output(jokes=["repaired", "slow"])), f"Expected the two writes, got {actual}."
     assert calls.count("slow") == 1, f"Expected the slow node to run one time, got {calls}."
 

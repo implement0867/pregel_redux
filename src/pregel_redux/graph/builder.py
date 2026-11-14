@@ -1,6 +1,6 @@
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass, replace
-from typing import Any, Concatenate, Literal, Never, Protocol, overload, runtime_checkable
+from typing import Any, Concatenate, Literal, Never, Protocol, assert_never, overload, runtime_checkable
 
 from pregel_redux.channels import build_channels, merge_channels
 from pregel_redux.checkpoints import Checkpointer
@@ -137,8 +137,8 @@ class StateGraph[StateT, InputT, OutputT]:
         if checkpointer is None:
             return graph
         names = frozenset(graph.nodes)
-        before = names if interrupt_before == "*" else frozenset(interrupt_before)
-        after = names if interrupt_after == "*" else frozenset(interrupt_after)
+        before = parse_breakpoints(interrupt_before, names)
+        after = parse_breakpoints(interrupt_after, names)
         unknown = sorted((before | after) - names)
         if unknown:
             raise ValueError(f"interrupt_before or interrupt_after refer to {unknown!r}, which are not nodes")
@@ -204,3 +204,17 @@ class StateGraph[StateT, InputT, OutputT]:
             interrupt_before=frozenset(),
             interrupt_after=frozenset(),
         )
+
+
+def parse_breakpoints(nodes: Collection[str] | Literal["*"], names: frozenset[str]) -> frozenset[str]:
+    match nodes:
+        case "*":
+            return names
+        case str():
+            raise TypeError(
+                f"interrupt_before and interrupt_after take '*' or a collection of node names, got {nodes!r}"
+            )
+        case Collection():
+            return frozenset(nodes)
+        case _:
+            assert_never(nodes)

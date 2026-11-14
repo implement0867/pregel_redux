@@ -42,6 +42,7 @@ from pregel_redux.streams import (
     TaskStartPart,
     UpdatesPart,
     ValuesPart,
+    parse_stream_modes,
 )
 from pregel_redux.task_refs import refer_task
 
@@ -228,7 +229,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         step_limit: int | None = None,
         signal: ShutdownSignal | None = None,
     ) -> AsyncGenerator[StreamPart]:
-        modes = frozenset([stream_mode] if isinstance(stream_mode, StreamMode) else stream_mode)
+        modes = parse_stream_modes(stream_mode)
         return stream_run(
             lambda emit: self.run(
                 self.checkpointer,
@@ -317,7 +318,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         signal: ShutdownSignal | None = None,
     ) -> Generator[StreamPart]:
         self.graph.reject_async_nodes("astream")
-        modes = frozenset([stream_mode] if isinstance(stream_mode, StreamMode) else stream_mode)
+        modes = parse_stream_modes(stream_mode)
         checkpointer = ThreadedCheckpointer(self.checkpointer)
         return iterate_in_new_loop(
             lambda: stream_run(

@@ -1,4 +1,4 @@
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Collection, Mapping
 from contextvars import ContextVar
 from dataclasses import dataclass
 from enum import StrEnum
@@ -13,6 +13,16 @@ class StreamMode(StrEnum):
     custom = "custom"
     checkpoints = "checkpoints"
     tasks = "tasks"
+
+
+def parse_stream_modes(stream_mode: object) -> frozenset[StreamMode]:
+    match stream_mode:
+        case str():
+            return frozenset({StreamMode(stream_mode)})
+        case Collection():
+            return frozenset(StreamMode(mode) for mode in stream_mode)
+        case _:
+            raise TypeError(f"stream_mode must be a mode or a collection of modes, got {stream_mode!r}")
 
 
 @dataclass(frozen=True)

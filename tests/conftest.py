@@ -1,9 +1,9 @@
-from collections.abc import AsyncIterator, Mapping
+from collections.abc import AsyncIterator
 from dataclasses import dataclass, field
 
 import pytest
 
-from pregel_redux.snapshots import FailedTask, FinishedTask, TaskSnapshot
+from pregel_redux.snapshots import FailedTask, TaskSnapshot
 
 
 @dataclass
@@ -25,12 +25,12 @@ def append_item[T](current: list[T], update: T) -> list[T]:
     return [*current, update]
 
 
-def read_error(task: TaskSnapshot) -> str | None:
-    return task.status.error if isinstance(task.status, FailedTask) else None
-
-
-def read_result(task: TaskSnapshot) -> Mapping[str, object] | None:
-    return task.status.result if isinstance(task.status, FinishedTask) else None
+def read_error(task: TaskSnapshot) -> str:
+    match task.status:
+        case FailedTask(error=error):
+            return error
+        case _:
+            raise AssertionError(f"Expected a failed task, got {task}.")
 
 
 @pytest.hookimpl(tryfirst=True)

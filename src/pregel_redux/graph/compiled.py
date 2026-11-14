@@ -68,6 +68,7 @@ from pregel_redux.streams import (
     UpdatesPart,
     ValuesPart,
     current_stream_writer,
+    parse_stream_modes,
 )
 from pregel_redux.task_refs import NodeCall, PullRef, PushRef, StartRef, TaskRef, name_task, refer_task
 
@@ -284,7 +285,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         subgraphs: bool = False,
         step_limit: int | None = None,
     ) -> AsyncGenerator[StreamPart]:
-        modes = frozenset([stream_mode] if isinstance(stream_mode, StreamMode) else stream_mode)
+        modes = parse_stream_modes(stream_mode)
         return stream_run(
             lambda emit: self.run_without_thread(input, step_limit, Stream(modes, subgraphs=subgraphs, emit=emit))
         )
@@ -343,7 +344,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         step_limit: int | None = None,
     ) -> Generator[StreamPart]:
         self.reject_async_nodes("astream")
-        modes = frozenset([stream_mode] if isinstance(stream_mode, StreamMode) else stream_mode)
+        modes = parse_stream_modes(stream_mode)
         return iterate_in_new_loop(
             lambda: self.astream(input, stream_mode=modes, subgraphs=subgraphs, step_limit=step_limit)
         )

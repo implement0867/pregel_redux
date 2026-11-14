@@ -27,8 +27,9 @@ from pregel_redux import (
     graceful_shutdown,
     interrupt,
 )
+from pregel_redux.snapshots import FinishedTask
 from pregel_redux.sqlite import SqliteCheckpointer
-from tests.conftest import join_lists, read_error, read_result
+from tests.conftest import join_lists, read_error
 
 
 class State(TypedDict, total=False):
@@ -204,8 +205,8 @@ def test_task_that_finished_after_a_failure_has_a_result_and_no_error() -> None:
     graph.invoke(None, config)
     state = graph.get_state(config)
 
-    actual = [(task.name, read_result(task), read_error(task)) for task in state.tasks if task.name == "recover"]
-    expected = [("recover", {"notes": ["recovered"]}, None)]
+    actual = [(task.name, task.status) for task in state.tasks if task.name == "recover"]
+    expected = [("recover", FinishedTask({"notes": ["recovered"]}))]
     assert actual == expected, f"Expected the finished task {expected}, got {actual}."
 
 
