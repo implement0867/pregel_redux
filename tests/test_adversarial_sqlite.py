@@ -117,7 +117,7 @@ def test_thread_deleted_after_a_stop_in_a_checkpoint_save_has_no_checkpoint(file
                         await run
                 case _:
                     assert_never(stop)
-            await checkpointer.adelete_thread("thread")
+            await asyncio.to_thread(checkpointer.delete_thread, "thread")
         finally:
             held.release.set()
 

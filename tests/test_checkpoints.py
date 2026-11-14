@@ -1,4 +1,5 @@
 import asyncio
+import threading
 from collections.abc import Callable
 from dataclasses import dataclass, field
 from typing import Annotated, TypedDict
@@ -338,11 +339,11 @@ class FailingCheckpointer(InMemoryCheckpointer):
     failing_put: int | None = None
     puts: int = 0
 
-    async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
+    def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
         self.puts += 1
         if self.puts == self.failing_put:
             raise ConnectionError("no database")
-        await super().aput(thread_id, checkpoint)
+        super().put(thread_id, checkpoint)
 
 
 def build_parent_graph(
@@ -419,11 +420,11 @@ def test_resume_finds_the_run_of_a_child_graph_for_each_send(topics: list[str]) 
 @dataclass
 class SignallingCheckpointer(InMemoryCheckpointer):
     signal_at_write: int = 0
-    signal: asyncio.Event = field(default_factory=asyncio.Event)
+    signal: threading.Event = field(default_factory=threading.Event)
     writes: int = 0
 
-    async def aput_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
-        await super().aput_writes(thread_id, checkpoint_ns, checkpoint_id, write)
+    def put_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
+        super().put_writes(thread_id, checkpoint_ns, checkpoint_id, write)
         self.writes += 1
         if self.writes == self.signal_at_write:
             self.signal.set()
@@ -439,12 +440,12 @@ def test_resume_does_not_run_a_node_that_finished_in_the_failed_step(finished_no
     calls: list[str] = []
 
     async def run_thread() -> Finished[Output] | Interrupted:
-        saved = asyncio.Event()
+        saved = threading.Event()
         failures: list[Exception] = [ConnectionError("no network")]
 
         async def fail_after_the_other_nodes(state: NarrowState) -> NarrowState:
             calls.append("failing")
-            await saved.wait()
+            await asyncio.to_thread(saved.wait)
             if failures:
                 raise failures.pop()
             return {"jokes": ["failing"]}

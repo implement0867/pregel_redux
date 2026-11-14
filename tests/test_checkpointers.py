@@ -1,5 +1,5 @@
 import asyncio
-from collections.abc import AsyncIterator, Callable, Iterator
+from collections.abc import Callable, Iterator
 from pathlib import Path
 from typing import Annotated, TypedDict
 from uuid import UUID
@@ -18,10 +18,10 @@ from pregel_redux import (
     StateGraph,
     interrupt,
 )
-from pregel_redux.checkpoints import Checkpoint, CheckpointTuple, PendingWrite, RunCommandRecord, SavedWrites
+from pregel_redux.checkpoints import RunCommandRecord, SavedWrites
 from pregel_redux.sqlite import SqliteCheckpointer
 from pregel_redux.streams import InterruptsPart, UpdatesPart
-from tests.conftest import collect, join_lists
+from tests.conftest import join_lists
 
 
 class State(TypedDict, total=False):
@@ -89,7 +89,7 @@ def test_threads_do_not_share_checkpoints(checkpointer: Checkpointer) -> None:
     graph.invoke({}, "finished")
     graph.invoke(Command(resume="answer"), "finished")
 
-    missing = asyncio.run(checkpointer.aget_tuple("other", "", None))
+    missing = checkpointer.get_tuple("other", "", None)
     steps = [graph.get_state(thread_id).step for thread_id in ("stopped", "finished")]
 
     assert missing is None, f"Expected no checkpoint, got {missing}."
@@ -107,10 +107,10 @@ def test_list_gives_the_checkpoints_before_an_id_with_the_newest_first(
     """
     graph = build_graph(checkpointer)
     graph.invoke({}, "thread")
-    stored = asyncio.run(collect(checkpointer.alist("thread", "", before=None, limit=None)))
+    stored = list(checkpointer.list("thread", "", before=None, limit=None))
     before = None if skipped == 0 else stored[skipped - 1].checkpoint.id
 
-    actual = asyncio.run(collect(checkpointer.alist("thread", "", before=before, limit=limit)))
+    actual = list(checkpointer.list("thread", "", before=before, limit=limit))
 
     steps = [saved.checkpoint.step for saved in actual]
     expected = [1, 0, -1][skipped:][:limit]
@@ -125,16 +125,16 @@ def test_checkpoint_is_found_by_its_id_with_its_pending_writes(checkpointer: Che
     """
     graph = build_graph(checkpointer)
     graph.invoke({}, "thread")
-    stopped = asyncio.run(collect(checkpointer.alist("thread", "", before=None, limit=1)))[0].checkpoint
+    stopped = next(checkpointer.list("thread", "", before=None, limit=1)).checkpoint
     one, two = (
         RunCommandRecord(index=0, command=SavedWrites(fields={}, branches=(node,), arrivals=(), sends=()))
         for node in ("one", "two")
     )
-    asyncio.run(checkpointer.aput_writes("thread", "", stopped.id, one))
-    asyncio.run(checkpointer.aput_writes("thread", "", stopped.id, two))
+    checkpointer.put_writes("thread", "", stopped.id, one)
+    checkpointer.put_writes("thread", "", stopped.id, two)
 
-    actual = asyncio.run(checkpointer.aget_tuple("thread", "", stopped.id))
-    missing = asyncio.run(checkpointer.aget_tuple("thread", "", UUID(int=1)))
+    actual = checkpointer.get_tuple("thread", "", stopped.id)
+    missing = checkpointer.get_tuple("thread", "", UUID(int=1))
 
     assert actual is not None, "Expected a checkpoint for the id of the stop, got None."
     writes = actual.pending_writes
@@ -155,42 +155,21 @@ def test_deleted_thread_has_no_checkpoints(checkpointer: Checkpointer) -> None:
     graph.invoke({}, "deleted")
     graph.invoke({}, "kept")
 
-    asyncio.run(checkpointer.adelete_thread("deleted"))
+    checkpointer.delete_thread("deleted")
 
-    deleted = asyncio.run(collect(checkpointer.alist("deleted", "", before=None, limit=None)))
-    kept = asyncio.run(collect(checkpointer.alist("kept", "", before=None, limit=None)))
+    deleted = list(checkpointer.list("deleted", "", before=None, limit=None))
+    kept = list(checkpointer.list("kept", "", before=None, limit=None))
     assert deleted == [], f"Expected no checkpoints, got {deleted}."
     assert len(kept) == 3, f"Expected 3 checkpoints, got {len(kept)}."
 
 
-class SyncOnlyCheckpointer(InMemoryCheckpointer):
-    async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
-        raise NotImplementedError
-
-    async def aput_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
-        raise NotImplementedError
-
-    async def aget_tuple(
-        self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None
-    ) -> CheckpointTuple | None:
-        raise NotImplementedError
-
-    def alist(
-        self, thread_id: str, checkpoint_ns: str, *, before: UUID | None, limit: int | None
-    ) -> AsyncIterator[CheckpointTuple]:
-        raise NotImplementedError
-
-    async def adelete_thread(self, thread_id: str) -> None:
-        raise NotImplementedError
-
-
-def test_sync_functions_of_the_graph_use_the_sync_functions_of_the_checkpointer() -> None:
+def test_sync_functions_of_the_graph_work_with_each_checkpointer(checkpointer: Checkpointer) -> None:
     """
-    Arrange: a graph with a checkpointer whose async functions raise NotImplementedError.
+    Arrange: a graph with a checkpointer.
     Act: run a thread to an interrupt, update its state, resume it and read its history, with the sync functions.
     Assert: the run finishes with the notes of the nodes, the update and the answer, and the history has each step.
     """
-    graph = build_graph(SyncOnlyCheckpointer())
+    graph = build_graph(checkpointer)
     stopped = list(graph.stream({}, "thread"))
     graph.update_state("thread", {"notes": ["update"]}, as_node="first")
 

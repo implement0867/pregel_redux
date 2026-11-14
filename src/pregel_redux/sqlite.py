@@ -1,5 +1,4 @@
-import asyncio
-from collections.abc import AsyncIterator, Iterator
+from collections.abc import Iterator
 from dataclasses import dataclass
 from uuid import UUID
 
@@ -122,24 +121,3 @@ class SqliteCheckpointer:
         with Session(self.engine) as session, session.begin():
             session.execute(delete(WriteRow).where(WriteRow.thread_id == thread_id))
             session.execute(delete(CheckpointRow).where(CheckpointRow.thread_id == thread_id))
-
-    async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None:
-        await asyncio.to_thread(self.put, thread_id, checkpoint)
-
-    async def aput_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
-        await asyncio.to_thread(self.put_writes, thread_id, checkpoint_ns, checkpoint_id, write)
-
-    async def aget_tuple(
-        self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None
-    ) -> CheckpointTuple | None:
-        return await asyncio.to_thread(self.get_tuple, thread_id, checkpoint_ns, checkpoint_id)
-
-    async def alist(
-        self, thread_id: str, checkpoint_ns: str, *, before: UUID | None, limit: int | None
-    ) -> AsyncIterator[CheckpointTuple]:
-        found = await asyncio.to_thread(lambda: tuple(self.list(thread_id, checkpoint_ns, before=before, limit=limit)))
-        for saved in found:
-            yield saved
-
-    async def adelete_thread(self, thread_id: str) -> None:
-        await asyncio.to_thread(self.delete_thread, thread_id)
