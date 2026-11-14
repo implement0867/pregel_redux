@@ -56,7 +56,6 @@ from pregel_redux.pregel import (
 )
 from pregel_redux.settings import RunSettings
 from pregel_redux.shutdown import ShutdownController, ShutdownSignal, run_until_abort
-from pregel_redux.snapshots import StateSnapshot
 from pregel_redux.streams import (
     CheckpointPart,
     ChildPart,
@@ -113,7 +112,8 @@ class Journal(Protocol):
     async def record_answers(self, task: TaskRef, answers: Sequence[JsonValue]) -> None: ...
     def find_writes(self, task: TaskRef) -> TaskWrites | None: ...
     def make_task_id(self, task: TaskRef) -> str: ...
-    async def read_snapshot(self) -> StateSnapshot | None: ...
+    async def read_waiting(self) -> tuple[Interrupt, ...]: ...
+    async def read_checkpoint(self) -> CheckpointPart | None: ...
     def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad: ...
     async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> Start: ...
 
@@ -129,7 +129,10 @@ class NoJournal:
     def make_task_id(self, task: TaskRef) -> str:
         return str(uuid5(NAMESPACE_OID, f"{encode_namespace(self.ns)}|{self.step}|{name_task(task)}"))
 
-    async def read_snapshot(self) -> None:
+    async def read_waiting(self) -> tuple[Interrupt, ...]:
+        return ()
+
+    async def read_checkpoint(self) -> None:
         return None
 
     async def record(self, task: TaskRef, writes: TaskWrites) -> None:
@@ -344,9 +347,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
             if not skip_interrupt_before and not names.isdisjoint(breakpoints.before):
                 return self.stop(position, run, journal, (), StopReason.breakpoint)
             if run.shutdown.requested and runs_nodes:
-                snapshot = await journal.read_snapshot()
-                waiting = () if snapshot is None else snapshot.interrupts
-                return self.stop(position, run, journal, waiting, StopReason.shutdown)
+                return self.stop(position, run, journal, await journal.read_waiting(), StopReason.shutdown)
             skip_interrupt_before = False
             if runs_nodes:
                 if steps == run.step_limit:
@@ -372,9 +373,9 @@ class CompiledGraph[StateT, InputT, OutputT]:
         return Finished(self.output_schema(**{name: values[name] for name in self.output_fields if name in values}))
 
     async def send_checkpoint(self, run: Run, journal: Journal) -> None:
-        snapshot = await journal.read_snapshot()
-        if snapshot is not None:
-            run.stream.send(journal.ns, CheckpointPart(snapshot))
+        part = await journal.read_checkpoint()
+        if part is not None:
+            run.stream.send(journal.ns, part)
 
     def stop(
         self, position: Position, run: Run, journal: Journal, interrupts: tuple[Interrupt, ...], reason: StopReason

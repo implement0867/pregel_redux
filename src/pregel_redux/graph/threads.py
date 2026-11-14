@@ -52,6 +52,7 @@ from pregel_redux.snapshots import (
     TaskStatus,
     WaitingTask,
 )
+from pregel_redux.streams import CheckpointPart
 from pregel_redux.task_refs import NodeCall, PullRef, PushRef, StartRef, TaskRef, name_task, refer_task
 
 
@@ -118,7 +119,7 @@ class ThreadScope:
         fork = await self.put(position, step, CheckpointSource.fork, checkpoint_id, loaded.newest_id)
         return OpenedRun(position, ThreadJournal(self, CheckpointTuple(checkpoint=fork, pending_writes=()), fork.id))
 
-    async def read_child_snapshot(self, journal: "ThreadJournal", task: TaskRef) -> "StateSnapshot | None":
+    def find_child_scope(self, journal: "ThreadJournal", task: TaskRef) -> "ThreadScope | None":
         match task:
             case StartRef():
                 return None
@@ -130,16 +131,33 @@ class ThreadScope:
             case CallPlan():
                 return None
             case CompiledGraph() as child:
-                pass
+                return ThreadScope(child, self.checkpointer, self.thread_id, journal.make_task_ns(task))
             case _:
                 assert_never(action)
-        scope = ThreadScope(child, self.checkpointer, self.thread_id, journal.make_task_ns(task))
-        saved = await self.checkpointer.aget_tuple(scope.thread_id, scope.stored_ns, None)
-        return None if saved is None else await scope.read_snapshot(saved, subgraphs=True)
 
-    async def read_task_snapshot(self, journal: "ThreadJournal", task: TaskRef, *, subgraphs: bool) -> TaskSnapshot:
+    def plan_refs(self, saved: CheckpointTuple) -> list[TaskRef]:
+        return [refer_task(task) for task in plan_tasks(self.read_position(saved), self.graph.triggers)]
+
+    async def read_level(self, saved: CheckpointTuple, *, subgraphs: bool) -> "SavedLevel":
+        journal = ThreadJournal(self, saved, saved.checkpoint.id)
+        children: dict[str, SavedLevel] = {}
+        for task in self.plan_refs(saved):
+            scope = self.find_child_scope(journal, task)
+            if scope is None or not (subgraphs or journal.find_writes(task) is None):
+                continue
+            child = await self.checkpointer.aget_tuple(scope.thread_id, scope.stored_ns, None)
+            if child is not None:
+                children[journal.make_task_id(task)] = await scope.read_level(child, subgraphs=True)
+        return SavedLevel(saved, children)
+
+    def build_task_snapshot(
+        self, journal: "ThreadJournal", task: TaskRef, level: "SavedLevel", *, subgraphs: bool
+    ) -> TaskSnapshot:
+        task_id = journal.make_task_id(task)
         writes = journal.find_writes(task)
-        child = await self.read_child_snapshot(journal, task) if subgraphs or writes is None else None
+        scope = self.find_child_scope(journal, task)
+        child_level = level.children.get(task_id)
+        child = None if scope is None or child_level is None else scope.build_snapshot(child_level, subgraphs=True)
         status: TaskStatus
         if writes is not None:
             status = FinishedTask(writes.fields)
@@ -159,23 +177,32 @@ class ThreadScope:
                             raise TypeError(f"the waiting interrupts {waiting!r} are not a tuple")
                 case _:
                     assert_never(stop)
-        return TaskSnapshot(id=journal.make_task_id(task), path=task, status=status, state=child if subgraphs else None)
+        return TaskSnapshot(id=task_id, path=task, status=status, state=child if subgraphs else None)
 
-    async def read_snapshot(self, saved: CheckpointTuple, *, subgraphs: bool) -> "StateSnapshot":
-        position = self.read_position(saved)
+    def build_snapshot(self, level: "SavedLevel", *, subgraphs: bool) -> StateSnapshot:
+        saved = level.saved
         journal = ThreadJournal(self, saved, saved.checkpoint.id)
-        refs = [refer_task(task) for task in plan_tasks(position, self.graph.triggers)]
-        tasks = tuple([await self.read_task_snapshot(journal, ref, subgraphs=subgraphs) for ref in refs])
         return StateSnapshot(
-            values=position.channels.read_values(),
+            values=self.read_position(saved).channels.read_values(),
             checkpoint_ns=self.checkpoint_ns,
             checkpoint_id=saved.checkpoint.id,
             parent_id=saved.checkpoint.parent_id,
             created_at=saved.checkpoint.ts,
             step=saved.checkpoint.step,
             source=saved.checkpoint.source,
-            tasks=tasks,
+            tasks=tuple(
+                self.build_task_snapshot(journal, task, level, subgraphs=subgraphs) for task in self.plan_refs(saved)
+            ),
         )
+
+    async def read_snapshot(self, saved: CheckpointTuple, *, subgraphs: bool) -> StateSnapshot:
+        return self.build_snapshot(await self.read_level(saved, subgraphs=subgraphs), subgraphs=subgraphs)
+
+
+@dataclass(frozen=True)
+class SavedLevel:
+    saved: CheckpointTuple
+    children: Mapping[str, "SavedLevel"]
 
 
 @dataclass(frozen=True)
@@ -206,6 +233,12 @@ class ThreadJournal:
 
     async def read_snapshot(self) -> StateSnapshot:
         return await self.scope.read_snapshot(self.saved, subgraphs=False)
+
+    async def read_waiting(self) -> tuple[Interrupt, ...]:
+        return (await self.read_snapshot()).interrupts
+
+    async def read_checkpoint(self) -> CheckpointPart:
+        return CheckpointPart(await self.read_snapshot())
 
     def make_task_ns(self, task: TaskRef) -> Namespace:
         return (*self.scope.checkpoint_ns, Segment(task.name, self.make_task_id(task)))
@@ -278,7 +311,7 @@ class ThreadJournal:
             return ResumeInput([], {})
         given = command.resume_by_interrupt_id or {}
         if command.resume is not None:
-            waiting = [interrupt.id for interrupt in (await self.read_snapshot()).interrupts]
+            waiting = [interrupt.id for interrupt in await self.read_waiting()]
             match waiting:
                 case []:
                     return ResumeInput([command.resume], given)
