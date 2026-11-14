@@ -1,7 +1,0 @@
-id: catch-all-pattern
-language: python
-rule:
-  kind: case_pattern
-  regex: ^[A-Za-z_][A-Za-z0-9_]*$
-  not:
-    regex: ^(None|True|False)$
