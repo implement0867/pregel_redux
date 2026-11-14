@@ -73,10 +73,34 @@ from pregel_redux.task_refs import NodeCall, PullRef, PushRef, StartRef, TaskRef
 
 
 @dataclass(frozen=True)
-class ChildEntry:
+class FreshStart:
     position: Position
     journal: "Journal"
-    resumed: bool
+
+
+@dataclass(frozen=True)
+class Continuation:
+    position: Position
+    journal: "Journal"
+
+
+type Start = FreshStart | Continuation
+
+
+@dataclass(frozen=True)
+class Breakpoints:
+    before: frozenset[str]
+    after: frozenset[str]
+
+
+@dataclass(frozen=True)
+class RunOptions:
+    step_limit: int | None
+    stream: Stream
+    shutdown: ShutdownSignal
+    provided: Mapping[Request, object]
+    resume: ResumeInput
+    breakpoints: Breakpoints
 
 
 class Journal(Protocol):
@@ -91,7 +115,7 @@ class Journal(Protocol):
     def make_task_id(self, task: TaskRef) -> str: ...
     async def read_snapshot(self) -> StateSnapshot | None: ...
     def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad: ...
-    async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> ChildEntry: ...
+    async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> Start: ...
 
 
 @dataclass
@@ -126,10 +150,10 @@ class NoJournal:
     def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad:
         return Scratchpad(task.name, [], resume, 0)
 
-    async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> ChildEntry:
+    async def enter_child(self, child: "CompiledGraph[object, Never, object]", call: NodeCall) -> Start:
         start = child.feed(child.open(extract_writes(call.node_input)), {})
         child_ns = (*self.ns, Segment(call.task.name, self.make_task_id(call.task)))
-        return ChildEntry(start, NoJournal(child_ns, 0), resumed=False)
+        return FreshStart(start, NoJournal(child_ns, 0))
 
 
 @dataclass(frozen=True)
@@ -183,24 +207,21 @@ class CompiledGraph[StateT, InputT, OutputT]:
     output_fields: frozenset[str]
     nodes: Mapping[str, CompiledNode]
     entry_nodes: frozenset[str]
-    interrupt_before: frozenset[str]
-    interrupt_after: frozenset[str]
 
     async def ainvoke(self, input: InputT, *, step_limit: int | None = None) -> OutputT:
         return await self.run_without_thread(input, step_limit, Stream(lambda part: None))
 
     async def run_without_thread(self, input: InputT, step_limit: int | None, stream: Stream) -> OutputT:
-        start = self.feed(self.open({}), extract_writes(input))
-        result = await self.run(
-            start,
-            step_limit,
-            NoJournal((), 0),
-            ResumeInput([], {}),
-            stream,
-            {},
-            ShutdownController().signal,
-            resumed=False,
+        start = FreshStart(self.feed(self.open({}), extract_writes(input)), NoJournal((), 0))
+        options = RunOptions(
+            step_limit=step_limit,
+            stream=stream,
+            shutdown=ShutdownController().signal,
+            provided={},
+            resume=ResumeInput([], {}),
+            breakpoints=Breakpoints(frozenset(), frozenset()),
         )
+        result = await self.run(start, options)
         match result:
             case Finished():
                 return result.output
@@ -211,22 +232,19 @@ class CompiledGraph[StateT, InputT, OutputT]:
             case _:
                 assert_never(result)
 
-    async def run(
-        self,
-        position: Position,
-        step_limit: int | None,
-        journal: Journal,
-        resume: ResumeInput,
-        stream: Stream,
-        provided: dict[Request, object],
-        shutdown: ShutdownSignal,
-        *,
-        resumed: bool,
-    ) -> Finished[OutputT] | Interrupted:
-        limit = RunSettings().step_limit if step_limit is None else step_limit
+    async def run(self, start: Start, options: RunOptions) -> Finished[OutputT] | Interrupted:
+        limit = RunSettings().step_limit if options.step_limit is None else options.step_limit
         async with ShieldedExitStack() as run_exits:
-            run = Run(provided, run_exits, asyncio.Lock(), limit, resume, stream, shutdown)
-            return await run_until_abort(shutdown, self.run_steps(position, run, journal, resumed=resumed))
+            run = Run(
+                dict(options.provided),
+                run_exits,
+                asyncio.Lock(),
+                limit,
+                options.resume,
+                options.stream,
+                options.shutdown,
+            )
+            return await run_until_abort(options.shutdown, self.run_steps(start, run, options.breakpoints))
         raise RuntimeError("a run-scoped dependency suppressed the exception of its run")
 
     def astream(
@@ -308,19 +326,22 @@ class CompiledGraph[StateT, InputT, OutputT]:
             case _:
                 assert_never(task)
 
-    async def run_steps(
-        self, start: Position, run: Run, journal: Journal, *, resumed: bool
-    ) -> Finished[OutputT] | Interrupted:
-        position = start
+    async def run_steps(self, start: Start, run: Run, breakpoints: Breakpoints) -> Finished[OutputT] | Interrupted:
+        position, journal = start.position, start.journal
         steps = 0
-        skip_interrupt_before = resumed
-        if not resumed:
-            await self.send_checkpoint(run, journal)
+        match start:
+            case FreshStart():
+                skip_interrupt_before = False
+                await self.send_checkpoint(run, journal)
+            case Continuation():
+                skip_interrupt_before = True
+            case _:
+                assert_never(start)
         while tasks := plan_tasks(position, self.triggers):
             calls = [self.build_call(task, position) for task in tasks]
             names = {call.task.name for call in calls}
             runs_nodes = any(not isinstance(task, StartTask) for task in tasks)
-            if not skip_interrupt_before and not names.isdisjoint(self.interrupt_before):
+            if not skip_interrupt_before and not names.isdisjoint(breakpoints.before):
                 return self.stop(position, run, journal, (), StopReason.breakpoint)
             if run.shutdown.requested and runs_nodes:
                 snapshot = await journal.read_snapshot()
@@ -345,7 +366,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
                 await self.send_checkpoint(run, journal)
             await asyncio.sleep(0)  # deliver a pending cancellation
             run.stream.send(journal.ns, ValuesPart(position.channels.read_values(), ()))
-            if not names.isdisjoint(self.interrupt_after):
+            if not names.isdisjoint(breakpoints.after):
                 return self.stop(position, run, journal, (), StopReason.breakpoint)
         values = position.channels.read_values()
         return Finished(self.output_schema(**{name: values[name] for name in self.output_fields if name in values}))
@@ -444,7 +465,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
                         return await self.call_function(action, name, call, run, journal.ns, step_exits)
                     case CompiledGraph():
                         entry = await journal.enter_child(action, call)
-                        result = await action.run_steps(entry.position, run, entry.journal, resumed=entry.resumed)
+                        result = await action.run_steps(entry, run, Breakpoints(frozenset(), frozenset()))
                         match result:
                             case Finished():
                                 return self.read_writes(name, result.output)

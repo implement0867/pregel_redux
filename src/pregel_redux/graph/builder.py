@@ -1,5 +1,5 @@
 from collections.abc import Callable, Collection, Mapping
-from dataclasses import dataclass, replace
+from dataclasses import dataclass
 from typing import Any, Concatenate, Literal, Never, Protocol, assert_never, overload, runtime_checkable
 
 from pregel_redux.channels import build_channels, merge_channels
@@ -7,7 +7,7 @@ from pregel_redux.checkpoints import Checkpointer
 from pregel_redux.commands import Endpoint, read_declared_targets
 from pregel_redux.configs import RunTarget
 from pregel_redux.dependencies import CallPlan, NodeValue, Scope, Supplied, plan_call
-from pregel_redux.graph.compiled import CompiledGraph, CompiledNode
+from pregel_redux.graph.compiled import Breakpoints, CompiledGraph, CompiledNode
 from pregel_redux.graph.persistent import PersistentGraph
 from pregel_redux.pregel import BranchKey, JoinKey
 from pregel_redux.shutdown import ShutdownSignal
@@ -147,7 +147,7 @@ class StateGraph[StateT, InputT, OutputT]:
         unknown = sorted((before | after) - names)
         if unknown:
             raise ValueError(f"interrupt_before or interrupt_after refer to {unknown!r}, which are not nodes")
-        return PersistentGraph(replace(graph, interrupt_before=before, interrupt_after=after), checkpointer)
+        return PersistentGraph(graph, checkpointer, Breakpoints(before, after))
 
     def compile_graph[ProviderT: Callable[..., object]](
         self,
@@ -208,8 +208,6 @@ class StateGraph[StateT, InputT, OutputT]:
                 for name, action in actions.items()
             },
             entry_nodes=entry_nodes,
-            interrupt_before=frozenset(),
-            interrupt_after=frozenset(),
         )
 
 

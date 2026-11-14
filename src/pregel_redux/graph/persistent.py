@@ -14,13 +14,11 @@ from pregel_redux.checkpoints import (
 )
 from pregel_redux.commands import Command
 from pregel_redux.configs import Namespace, RunTarget, StateAddress, parse_run_target, parse_state_address
-from pregel_redux.dependencies import Request
 from pregel_redux.graph.adapters import iterate_in_new_loop, run_in_new_loop, stream_run
-from pregel_redux.graph.compiled import CompiledGraph
+from pregel_redux.graph.compiled import Breakpoints, CompiledGraph, Continuation, FreshStart, RunOptions, Start
 from pregel_redux.graph.threads import ThreadJournal, ThreadScope, find_graph, infer_writer
 from pregel_redux.interrupts import Finished, Interrupted, ResumeInput
 from pregel_redux.pregel import (
-    Position,
     PullTask,
     Task,
     TaskWrites,
@@ -41,16 +39,15 @@ from pregel_redux.task_refs import refer_task
 
 @dataclass(frozen=True)
 class RunStart:
-    position: Position
-    journal: ThreadJournal
+    start: Start
     resume: ResumeInput
-    resumed: bool
 
 
 @dataclass(frozen=True)
 class PersistentGraph[StateT, InputT, OutputT]:
     graph: CompiledGraph[StateT, InputT, OutputT]
     checkpointer: Checkpointer
+    breakpoints: Breakpoints
 
     @cached_property
     def storage(self) -> AsyncCheckpointer:
@@ -81,7 +78,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
                 if writes is not None and (writes.fields or writes.branches or writes.sends):
                     await journal.record_command(writes)
                     position = apply_command(self.graph.trigger_keys, self.graph.triggers, position, writes)
-                return RunStart(position, journal, resume, resumed=True)
+                return RunStart(Continuation(position, journal), resume)
             case _ if opened is None:
                 position = self.graph.feed(self.graph.open({}), extract_writes(input))
                 journal = await scope.begin(position, -1, None)
@@ -89,7 +86,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
                 position = self.graph.feed(opened.position, extract_writes(input))
                 checkpoint = opened.journal.saved.checkpoint
                 journal = await scope.begin(position, checkpoint.step + 1, checkpoint.id)
-        return RunStart(position, journal, ResumeInput([], {}), resumed=False)
+        return RunStart(FreshStart(position, journal), ResumeInput([], {}))
 
     async def run(
         self,
@@ -112,11 +109,16 @@ class PersistentGraph[StateT, InputT, OutputT]:
         stream: Stream,
         shutdown: ShutdownSignal,
     ) -> Finished[OutputT] | Interrupted:
-        start = await self.start(input, target)
-        provided: dict[Request, object] = {RunTarget: target, ShutdownSignal: shutdown}
-        return await self.graph.run(
-            start.position, step_limit, start.journal, start.resume, stream, provided, shutdown, resumed=start.resumed
+        begun = await self.start(input, target)
+        options = RunOptions(
+            step_limit=step_limit,
+            stream=stream,
+            shutdown=shutdown,
+            provided={RunTarget: target, ShutdownSignal: shutdown},
+            resume=begun.resume,
+            breakpoints=self.breakpoints,
         )
+        return await self.graph.run(begun.start, options)
 
     async def ainvoke(
         self,

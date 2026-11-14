@@ -26,7 +26,7 @@ from pregel_redux.checkpoints import (
 from pregel_redux.commands import Command
 from pregel_redux.configs import Namespace, Segment, encode_namespace
 from pregel_redux.dependencies import CallPlan, finish_despite_cancellation
-from pregel_redux.graph.compiled import ChildEntry, CompiledGraph
+from pregel_redux.graph.compiled import CompiledGraph, Continuation, FreshStart, Start
 from pregel_redux.graph.conversion import (
     AnyGraph,
     CheckpointStamp,
@@ -292,13 +292,13 @@ class ThreadJournal:
         index = sum(1 for write in self.saved.pending_writes if isinstance(write, RunCommandRecord))
         await self.put_write(RunCommandRecord(index=index, command=dump_writes(self.scope.graph, writes)))
 
-    async def enter_child(self, child: AnyGraph, call: NodeCall) -> ChildEntry:
+    async def enter_child(self, child: AnyGraph, call: NodeCall) -> Start:
         scope = ThreadScope(child, self.scope.checkpointer, self.scope.thread_id, self.make_task_ns(call.task))
         opened = await scope.open_run(None, answers=False)
         if opened is not None:
-            return ChildEntry(opened.position, opened.journal, resumed=True)
+            return Continuation(opened.position, opened.journal)
         start = child.feed(child.open(extract_writes(call.node_input)), {})
-        return ChildEntry(start, await scope.begin(start, -1, None), resumed=False)
+        return FreshStart(start, await scope.begin(start, -1, None))
 
 
 @dataclass(frozen=True)
