@@ -114,7 +114,11 @@ class SqliteCheckpointer:
         if before is not None:
             query = query.where(CheckpointRow.checkpoint_id < before)
         with Session(self.engine) as session:
-            rows = session.scalars(query.order_by(CheckpointRow.checkpoint_id.desc()).limit(limit)).all()
+            rows: list[CheckpointRow] = []
+            for row in session.scalars(query.order_by(CheckpointRow.checkpoint_id.desc())):
+                if len(rows) == limit:
+                    break
+                rows.append(row)
             yield from [read_tuple(session, row) for row in rows]
 
     def delete_thread(self, thread_id: str) -> None:

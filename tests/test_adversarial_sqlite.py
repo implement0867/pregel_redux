@@ -156,6 +156,21 @@ def test_history_with_a_negative_limit_is_rejected(checkpointer: Checkpointer) -
         list(graph.get_state_history("thread", limit=-1))
 
 
+def test_history_with_a_limit_above_the_largest_sqlite_integer_gives_each_state(checkpointer: Checkpointer) -> None:
+    """
+    Arrange: a thread with checkpoints.
+    Act: read the history of the thread with a limit that a SQLite INTEGER cannot hold.
+    Assert: the read gives each state of the history on each checkpointer.
+    """
+    graph = build_parallel_graph(checkpointer, 1)
+    graph.invoke({}, "thread")
+
+    actual = list(graph.get_state_history("thread", limit=2**64))
+
+    expected = list(graph.get_state_history("thread"))
+    assert actual == expected, f"Expected {expected}, got {actual}."
+
+
 def test_thread_id_with_a_lone_surrogate_is_rejected(checkpointer: Checkpointer) -> None:
     """
     Arrange: a graph of one node.

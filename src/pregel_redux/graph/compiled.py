@@ -394,7 +394,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         except asyncio.CancelledError:
             for task in tasks:
                 task.cancel()
-            await finish_despite_cancellation(asyncio.wait(tasks))
+            await finish_despite_cancellation(asyncio.gather(*tasks, return_exceptions=True))
             raise
         failures = [failure for task in tasks if (failure := task.exception()) is not None]
         match failures:

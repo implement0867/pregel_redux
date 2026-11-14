@@ -1,4 +1,5 @@
 import asyncio
+import gc
 import signal
 import threading
 from collections.abc import Callable, Iterator
@@ -25,7 +26,7 @@ from pregel_redux import (
     graceful_shutdown,
     interrupt,
 )
-from pregel_redux.snapshots import FinishedTask
+from pregel_redux.snapshots import FailedTask, FinishedTask
 from pregel_redux.sqlite import SqliteCheckpointer
 from pregel_redux.streams import ChildPart, ValuesPart
 from tests.conftest import join_lists, read_error
@@ -437,3 +438,36 @@ def test_answer_of_a_node_that_failed_stays_and_its_later_question_waits_after_a
     assert waiting == ["second question"], f"Expected only the second question to wait, got {waiting}."
     assert errors == ["ConnectionError('run 4')"], f"Expected the error of the fourth run, got {errors}."
     assert actual == expected, f"Expected {expected}, got {actual}."
+
+
+def test_abort_before_the_failure_of_a_sync_node_leaves_no_error_that_no_code_reads() -> None:
+    """
+    Arrange: a sync node that aborts the run and then fails, and a handler that collects the errors that
+    the event loop reports.
+    Act: run the thread with the signal, and collect the unreachable tasks.
+    Assert: the run raises RunAborted, the task snapshot has the error, and the event loop reports no error.
+    """
+    controller = ShutdownController()
+    reports: list[dict[str, object]] = []
+
+    def abort_then_fail(state: State) -> State:
+        controller.abort()
+        raise ConnectionError("lost")
+
+    builder = StateGraph(State)
+    builder.add_node("fail", abort_then_fail)
+    builder.add_edge(Endpoint.start, "fail")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+
+    async def run_and_collect() -> None:
+        asyncio.get_running_loop().set_exception_handler(lambda loop, context: reports.append(context))
+        with pytest.raises(RunAborted):
+            await graph.ainvoke({}, "thread", signal=controller.signal)
+        gc.collect()
+        await asyncio.sleep(0)
+
+    asyncio.run(run_and_collect())
+
+    statuses = [task.status for task in graph.get_state("thread").tasks]
+    assert [type(status) for status in statuses] == [FailedTask], f"Expected one failed task, got {statuses}."
+    assert reports == [], f"Expected no error report of the event loop, got {reports}."
