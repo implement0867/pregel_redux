@@ -11,18 +11,19 @@ from pregel_redux import (
     Endpoint,
     Finished,
     InMemoryCheckpointer,
-    Interrupted,
+    Received,
     Reducer,
     RunAborted,
     ShutdownController,
     ShutdownSignal,
     StateGraph,
+    Stopped,
     StopReason,
+    Waiting,
     graceful_shutdown,
-    interrupt,
 )
 from pregel_redux.streams import (
-    InterruptsPart,
+    StoppedPart,
     UpdatesPart,
 )
 from tests.conftest import collect, join_lists
@@ -60,7 +61,7 @@ def test_graceful_shutdown_stops_the_run_after_the_current_step() -> None:
     stopped = graph.invoke({}, "thread", signal=controller.signal)
     finished = graph.invoke(None, "thread")
 
-    assert stopped == Interrupted((), {"notes": ["first"]}, StopReason.shutdown), (
+    assert stopped == Stopped({"notes": ["first"]}, StopReason.shutdown), (
         f"Expected a stop after the first node, got {stopped}."
     )
     assert finished == Finished(State(notes=["first", "second"])), f"Expected the two writes, got {finished}."
@@ -103,7 +104,7 @@ def test_graceful_shutdown_lets_the_other_nodes_of_the_step_finish() -> None:
     stopped = asyncio.run(graph.ainvoke({}, "thread", signal=controller.signal))
     finished = asyncio.run(graph.ainvoke(None, "thread"))
 
-    assert stopped == Interrupted((), {"notes": ["request", "slow"]}, StopReason.shutdown), (
+    assert stopped == Stopped({"notes": ["request", "slow"]}, StopReason.shutdown), (
         f"Expected the two writes, got {stopped}."
     )
     assert finished == Finished(State(notes=["request", "slow", "last"])), f"Expected three writes, got {finished}."
@@ -142,7 +143,7 @@ def test_graceful_shutdown_stops_a_child_graph_after_its_current_step() -> None:
     calls_at_the_stop = list(calls)
     finished = graph.invoke(None, "thread")
 
-    assert stopped == Interrupted((), {"notes": []}, StopReason.shutdown), (
+    assert stopped == Stopped({"notes": []}, StopReason.shutdown), (
         f"Expected a stop inside the child graph, got {stopped}."
     )
     assert calls_at_the_stop == ["first"], f"Expected only the first node before the stop, got {calls_at_the_stop}."
@@ -171,23 +172,23 @@ def test_run_with_a_signal_that_already_requests_a_shutdown_runs_no_node() -> No
 
     stopped = graph.invoke({"notes": ["input"]}, "thread", signal=controller.signal)
 
-    assert stopped == Interrupted((), {"notes": ["input"]}, StopReason.shutdown), (
+    assert stopped == Stopped({"notes": ["input"]}, StopReason.shutdown), (
         f"Expected a stop with the input, got {stopped}."
     )
     assert calls == [], f"Expected no node to run, got {calls}."
 
 
-def test_graceful_shutdown_before_a_step_reports_the_questions_that_wait() -> None:
+def test_run_with_a_shutdown_request_on_a_thread_at_rest_gives_the_entrances_that_wait() -> None:
     """
-    Arrange: a thread where a node waits for the answer to a question, and a controller with a shutdown request.
+    Arrange: a thread where a node waits for a message, and a controller with a shutdown request.
     Act: run the thread again without an input and with the signal.
-    Assert: the stop has the question that waits, the same as the state of the thread.
+    Assert: the run waits for the same entrance as the first run, the same as the state of the thread.
     """
     controller = ShutdownController()
     controller.shutdown()
 
-    def ask(state: State) -> State:
-        return {"notes": [interrupt("question", response_schema=str)]}
+    def ask(state: State, answer: Received[str]) -> State:
+        return {"notes": [answer]}
 
     builder = StateGraph(State)
     builder.add_node("ask", ask)
@@ -197,10 +198,10 @@ def test_graceful_shutdown_before_a_step_reports_the_questions_that_wait() -> No
 
     stopped = graph.invoke(None, "thread", signal=controller.signal)
 
-    waiting = graph.get_state("thread").interrupts
-    assert isinstance(asked, Interrupted), f"Expected a question in the first run, got {asked}."
-    assert isinstance(stopped, Interrupted), f"Expected a stop, got {stopped}."
-    assert stopped.interrupts == asked.interrupts == waiting, f"Expected the question {waiting}, got {stopped}."
+    waiting = graph.get_state("thread").accepts
+    assert isinstance(asked, Waiting), f"Expected a wait in the first run, got {asked}."
+    assert isinstance(stopped, Waiting), f"Expected a wait in the second run, got {stopped}."
+    assert stopped.accepts == asked.accepts == waiting, f"Expected the entrances {waiting}, got {stopped}."
 
 
 def test_abort_stops_a_node_at_once_and_runs_the_cleanup() -> None:
@@ -325,7 +326,7 @@ def test_node_that_finishes_in_the_grace_period_gives_a_graceful_stop() -> None:
 
     stopped = graph.invoke({}, "thread", signal=controller.signal)
 
-    assert stopped == Interrupted((), {"notes": ["first"]}, StopReason.shutdown), (
+    assert stopped == Stopped({"notes": ["first"]}, StopReason.shutdown), (
         f"Expected a stop after the first node, got {stopped}."
     )
 
@@ -378,7 +379,7 @@ def test_stream_ends_after_the_current_step_at_a_graceful_shutdown() -> None:
     parts = list(graph.stream({}, "thread", signal=controller.signal))
 
     names = [part.node for part in parts if isinstance(part, UpdatesPart)]
-    stops = [part for part in parts if isinstance(part, InterruptsPart)]
+    stops = [part for part in parts if isinstance(part, StoppedPart)]
     assert names == ["first"], f"Expected only the update of the first node, got {parts}."
     assert len(stops) == 1, f"Expected one stop, got {parts}."
 
@@ -500,7 +501,7 @@ def test_first_interrupt_signal_requests_a_graceful_shutdown() -> None:
     with graceful_shutdown() as shutdown:
         stopped = asyncio.run(graph.ainvoke({}, "thread", signal=shutdown))
 
-    assert stopped == Interrupted((), {"notes": ["first"]}, StopReason.shutdown), (
+    assert stopped == Stopped({"notes": ["first"]}, StopReason.shutdown), (
         f"Expected a stop after the first node, got {stopped}."
     )
     assert signal.getsignal(signal.SIGINT) is handler_before, "Expected the earlier handler after the block."

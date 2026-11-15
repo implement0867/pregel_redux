@@ -17,7 +17,7 @@ from pregel_redux.configs import Namespace, RunTarget, StateAddress, parse_run_t
 from pregel_redux.graph.adapters import iterate_in_new_loop, run_in_new_loop, stream_run
 from pregel_redux.graph.compiled import Breakpoints, CompiledGraph, Continuation, FreshStart, RunOptions, Start
 from pregel_redux.graph.threads import ThreadJournal, ThreadScope, find_graph, infer_writer
-from pregel_redux.interrupts import Finished, Interrupted, ResumeInput
+from pregel_redux.messages import Message
 from pregel_redux.pregel import (
     PullTask,
     Task,
@@ -27,6 +27,7 @@ from pregel_redux.pregel import (
     plan_tasks,
     read_command_writes,
 )
+from pregel_redux.results import Finished, Stopped, Waiting
 from pregel_redux.shutdown import RunAborted, ShutdownController, ShutdownSignal
 from pregel_redux.snapshots import StateSnapshot
 from pregel_redux.streams import (
@@ -35,12 +36,6 @@ from pregel_redux.streams import (
     StreamPart,
 )
 from pregel_redux.task_refs import refer_task
-
-
-@dataclass(frozen=True)
-class RunStart:
-    start: Start
-    resume: ResumeInput
 
 
 @dataclass(frozen=True)
@@ -55,30 +50,30 @@ class PersistentGraph[StateT, InputT, OutputT]:
 
     async def start(
         self,
-        input: InputT | Command[str] | None,
+        input: InputT | Command[str] | Message | None,
         target: RunTarget,
-    ) -> RunStart:
+    ) -> Start:
         thread_id = target.thread_id
         scope = ThreadScope(self.graph, self.storage, thread_id, ())
         match input:
-            case Command() as command:
-                answers = command.resume is not None or bool(command.resume_by_interrupt_id)
+            case Message():
+                return await scope.receive(input, target.fork_from)
             case _:
-                answers = False
-        opened = await scope.open_run(target.fork_from, answers=answers)
+                pass
+        opened = await scope.open_run(target.fork_from)
         match input:
             case None | Command():
                 if opened is None:
                     raise LookupError(f"thread {thread_id!r} has no checkpoint, so the run needs an input")
                 position, journal = opened.position, opened.journal
-                resume = await journal.read_resume(input)
                 writes = (
                     None if input is None else read_command_writes(self.graph.nodes.keys(), self.graph.channels, input)
                 )
                 if writes is not None and (writes.fields or writes.branches or writes.sends):
+                    self.graph.reject_sends_to_receivers(writes.sends)
                     await journal.record_command(writes)
                     position = apply_command(self.graph.trigger_keys, self.graph.triggers, position, writes)
-                return RunStart(Continuation(position, journal), resume)
+                return Continuation(position, journal)
             case _ if opened is None:
                 position = self.graph.feed(self.graph.open({}), extract_writes(input))
                 journal = await scope.begin(position, -1, None)
@@ -86,16 +81,16 @@ class PersistentGraph[StateT, InputT, OutputT]:
                 position = self.graph.feed(opened.position, extract_writes(input))
                 checkpoint = opened.journal.saved.checkpoint
                 journal = await scope.begin(position, checkpoint.step + 1, checkpoint.id)
-        return RunStart(FreshStart(position, journal), ResumeInput([], {}))
+        return FreshStart(position, journal)
 
     async def run(
         self,
-        input: InputT | Command[str] | None,
+        input: InputT | Command[str] | Message | None,
         target: RunTarget,
         step_limit: int | None,
         stream: Stream,
         signal: ShutdownSignal | None,
-    ) -> Finished[OutputT] | Interrupted:
+    ) -> Finished[OutputT] | Waiting | Stopped:
         shutdown = ShutdownController().signal if signal is None else signal
         if shutdown.aborted:
             raise RunAborted("the shutdown signal of the run is aborted")
@@ -103,45 +98,43 @@ class PersistentGraph[StateT, InputT, OutputT]:
 
     async def run_thread(
         self,
-        input: InputT | Command[str] | None,
+        input: InputT | Command[str] | Message | None,
         target: RunTarget,
         step_limit: int | None,
         stream: Stream,
         shutdown: ShutdownSignal,
-    ) -> Finished[OutputT] | Interrupted:
-        begun = await self.start(input, target)
+    ) -> Finished[OutputT] | Waiting | Stopped:
         options = RunOptions(
             step_limit=step_limit,
             stream=stream,
             shutdown=shutdown,
             provided={RunTarget: target, ShutdownSignal: shutdown},
-            resume=begun.resume,
             breakpoints=self.breakpoints,
         )
-        return await self.graph.run(begun.start, options)
+        return await self.graph.run(await self.start(input, target), options)
 
     async def ainvoke(
         self,
-        input: InputT | Command[str] | None,
+        input: InputT | Command[str] | Message | None,
         thread_id: str,
         *,
         fork_from: UUID | None = None,
         step_limit: int | None = None,
         signal: ShutdownSignal | None = None,
-    ) -> Finished[OutputT] | Interrupted:
+    ) -> Finished[OutputT] | Waiting | Stopped:
         stream = Stream(lambda part: None)
         target = parse_run_target(thread_id, fork_from)
         return await self.run(input, target, step_limit, stream, signal)
 
     def invoke(
         self,
-        input: InputT | Command[str] | None,
+        input: InputT | Command[str] | Message | None,
         thread_id: str,
         *,
         fork_from: UUID | None = None,
         step_limit: int | None = None,
         signal: ShutdownSignal | None = None,
-    ) -> Finished[OutputT] | Interrupted:
+    ) -> Finished[OutputT] | Waiting | Stopped:
         self.graph.reject_async_nodes("ainvoke")
         stream = Stream(lambda part: None)
         target = parse_run_target(thread_id, fork_from)
@@ -149,7 +142,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
 
     def astream(
         self,
-        input: InputT | Command[str] | None,
+        input: InputT | Command[str] | Message | None,
         thread_id: str,
         *,
         fork_from: UUID | None = None,
@@ -169,7 +162,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
 
     def stream(
         self,
-        input: InputT | Command[str] | None,
+        input: InputT | Command[str] | Message | None,
         thread_id: str,
         *,
         fork_from: UUID | None = None,

@@ -1,15 +1,17 @@
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 
+from typing_extensions import TypeForm
+
 from pregel_redux.configs import Namespace, Segment
-from pregel_redux.interrupts import Interrupt
+from pregel_redux.messages import Entrance
+from pregel_redux.results import StopReason
 from pregel_redux.snapshots import StateSnapshot
 
 
 @dataclass(frozen=True)
 class ValuesPart:
     values: Mapping[str, object]
-    interrupts: tuple[Interrupt, ...]
 
 
 @dataclass(frozen=True)
@@ -19,8 +21,13 @@ class UpdatesPart:
 
 
 @dataclass(frozen=True)
-class InterruptsPart:
-    interrupts: tuple[Interrupt, ...]
+class WaitingPart:
+    accepts: Mapping[Entrance, TypeForm[object]]
+
+
+@dataclass(frozen=True)
+class StoppedPart:
+    reason: StopReason
 
 
 @dataclass(frozen=True)
@@ -45,11 +52,10 @@ class TaskResultPart:
     id: str
     name: str
     update: Mapping[str, object]
-    interrupts: tuple[Interrupt, ...]
 
 
 type StreamPart = (
-    ValuesPart | UpdatesPart | InterruptsPart | CustomPart | CheckpointPart | TaskStartPart | TaskResultPart
+    ValuesPart | UpdatesPart | WaitingPart | StoppedPart | CustomPart | CheckpointPart | TaskStartPart | TaskResultPart
 )
 
 

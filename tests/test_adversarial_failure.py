@@ -4,7 +4,7 @@ from collections.abc import Iterator
 from typing import Annotated, TypedDict
 
 import pytest
-from pydantic import BaseModel, JsonValue, ValidationError
+from pydantic import BaseModel, ValidationError
 
 from pregel_redux import (
     Command,
@@ -12,14 +12,16 @@ from pregel_redux import (
     Endpoint,
     Finished,
     InMemoryCheckpointer,
-    Interrupted,
+    Message,
+    Received,
     Reducer,
     RunAborted,
     Scope,
     Send,
     ShutdownController,
     StateGraph,
-    interrupt,
+    Stopped,
+    Waiting,
 )
 from tests.conftest import join_lists, read_error
 
@@ -138,16 +140,14 @@ def test_run_scoped_provider_that_suppresses_the_exception_of_its_node_is_reject
             asyncio.run(builder.compile().ainvoke({}))
 
 
-def test_answer_that_is_not_of_the_response_schema_leaves_the_question_waiting() -> None:
+def test_message_that_is_not_of_the_received_type_leaves_the_entrance_open() -> None:
     """
-    Arrange: a thread that waits for the answer to a question whose response schema is a Pydantic model.
-    Act: answer with a value that is not of the schema, then answer the same question by its id with a value
-    of the schema.
-    Assert: the question still waits after the rejected answer, and the second answer finishes the run.
+    Arrange: a thread that waits for a message whose type is a Pydantic model.
+    Act: give a message that is not of the type, then give the same entrance a message of the type.
+    Assert: the thread accepts the same entrance after the rejected message, and the second message finishes the run.
     """
 
-    def decide(state: State) -> State:
-        decision = interrupt("approve?", response_schema=Decision)
+    def decide(state: State, decision: Received[Decision]) -> State:
         return State(notes=["approved" if decision.approved else "rejected"])
 
     builder = StateGraph(State)
@@ -156,17 +156,18 @@ def test_answer_that_is_not_of_the_response_schema_leaves_the_question_waiting()
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     thread_id = "thread"
     asked = asyncio.run(graph.ainvoke({}, thread_id))
-    assert isinstance(asked, Interrupted), f"Expected a waiting question, got {asked}."
-    questions = asked.interrupts
+    assert isinstance(asked, Waiting), f"Expected a thread that waits, got {asked}."
     with pytest.raises(ValidationError):
-        asyncio.run(graph.ainvoke(Command(resume="text"), thread_id))
+        asyncio.run(graph.ainvoke(Message("text"), thread_id))
 
-    waiting = asyncio.run(graph.aget_state(thread_id)).interrupts
-    answers: dict[str, JsonValue] = {item.id: {"approved": True} for item in questions}
-    actual = asyncio.run(graph.ainvoke(Command[str](resume_by_interrupt_id=answers), thread_id))
+    waiting = asyncio.run(graph.aget_state(thread_id)).accepts
+    (entrance,) = asked.accepts
+    actual = asyncio.run(graph.ainvoke(Message({"approved": True}, to=entrance), thread_id))
 
-    assert waiting == questions, f"Expected the question {questions} to wait after the rejected answer, got {waiting}."
-    assert actual == Finished(State(notes=["approved"])), f"Expected the second answer to finish the run, got {actual}."
+    assert waiting == asked.accepts, f"Expected {asked.accepts} to wait after the rejected message, got {waiting}."
+    assert actual == Finished(State(notes=["approved"])), (
+        f"Expected the second message to finish the run, got {actual}."
+    )
 
 
 def test_deferred_node_runs_after_the_nodes_of_the_pending_sends() -> None:
@@ -198,34 +199,34 @@ def test_deferred_node_runs_after_the_nodes_of_the_pending_sends() -> None:
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 
-def test_abort_after_an_answer_keeps_the_error_of_the_task() -> None:
+def test_abort_after_a_failure_keeps_the_error_of_the_task() -> None:
     """
-    Arrange: a node that fails before its question in the first run, and that receives a plain answer to its
-    question in the second run and then waits until the run is aborted.
-    Act: run the thread, run it with the answer and the signal, and read the state after the abort.
-    Assert: the task keeps the error of the first run, because it did not finish and did not ask a question.
+    Arrange: a node that receives a message and fails in the run of the message, and that waits in the next run
+    until the run is aborted.
+    Act: run the thread, run it with the message, run it with the signal, and read the state after the abort.
+    Assert: the task keeps the error of the run of the message, because it did not finish.
     """
     controller = ShutdownController()
     runs: list[str] = []
 
-    async def fail_then_ask(state: State) -> State:
+    async def fail_then_wait(state: State, answer: Received[str]) -> State:
         runs.append("run")
         if len(runs) == 1:
             raise ConnectionError("first run")
-        answer = interrupt("question", response_schema=str)
         controller.abort()
         await asyncio.Event().wait()
         return State(notes=[answer])
 
     builder = StateGraph(State)
-    builder.add_node("ask", fail_then_ask)
+    builder.add_node("ask", fail_then_wait)
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     thread_id = "thread"
+    asyncio.run(graph.ainvoke({}, thread_id))
     with pytest.raises(ConnectionError):
-        asyncio.run(graph.ainvoke({}, thread_id))
+        asyncio.run(graph.ainvoke(Message("yes"), thread_id))
     with pytest.raises(RunAborted):
-        asyncio.run(graph.ainvoke(Command(resume="yes"), thread_id, signal=controller.signal))
+        asyncio.run(graph.ainvoke(None, thread_id, signal=controller.signal))
 
     errors = [read_error(task) for task in asyncio.run(graph.aget_state(thread_id)).tasks]
 
@@ -237,7 +238,7 @@ def test_graceful_stop_of_a_child_graph_keeps_the_error_of_its_task() -> None:
     Arrange: a step with a node and a child graph that both fail, and a second run in which the node requests
     a graceful shutdown before the child graph runs its failed node again.
     Act: run the thread, then run it again with the signal, and read the state with the child graphs.
-    Assert: the task of the child graph keeps its error, because it did not finish and did not ask a question,
+    Assert: the task of the child graph keeps its error, because it did not finish and its child does not wait,
     and the state of the child graph still has the error of its node.
     """
     controller = ShutdownController()
@@ -275,7 +276,7 @@ def test_graceful_stop_of_a_child_graph_keeps_the_error_of_its_task() -> None:
     task = next(task for task in state.tasks if task.name == "child")
     assert task.state is not None, f"Expected the state of the child graph, got {task}."
     inner = [read_error(item) for item in task.state.tasks]
-    assert isinstance(stopped, Interrupted), f"Expected a graceful stop, got {stopped}."
+    assert isinstance(stopped, Stopped), f"Expected a graceful stop, got {stopped}."
     assert runs.count("fail") == 1, f"Expected the failed node of the child graph not to run again, got {runs}."
     assert inner == ["ConnectionError('no network')"], f"Expected the error in the child graph, got {inner}."
     assert read_error(task) == "ConnectionError('no network')", f"Expected the error of the child task, got {task}."

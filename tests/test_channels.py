@@ -109,7 +109,7 @@ def apply_updates(
     channels: Mapping[str, Channel], values: Mapping[str, object], updates: Sequence[Mapping[str, object]]
 ) -> dict[str, object]:
     writes = [TaskWrites(parse_updates(channels, update), frozenset(), (), ()) for update in updates]
-    return apply_writes(open_channels(channels, values, {}, {}), [], writes, [], []).channels.read_values()
+    return apply_writes(open_channels(channels, values, {}, {}, []), [], writes, [], []).channels.read_values()
 
 
 def call_without_type_check(function: Callable[..., object], arguments: Mapping[str, object]) -> object:

@@ -1,6 +1,7 @@
 from dataclasses import dataclass
 from typing import Literal, assert_never
 
+from pregel_redux.channels import Stored
 from pregel_redux.pregel import PullTask, PushTask, StartTask, Task
 
 
@@ -27,6 +28,7 @@ type TaskRef = StartRef | PullRef | PushRef
 class NodeCall:
     task: TaskRef
     node_input: object
+    received: Stored[object] | None
 
 
 def name_task(task: TaskRef) -> str:

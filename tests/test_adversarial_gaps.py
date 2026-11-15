@@ -7,7 +7,6 @@ from pathlib import Path
 from typing import Annotated, TypedDict
 
 import pytest
-from pydantic import JsonValue
 from sqlalchemy import create_engine
 
 from pregel_redux import (
@@ -15,16 +14,18 @@ from pregel_redux import (
     Command,
     Depends,
     Endpoint,
+    Entrance,
     Finished,
     InMemoryCheckpointer,
-    Interrupted,
+    Message,
+    Received,
     Reducer,
     RunAborted,
     Send,
     ShutdownController,
     StateGraph,
+    Waiting,
     graceful_shutdown,
-    interrupt,
 )
 from pregel_redux.snapshots import FailedTask, FinishedTask
 from pregel_redux.sqlite import SqliteCheckpointer
@@ -55,8 +56,12 @@ def build_writer(name: str) -> Callable[[State], State]:
     return write
 
 
-def ask(state: State) -> State:
-    return State(notes=[interrupt("question", response_schema=str)])
+def ask(state: State, answer: Received[str]) -> State:
+    return State(notes=[answer])
+
+
+def raise_connection_error(state: State) -> State:
+    raise ConnectionError("no network")
 
 
 def build_parent_of_a_child_graph() -> StateGraph[State, State, State]:
@@ -98,44 +103,41 @@ def test_values_parts_of_a_child_graph_have_the_namespace_of_the_child_graph() -
     assert inner == expected_inner, f"Expected the child graph parts {expected_inner}, got {inner}."
 
 
-def test_command_with_a_send_keeps_the_send_tasks_that_wait_for_an_answer() -> None:
+def test_command_with_a_send_keeps_the_nodes_that_wait_for_a_message() -> None:
     """
-    Arrange: a thread in which two Send tasks wait for an answer to their question.
-    Act: run the thread with a Command that sends a payload to a writer, then answer the two questions.
-    Assert: the two questions wait before and after the Command, and the last run finishes with the note of
-    the writer and the two answers.
+    Arrange: a thread in which two nodes wait for a message.
+    Act: run the thread with a Command that sends a payload to a writer, then give each node its message.
+    Assert: the thread accepts the same two entrances before and after the Command, and the last run finishes
+    with the note of the writer and the two messages.
     """
-
-    def route(state: State) -> Command[str]:
-        return Command(goto=[Send("ask", {}), Send("ask", {})])
-
     builder = StateGraph(State)
-    builder.add_node("route", route)
-    builder.add_node("ask", ask)
+    builder.add_node("left", ask)
+    builder.add_node("right", ask)
     builder.add_node("write", build_writer("write"))
-    builder.add_edge(Endpoint.start, "route")
+    builder.add_edge(Endpoint.start, "left")
+    builder.add_edge(Endpoint.start, "right")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     thread_id = "thread"
     graph.invoke({}, thread_id)
-    before = graph.get_state(thread_id).interrupts
+    before = graph.get_state(thread_id).accepts
 
     graph.invoke(Command(goto=[Send("write", {})]), thread_id)
-    after = graph.get_state(thread_id).interrupts
-    answers: dict[str, JsonValue] = {item.id: f"answer {index}" for index, item in enumerate(before)}
-    actual = graph.invoke(Command[str](resume_by_interrupt_id=answers), thread_id)
+    after = graph.get_state(thread_id).accepts
+    results = [
+        graph.invoke(Message(f"answer {index}", to=entrance), thread_id) for index, entrance in enumerate(before)
+    ]
 
-    expected = Finished(State(notes=["answer 0", "answer 1", "write"]))
-    assert len(before) == 2, f"Expected two waiting questions before the Command, got {before}."
-    assert after == before, f"Expected the questions {before} to wait after the Command, got {after}."
-    assert actual == expected, f"Expected {expected}, got {actual}."
+    expected = Finished(State(notes=["write", "answer 0", "answer 1"]))
+    assert len(before) == 2, f"Expected two entrances before the Command, got {before}."
+    assert after == before, f"Expected the entrances {before} after the Command, got {after}."
+    assert results[-1] == expected, f"Expected {expected}, got {results[-1]}."
 
 
-def test_command_with_an_update_keeps_a_deferred_node_after_the_node_that_waits_for_an_answer() -> None:
+def test_command_with_an_update_keeps_a_deferred_node_after_the_node_that_waits_for_a_message() -> None:
     """
-    Arrange: a thread in which a node waits for an answer to its question, and a deferred node that the start
-    also reaches.
-    Act: run the thread with a Command that has only an update, then answer the question.
-    Assert: the deferred node does not run in the run of the Command, and it runs after the answer and sees
+    Arrange: a thread in which a node waits for a message, and a deferred node that the start also reaches.
+    Act: run the thread with a Command that has only an update, then give the message.
+    Assert: the deferred node does not run in the run of the Command, and it runs after the message and sees
     the note of the node that waited.
     """
     calls: list[str] = []
@@ -155,21 +157,23 @@ def test_command_with_an_update_keeps_a_deferred_node_after_the_node_that_waits_
 
     graph.invoke(Command(update=State(notes=["update"])), thread_id)
     calls_of_the_command = list(calls)
-    waiting = graph.get_state(thread_id).next
-    actual = graph.invoke(Command(resume="yes"), thread_id)
+    state = graph.get_state(thread_id)
+    actual = graph.invoke(Message("yes"), thread_id)
 
     expected = Finished(State(notes=["update", "yes", "late saw ['update', 'yes']"]))
     assert calls_of_the_command == [], (
         f"Expected the deferred node not to run in the run of the Command, got {calls_of_the_command}."
     )
-    assert waiting == ("ask",), f"Expected only the waiting node next after the Command, got {waiting}."
+    assert (state.next, state.accepts) == ((), {Entrance((), "ask"): str}), (
+        f"Expected no next node and only the entrance of the waiting node after the Command, got {state}."
+    )
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 
 def test_task_that_finished_after_a_failure_has_a_result_and_no_error() -> None:
     """
-    Arrange: a step of a node that fails in the first run and a node that asks a question.
-    Act: run the thread, run it again so that the failed node finishes while the other node waits, and read
+    Arrange: a step of a node that fails in the first run and a node that fails in each run.
+    Act: run the thread, run it again so that the first node finishes while the step does not, and read
     the state.
     Assert: the task of the node that finished has its result and no error.
     """
@@ -181,17 +185,21 @@ def test_task_that_finished_after_a_failure_has_a_result_and_no_error() -> None:
             raise ConnectionError("no network")
         return State(notes=["recovered"])
 
+    def fail_each_time(state: State) -> State:
+        raise LookupError("no record")
+
     builder = StateGraph(State)
-    builder.add_node("ask", ask)
+    builder.add_node("block", fail_each_time)
     builder.add_node("recover", fail_one_time)
-    builder.add_edge(Endpoint.start, "ask")
+    builder.add_edge(Endpoint.start, "block")
     builder.add_edge(Endpoint.start, "recover")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     thread_id = "thread"
-    with pytest.raises(ConnectionError):
+    with pytest.raises(ExceptionGroup):
         graph.invoke({}, thread_id)
 
-    graph.invoke(None, thread_id)
+    with pytest.raises(LookupError):
+        graph.invoke(None, thread_id)
     state = graph.get_state(thread_id)
 
     actual = [(task.name, task.status) for task in state.tasks if task.name == "recover"]
@@ -277,17 +285,18 @@ def test_checkpoint_that_is_stored_again_after_the_delete_of_its_thread_has_no_p
     checkpointer: Checkpointer,
 ) -> None:
     """
-    Arrange: a thread that stopped at an interrupt, so that its newest checkpoint has a pending write.
+    Arrange: a thread whose node failed, so that its newest checkpoint has a pending write.
     Act: delete the thread, store the same checkpoint again, and read it.
     Assert: the checkpoint that was read has no pending writes.
     """
     builder = StateGraph(State)
-    builder.add_node("ask", ask)
-    builder.add_edge(Endpoint.start, "ask")
+    builder.add_node("fail", raise_connection_error)
+    builder.add_edge(Endpoint.start, "fail")
     graph = builder.compile(checkpointer=checkpointer)
-    graph.invoke({}, "thread")
+    with pytest.raises(ConnectionError):
+        graph.invoke({}, "thread")
     stopped = checkpointer.get_tuple("thread", "", None)
-    assert stopped is not None, "Expected a checkpoint of the thread that stopped at an interrupt, got None."
+    assert stopped is not None, "Expected a checkpoint of the thread whose node failed, got None."
     assert stopped.pending_writes, f"Expected a pending write before the delete, got {stopped.pending_writes}."
 
     checkpointer.delete_thread("thread")
@@ -358,85 +367,85 @@ def test_grace_period_of_a_second_shutdown_request_aborts_a_run_that_does_not_st
         asyncio.run(run_with_a_guard())
 
 
-def test_answer_of_a_node_that_an_abort_cancelled_reaches_the_node_in_the_next_run() -> None:
+def test_message_of_a_node_that_an_abort_cancelled_reaches_the_node_in_the_next_run() -> None:
     """
-    Arrange: an async node that asks a question in each run, and that in its second run aborts the run after
-    it received the answer and then waits.
-    Act: run the thread, run it with the answer and the signal, and run it again with no input.
-    Assert: the second run raises RunAborted, and the third run finishes with the answer of the second run.
+    Arrange: an async node that receives a message, and that in its first run aborts the run and then waits.
+    Act: run the thread, run it with the message and the signal, and run it again with no input.
+    Assert: the second run raises RunAborted, and the third run finishes with the message of the second run.
     """
     controller = ShutdownController()
     runs: list[str] = []
 
-    async def ask_then_wait(state: State) -> State:
+    async def receive_then_wait(state: State, answer: Received[str]) -> State:
         runs.append("run")
-        answer = interrupt("question", response_schema=str)
-        if len(runs) == 2:
+        if len(runs) == 1:
             controller.abort()
             await asyncio.Event().wait()
         return State(notes=[answer])
 
     builder = StateGraph(State)
-    builder.add_node("ask", ask_then_wait)
+    builder.add_node("ask", receive_then_wait)
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     thread_id = "thread"
 
-    async def run_with_a_guard(command: Command[str] | None) -> object:
+    async def run_with_a_guard(message: Message | None) -> object:
         async with asyncio.timeout(5):
-            return await graph.ainvoke(command, thread_id, signal=controller.signal if command else None)
+            return await graph.ainvoke(message, thread_id, signal=controller.signal if message else None)
 
     asyncio.run(graph.ainvoke({}, thread_id))
     with pytest.raises(RunAborted):
-        asyncio.run(run_with_a_guard(Command(resume="yes")))
+        asyncio.run(run_with_a_guard(Message("yes")))
 
     actual = asyncio.run(run_with_a_guard(None))
 
     expected = Finished(State(notes=["yes"]))
-    assert actual == expected, f"Expected the saved answer to finish the third run with {expected}, got {actual}."
+    assert actual == expected, f"Expected the saved message to finish the third run with {expected}, got {actual}."
 
 
-def test_answer_of_a_node_that_failed_stays_and_its_later_question_waits_after_another_failure() -> None:
+def test_message_of_a_node_that_failed_stays_and_the_next_node_waits_until_the_step_finishes() -> None:
     """
-    Arrange: a node with two questions that fails between the questions in its second run and its fourth run.
-    Act: run the thread, run it with the first answer, run it two times with no input, read the state, and
-    run it with the second answer.
-    Assert: the third run asks only the second question, the state after the fourth run has the error of
-    that run and only the second question, and the fifth run finishes with the two answers.
+    Arrange: a chain of two nodes that each receive a message and each fail in the run of their message.
+    Act: run the thread, give the first message, run it with no input, give the second message, read the state,
+    and run it with no input.
+    Assert: the third run waits only for the second node, the state after the fourth run has the error of
+    that run and accepts no message, and the fifth run finishes with the two messages.
     """
-    runs: list[str] = []
+    failed: list[str] = []
 
-    def ask_two_questions(state: State) -> State:
-        runs.append("run")
-        first = interrupt("first question", response_schema=str)
-        if len(runs) in (2, 4):
-            raise ConnectionError(f"run {len(runs)}")
-        second = interrupt("second question", response_schema=str)
-        return State(notes=[first, second])
+    def build_receiver(name: str) -> Callable[..., State]:
+        def receive(state: State, answer: Received[str]) -> State:
+            if name not in failed:
+                failed.append(name)
+                raise ConnectionError(name)
+            return State(notes=[answer])
+
+        return receive
 
     builder = StateGraph(State)
-    builder.add_node("ask", ask_two_questions)
-    builder.add_edge(Endpoint.start, "ask")
+    builder.add_node("first", build_receiver("first"))
+    builder.add_node("second", build_receiver("second"))
+    builder.add_edge(Endpoint.start, "first")
+    builder.add_edge("first", "second")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     thread_id = "thread"
     graph.invoke({}, thread_id)
     with pytest.raises(ConnectionError):
-        graph.invoke(Command(resume="one"), thread_id)
+        graph.invoke(Message("one"), thread_id)
 
     third = graph.invoke(None, thread_id)
-    assert isinstance(third, Interrupted), f"Expected the third run to stop at a question, got {third}."
-    asked = [item.value for item in third.interrupts]
-    assert asked == ["second question"], f"Expected the third run to ask only the second question, got {asked}."
+    assert isinstance(third, Waiting), f"Expected the third run to wait, got {third}."
+    asked = list(third.accepts)
+    assert asked == [Entrance((), "second")], f"Expected the third run to wait only for the second node, got {asked}."
     with pytest.raises(ConnectionError):
-        graph.invoke(None, thread_id)
+        graph.invoke(Message("two"), thread_id)
     state = graph.get_state(thread_id)
-    actual = graph.invoke(Command(resume="two"), thread_id)
+    actual = graph.invoke(None, thread_id)
 
-    waiting = [item.value for item in state.interrupts]
     errors = [read_error(task) for task in state.tasks]
     expected = Finished(State(notes=["one", "two"]))
-    assert waiting == ["second question"], f"Expected only the second question to wait, got {waiting}."
-    assert errors == ["ConnectionError('run 4')"], f"Expected the error of the fourth run, got {errors}."
+    assert state.accepts == {}, f"Expected no entrance while the step is not finished, got {state.accepts}."
+    assert errors == ["ConnectionError('second')"], f"Expected the error of the fourth run, got {errors}."
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 

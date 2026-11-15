@@ -5,14 +5,14 @@ from uuid import UUID, uuid4
 import pytest
 
 from pregel_redux import (
-    Command,
     Endpoint,
     Finished,
     InMemoryCheckpointer,
+    Message,
     PersistentGraph,
+    Received,
     Reducer,
     StateGraph,
-    interrupt,
 )
 from tests.conftest import join_lists
 
@@ -28,9 +28,9 @@ def build_writer(name: str) -> Callable[[State], State]:
     return write
 
 
-def build_asker(name: str) -> Callable[[State], State]:
-    def ask(state: State) -> State:
-        return {"notes": [f"{name} got {interrupt(f'{name} question', response_schema=str)}"]}
+def build_asker(name: str) -> Callable[..., State]:
+    def ask(state: State, answer: Received[str]) -> State:
+        return {"notes": [f"{name} got {answer}"]}
 
     return ask
 
@@ -45,31 +45,31 @@ def build_failing_once(name: str, failures: list[str]) -> Callable[[State], Stat
     return fail_once
 
 
-def test_answer_by_id_with_the_checkpoint_id_of_the_stop_reaches_the_waiting_node() -> None:
+def test_message_with_the_checkpoint_id_of_the_wait_reaches_the_waiting_node() -> None:
     """
-    Arrange: a thread that stopped at an interrupt, and the state of the thread with its checkpoint id.
-    Act: run the thread from that checkpoint id with an answer by the id of the waiting interrupt.
-    Assert: the run finishes with the answer, as the same command without the checkpoint id does.
+    Arrange: a thread that waits for a message, and the state of the thread with its checkpoint id and its entrance.
+    Act: run the thread from that checkpoint id with a message for the entrance.
+    Assert: the run finishes with the message, as the same message without the checkpoint id does.
     """
     builder = StateGraph(State)
     builder.add_node("ask", build_asker("ask"))
     builder.add_edge(Endpoint.start, "ask")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     graph.invoke({}, "thread")
-    stopped = graph.get_state("thread")
-    answers = {item.id: "yes" for item in stopped.interrupts}
+    waiting = graph.get_state("thread")
+    (entrance,) = waiting.accepts
 
-    actual = graph.invoke(Command(resume_by_interrupt_id=answers), "thread", fork_from=stopped.checkpoint_id)
+    actual = graph.invoke(Message("yes", to=entrance), "thread", fork_from=waiting.checkpoint_id)
 
     expected = Finished(State(notes=["ask got yes"]))
     assert actual == expected, f"Expected {expected}, got {actual}."
 
 
-def test_plain_answer_with_the_checkpoint_id_of_two_waiting_interrupts_is_rejected() -> None:
+def test_message_without_an_entrance_with_the_checkpoint_id_of_two_waiting_nodes_is_rejected() -> None:
     """
-    Arrange: a thread in which two nodes wait for an answer, and the checkpoint id of the thread.
-    Act: run the thread from that checkpoint id with one plain answer.
-    Assert: the run raises ValueError, as the same command without the checkpoint id does.
+    Arrange: a thread in which two nodes wait for a message, and the checkpoint id of the thread.
+    Act: run the thread from that checkpoint id with one message that names no entrance.
+    Assert: the run raises ValueError, as the same message without the checkpoint id does.
     """
     builder = StateGraph(State)
     builder.add_node("left", build_asker("left"))
@@ -78,10 +78,10 @@ def test_plain_answer_with_the_checkpoint_id_of_two_waiting_interrupts_is_reject
     builder.add_edge(Endpoint.start, "right")
     graph = builder.compile(checkpointer=InMemoryCheckpointer())
     graph.invoke({}, "thread")
-    stopped = graph.get_state("thread")
+    waiting = graph.get_state("thread")
 
-    with pytest.raises(ValueError, match="resume_by_interrupt_id"):
-        graph.invoke(Command(resume="yes"), "thread", fork_from=stopped.checkpoint_id)
+    with pytest.raises(ValueError, match=r"Message\.to"):
+        graph.invoke(Message("yes"), "thread", fork_from=waiting.checkpoint_id)
 
 
 def run_with_an_input(graph: PersistentGraph[State, State, State], checkpoint_id: UUID) -> object:

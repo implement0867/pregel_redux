@@ -1,5 +1,4 @@
 import asyncio
-import json
 import threading
 from collections import Counter
 from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Iterator, Mapping, Sequence
@@ -18,17 +17,19 @@ from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
 from pydantic import TypeAdapter, ValidationError
 from sqlalchemy import create_engine
+from typing_extensions import TypeForm
 
 from pregel_redux import (
     Checkpointer,
     Command,
     Depends,
     Endpoint,
+    Entrance,
     Finished,
     InMemoryCheckpointer,
-    Interrupt,
-    Interrupted,
+    Message,
     PersistentGraph,
+    Received,
     Reducer,
     RunAborted,
     Scope,
@@ -37,7 +38,8 @@ from pregel_redux import (
     ShutdownSignal,
     StateGraph,
     StateSnapshot,
-    interrupt,
+    Stopped,
+    Waiting,
 )
 from pregel_redux.checkpoints import CheckpointSource
 from pregel_redux.configs import Namespace
@@ -74,8 +76,8 @@ class WriterSpec:
 
 
 @dataclass(frozen=True)
-class AskerSpec:
-    questions: int
+class ReceiverSpec:
+    pass
 
 
 @dataclass(frozen=True)
@@ -94,7 +96,7 @@ class ResourceSpec:
 
 @dataclass(frozen=True)
 class FunctionSpec:
-    action: WriterSpec | AskerSpec | RouterSpec
+    action: WriterSpec | ReceiverSpec | RouterSpec
     is_async: bool
     pauses: int
     late_pauses: int
@@ -130,7 +132,6 @@ class GraphSpec:
 
 class Phase(Enum):
     start = "start"
-    answer = "answer"
     end = "end"
     cleanup = "cleanup"
 
@@ -148,8 +149,7 @@ class Execution:
     origin: str | None
     clock: int
     observed: tuple[str, ...]
-    given: list[str | None] = field(default_factory=list)
-    received: list[str | None] = field(default_factory=list)
+    received: str | None
     completed: bool = False
 
 
@@ -158,9 +158,7 @@ class Trace:
     executions: dict[str, Execution] = field(default_factory=dict)
     tags: dict[str, tuple[str, int]] = field(default_factory=dict)
     faults: dict[tuple[int, ...], Phase] = field(default_factory=dict)
-    consumed: set[str] = field(default_factory=set)
-    given: dict[str, str] = field(default_factory=dict)
-    plain: str | None = None
+    delivered: dict[str, tuple[int, ...]] = field(default_factory=dict)
     fired: list[tuple[tuple[int, ...], Phase]] = field(default_factory=list)
     shutdowns: dict[tuple[int, ...], Stop] = field(default_factory=dict)
     controller: ShutdownController = field(default_factory=ShutdownController)
@@ -206,7 +204,6 @@ class Trace:
 
     def start_era(self) -> None:
         self.era += 1
-        self.consumed.clear()
 
     def completed(self) -> list[Execution]:
         return [execution for execution in list(self.executions.values()) if execution.completed]
@@ -235,13 +232,24 @@ def join_specs(draw: st.DrawFn, node_count: int, reached: Sequence[int]) -> Join
     return JoinSpec(tuple(sorted(draw(st.one_of(live_sources, any_sources)))), target)
 
 
-def drop_ways(node: NodeSpec, alone: set[int]) -> NodeSpec:
+def receives_a_message(node: NodeSpec) -> bool:
+    match node.work:
+        case FunctionSpec(action=ReceiverSpec()):
+            return True
+        case FunctionSpec() | ChildSpec():
+            return False
+        case _:
+            assert_never(node.work)
+
+
+def drop_ways(node: NodeSpec, alone: set[int], receivers: set[int]) -> NodeSpec:
     def keep(indexes: tuple[int, ...]) -> tuple[int, ...]:
         return tuple(index for index in indexes if index not in alone)
 
     match node.work:
         case FunctionSpec(action=RouterSpec() as router) as function:
-            action = RouterSpec(keep(router.forward), keep(router.sends), keep(router.back), router.rounds)
+            sends = tuple(index for index in keep(router.sends) if index not in receivers)
+            action = RouterSpec(keep(router.forward), sends, keep(router.back), router.rounds)
             return replace(node, work=replace(function, action=action), targets=keep(node.targets))
         case FunctionSpec() | ChildSpec():
             return replace(node, targets=keep(node.targets))
@@ -276,7 +284,7 @@ def graph_specs(draw: st.DrawFn, known_names: tuple[str, ...], depth: int) -> Gr
         later = range(index + 1, len(names))
         action = st.one_of(
             st.just(WriterSpec()),
-            st.builds(AskerSpec, questions=st.integers(min_value=1, max_value=3)),
+            st.just(ReceiverSpec()),
             st.builds(
                 RouterSpec,
                 forward=pick_some(later),
@@ -297,14 +305,16 @@ def graph_specs(draw: st.DrawFn, known_names: tuple[str, ...], depth: int) -> Gr
         )
         child = st.builds(ChildSpec, graph=graph_specs((*known_names, *names), depth + 1))
         work = draw(function if depth == 2 else st.one_of(function, child))
-        nodes.append(NodeSpec(node_name, work, draw(st.booleans()), draw(pick_some(later)), draw(st.booleans())))
+        node = NodeSpec(node_name, work, draw(st.booleans()), draw(pick_some(later)), draw(st.booleans()))
+        nodes.append(replace(node, defer=node.defer and not receives_a_message(node)))
     entries = draw(st.lists(st.sampled_from(range(len(names))), min_size=1, unique=True))
     reached = find_reached_nodes(nodes, entries)
     joins = draw(st.lists(join_specs(len(names), reached))) if len(names) > 2 else []
     targets = sorted({join.target for join in joins if join.target is not None})
     alone = set(draw(pick_some(targets)))
     kept_entries = [entry for entry in entries if entry not in alone] or entries
-    return GraphSpec(tuple(drop_ways(node, alone) for node in nodes), tuple(kept_entries), tuple(joins))
+    receivers = {index for index, node in enumerate(nodes) if receives_a_message(node)}
+    return GraphSpec(tuple(drop_ways(node, alone, receivers) for node in nodes), tuple(kept_entries), tuple(joins))
 
 
 def build_function(spec: GraphSpec, work: FunctionSpec, path: tuple[int, ...], build: Build) -> Callable[..., object]:
@@ -324,9 +334,9 @@ def build_function(spec: GraphSpec, work: FunctionSpec, path: tuple[int, ...], b
             case _:
                 assert_never(target.work)
 
-    def start(state: State, writer: StreamWriter) -> tuple[Execution, str]:
+    def start(state: State, writer: StreamWriter, received: str | None) -> tuple[Execution, str]:
         execution = Execution(
-            path, trace.era, state.get("origin"), state.get("clock", 0), tuple(state.get("visits", []))
+            path, trace.era, state.get("origin"), state.get("clock", 0), tuple(state.get("visits", [])), received
         )
         label = trace.begin(execution)
         writer(label)
@@ -334,25 +344,12 @@ def build_function(spec: GraphSpec, work: FunctionSpec, path: tuple[int, ...], b
         trace.fail(path, Phase.start)
         return execution, label
 
-    def finish(execution: Execution, label: str) -> Generator[None, None, object]:
+    def finish(execution: Execution, label: str) -> object:
         update = State(visits=[label], clock=1)
         result: object = update
         match work.action:
-            case WriterSpec():
+            case WriterSpec() | ReceiverSpec():
                 pass
-            case AskerSpec(questions=questions):
-                for index in range(questions if build.interactive else 0):
-                    question = json.dumps([list(path), execution.origin, execution.clock, index])
-                    answer = interrupt(question, response_schema=str)
-                    with trace.lock:
-                        if answer == trace.plain and question not in trace.consumed:
-                            trace.given[question] = answer
-                            trace.plain = None
-                    execution.given.append(trace.given.get(question))
-                    execution.received.append(answer)
-                    trace.consumed.add(question)
-                    yield
-                    trace.fail(path, Phase.answer)
             case RouterSpec() as router:
                 rounds = sum(
                     visit in trace.executions and trace.executions[visit].path == path for visit in execution.observed
@@ -371,29 +368,16 @@ def build_function(spec: GraphSpec, work: FunctionSpec, path: tuple[int, ...], b
         execution.completed = True
         return result
 
-    def act(state: State, writer: StreamWriter) -> object:
-        steps = finish(*start(state, writer))
-        while True:
-            try:
-                next(steps)
-            except StopIteration as stop:
-                return stop.value
+    def run_node(state: State, writer: StreamWriter, received: str | None) -> object:
+        return finish(*start(state, writer, received))
 
-    async def act_async(state: State, writer: StreamWriter) -> object:
+    async def run_node_async(state: State, writer: StreamWriter, received: str | None) -> object:
         for _ in range(work.pauses):
             await asyncio.sleep(0)
-        steps = finish(*start(state, writer))
-        while True:
-            for _ in range(work.late_pauses):
-                await asyncio.sleep(0)
-            try:
-                next(steps)
-            except StopIteration as stop:
-                return stop.value
-
-    is_async = work.is_async and build.async_nodes
-    if work.resource is None:
-        return act_async if is_async else act
+        started = start(state, writer, received)
+        for _ in range(work.late_pauses):
+            await asyncio.sleep(0)
+        return finish(*started)
 
     def open_resource() -> Iterator[int]:
         try:
@@ -407,19 +391,56 @@ def build_function(spec: GraphSpec, work: FunctionSpec, path: tuple[int, ...], b
         finally:
             trace.fail(path, Phase.cleanup)
 
+    def act(state: State, writer: StreamWriter) -> object:
+        return run_node(state, writer, None)
+
+    async def act_async(state: State, writer: StreamWriter) -> object:
+        return await run_node_async(state, writer, None)
+
+    def receive(state: State, writer: StreamWriter, message: Received[str]) -> object:
+        return run_node(state, writer, message)
+
+    async def receive_async(state: State, writer: StreamWriter, message: Received[str]) -> object:
+        return await run_node_async(state, writer, message)
+
+    is_async = work.is_async and build.async_nodes
+    receives = build.interactive and isinstance(work.action, ReceiverSpec)
+    if work.resource is None:
+        if receives:
+            return receive_async if is_async else receive
+        return act_async if is_async else act
+
     provider = open_resource_async if work.resource.is_async and build.async_nodes else open_resource
     scope = work.resource.scope
 
     def act_with_resource(
         state: State, writer: StreamWriter, resource: Annotated[int, Depends(provider, scope=scope)]
     ) -> object:
-        return act(state, writer)
+        return run_node(state, writer, None)
 
     async def act_async_with_resource(
         state: State, writer: StreamWriter, resource: Annotated[int, Depends(provider, scope=scope)]
     ) -> object:
-        return await act_async(state, writer)
+        return await run_node_async(state, writer, None)
 
+    def receive_with_resource(
+        state: State,
+        writer: StreamWriter,
+        message: Received[str],
+        resource: Annotated[int, Depends(provider, scope=scope)],
+    ) -> object:
+        return run_node(state, writer, message)
+
+    async def receive_async_with_resource(
+        state: State,
+        writer: StreamWriter,
+        message: Received[str],
+        resource: Annotated[int, Depends(provider, scope=scope)],
+    ) -> object:
+        return await run_node_async(state, writer, message)
+
+    if receives:
+        return receive_async_with_resource if is_async else receive_with_resource
     return act_async_with_resource if is_async else act_with_resource
 
 
@@ -592,12 +613,20 @@ async def call_in_loop[ResultT](function: Callable[[], ResultT]) -> ResultT:
     return function()
 
 
-def read_question(waiting: Interrupt) -> str:
-    match waiting.value:
-        case str() as question:
-            return question
-        case _:
-            raise AssertionError(f"Expected a question text as the value of the interrupt, got {waiting.value!r}.")
+def find_path(spec: GraphSpec, entrance: Entrance) -> tuple[int, ...]:
+    found = spec
+    path: list[int] = []
+    for name in (*(segment.node for segment in entrance.checkpoint_ns), entrance.node):
+        index = next(index for index, node in enumerate(found.nodes) if node.name == name)
+        path.append(index)
+        match found.nodes[index].work:
+            case ChildSpec(graph=graph):
+                found = graph
+            case FunctionSpec():
+                pass
+            case _ as unknown:
+                assert_never(unknown)
+    return tuple(path)
 
 
 def read_visits(values: Mapping[str, object]) -> list[str]:
@@ -646,7 +675,7 @@ class Thread:
     diverged: bool = False
     steered: bool = False
     commanded: bool = False
-    result: Finished[State] | Interrupted | None = None
+    result: Finished[State] | Waiting | Stopped | None = None
     snapshot: StateSnapshot | None = None
     history: list[StateSnapshot] = field(default_factory=list)
 
@@ -711,7 +740,7 @@ class ThreadMachine(RuleBasedStateMachine):
 
     def collect_stream(
         self,
-        run_input: State | Command[str] | None,
+        run_input: State | Command[str] | Message | None,
         fork_from: UUID | None,
         mode: CallMode,
         plan: StreamPlan,
@@ -776,8 +805,8 @@ class ThreadMachine(RuleBasedStateMachine):
             assert not values or values[-1] == newest, f"Expected the last values part {newest}, got {values[-1]}."
 
     def deliver(
-        self, run_input: State | Command[str] | None, fork_from: UUID | None, delivery: Delivery
-    ) -> Finished[State] | Interrupted | None:
+        self, run_input: State | Command[str] | Message | None, fork_from: UUID | None, delivery: Delivery
+    ) -> Finished[State] | Waiting | Stopped | None:
         graph = self.thread.graph
         mode = delivery.mode if self.thread.sync_allowed else CallMode.asynchronous
         trace = self.thread.trace
@@ -791,7 +820,7 @@ class ThreadMachine(RuleBasedStateMachine):
         known = {item.checkpoint_id for item in self.thread.history}
         stored = self.runner.run(collect(graph.aget_state_history(self.thread_id)))
         assert stored == self.thread.history, "Expected no change of the stored checkpoints between two runs."
-        result: Finished[State] | Interrupted | None = None
+        result: Finished[State] | Waiting | Stopped | None = None
         parts: list[StreamPart | ChildPart] | None = None
         raised: list[BaseException] = []
         try:
@@ -889,15 +918,34 @@ class ThreadMachine(RuleBasedStateMachine):
     def is_started(self) -> bool:
         return self.thread.snapshot is not None
 
-    def waiting(self) -> tuple[Interrupt, ...]:
-        return () if self.thread.snapshot is None else self.thread.snapshot.interrupts
+    def accepts(self) -> Mapping[Entrance, TypeForm[object]]:
+        return {} if self.thread.snapshot is None else self.thread.snapshot.accepts
 
-    def check_questions_still_wait(self, unanswered: Sequence[Interrupt]) -> None:
-        now = {
-            item.id for item in self.runner.run(self.thread.graph.aget_state(self.thread_id, subgraphs=True)).interrupts
-        }
-        lost = [item for item in unanswered if item.id not in now]
-        assert not lost, f"Expected each question without an answer to wait after the run, lost {lost}."
+    def check_entrances_still_wait(self, unanswered: Sequence[Entrance]) -> None:
+        graph = self.thread.graph
+        for entrance in unanswered:
+            level = self.runner.run(graph.aget_state(self.thread_id, checkpoint_ns=entrance.checkpoint_ns))
+            assert level.next or entrance in level.accepts, (
+                f"Expected the entrance {entrance} without a message to stay open in its graph at rest, got {level}."
+            )
+
+    def send_message(
+        self, entrance: Entrance, fork_from: UUID | None, delivery: Delivery
+    ) -> Finished[State] | Waiting | Stopped | None:
+        thread = self.thread
+        text = thread.make_text("")
+        thread.trace.delivered[text] = find_path(thread.spec, entrance)
+        thread.diverged = True
+        result = self.deliver(Message(text, entrance), fork_from, delivery)
+        match result:
+            case Finished() | Waiting():
+                received = [item for item in thread.trace.completed() if item.received == text]
+                assert received, f"Expected the node at {entrance} to receive the message {text!r} in its run."
+            case Stopped() | None:
+                pass
+            case _:
+                assert_never(result)
+        return result
 
     @rule(delivery=deliveries(), origin=st.text())
     def send_input(self, delivery: Delivery, origin: str) -> None:
@@ -910,55 +958,51 @@ class ThreadMachine(RuleBasedStateMachine):
     @precondition(is_started)
     @rule(delivery=deliveries())
     def resume(self, delivery: Delivery) -> None:
-        unanswered = self.waiting()
+        unanswered = list(self.accepts())
         self.deliver(None, None, delivery)
-        self.check_questions_still_wait(unanswered)
+        self.check_entrances_still_wait(unanswered)
 
     @precondition(is_started)
-    @rule(
-        delivery=deliveries(),
-        picks=st.lists(st.tuples(st.integers(min_value=0), st.text()), min_size=1),
-        from_newest=st.booleans(),
-    )
-    def answer(self, delivery: Delivery, picks: list[tuple[int, str]], *, from_newest: bool) -> None:
-        waiting = self.waiting()
-        event(f"answer for waiting interrupts: {bool(waiting)}")
+    @rule(delivery=deliveries(), pick=st.integers(min_value=0), from_newest=st.booleans())
+    def answer(self, delivery: Delivery, pick: int, *, from_newest: bool) -> None:
+        thread = self.thread
+        waiting = list(self.accepts())
+        event(f"message for an open entrance: {bool(waiting)}")
         if not waiting:
             return
-        answers: dict[str, str] = {}
-        for index, text in picks:
-            chosen = waiting[index % len(waiting)]
-            if chosen.id not in answers:
-                answers[chosen.id] = self.thread.make_text(text)
-        self.thread.trace.given.update(
-            {read_question(item): answers[item.id] for item in waiting if item.id in answers}
-        )
-        unanswered = [item for item in waiting if item.id not in answers]
-        newest = self.thread.history[0].checkpoint_id if from_newest else None
-        event(f"answer by id with the newest checkpoint id: {from_newest}")
-        self.deliver(Command(resume_by_interrupt_id=answers), newest, delivery)
-        self.check_questions_still_wait(unanswered)
+        chosen = waiting[pick % len(waiting)]
+        unanswered = [entrance for entrance in waiting if entrance != chosen]
+        newest = thread.history[0].checkpoint_id if from_newest else None
+        event(f"message with the newest checkpoint id: {from_newest}")
+        if from_newest and chosen.checkpoint_ns:
+            before = self.runner.run(thread.graph.aget_state(self.thread_id))
+            with pytest.raises(ValueError):
+                self.deliver(Message(thread.make_text(""), chosen), newest, delivery)
+            after = self.runner.run(thread.graph.aget_state(self.thread_id))
+            assert after == before, f"Expected a refused message to leave the state {before}, got {after}."
+            return
+        self.send_message(chosen, newest, delivery)
+        if not from_newest:
+            self.check_entrances_still_wait(unanswered)
 
     @precondition(is_started)
-    @rule(delivery=deliveries(), text=st.text())
-    def answer_plainly(self, delivery: Delivery, text: str) -> None:
+    @rule(delivery=deliveries())
+    def answer_without_an_entrance(self, delivery: Delivery) -> None:
         thread = self.thread
-        answer = thread.make_text(text)
-        event(f"plain answer for waiting interrupts: {min(len(self.waiting()), 2)}")
-        match self.waiting():
-            case []:
-                thread.trace.plain = answer
-                self.deliver(Command(resume=answer), None, delivery)
-                thread.trace.plain = None
-            case [waiting]:
-                thread.trace.given[read_question(waiting)] = answer
-                self.deliver(Command(resume=answer), None, delivery)
+        waiting = list(self.accepts())
+        event(f"message without an entrance for open entrances: {min(len(waiting), 2)}")
+        match waiting:
+            case [entrance]:
+                text = thread.make_text("")
+                thread.trace.delivered[text] = find_path(thread.spec, entrance)
+                thread.diverged = True
+                self.deliver(Message(text), None, delivery)
             case _:
                 before = self.runner.run(thread.graph.aget_state(self.thread_id))
                 with pytest.raises(ValueError):
-                    self.deliver(Command(resume=answer), None, delivery)
+                    self.deliver(Message(thread.make_text("")), None, delivery)
                 after = self.runner.run(thread.graph.aget_state(self.thread_id))
-                assert after == before, f"Expected a refused answer to leave the state {before}, got {after}."
+                assert after == before, f"Expected a refused message to leave the state {before}, got {after}."
 
     @precondition(is_started)
     @rule(delivery=deliveries(), texts=st.lists(st.text()))
@@ -988,7 +1032,7 @@ class ThreadMachine(RuleBasedStateMachine):
         event(f"goto of a command with a send: {tag is not None}")
 
         target: str | Send = node.name
-        if tag is not None:
+        if tag is not None and not receives_a_message(node):
             match node.work:
                 case FunctionSpec():
                     target = Send(node.name, State(origin=tag))
@@ -997,19 +1041,21 @@ class ThreadMachine(RuleBasedStateMachine):
                 case _:
                     assert_never(node.work)
         requested = len(thread.trace.requested)
-        unanswered = self.waiting()
+        unanswered = list(self.accepts())
         result = self.deliver(Command(goto=target), None, delivery)
-        self.check_questions_still_wait(unanswered)
+        self.check_entrances_still_wait(unanswered)
         if len(thread.trace.requested) > requested:
             return
 
         executions = list(thread.trace.executions.values())
         now = sum(execution.path[0] == index for execution in executions)
-        if result is not None and tag is not None:
+        if isinstance(result, Finished | Stopped) and tag is not None and not receives_a_message(node):
             received = [execution.path for execution in executions if execution.origin == tag]
             assert received, f"Expected the node {node.name!r} to run with the payload of the send."
             assert all(path[0] == index for path in received), f"Expected the payload only in {node.name!r}."
-        elif result is not None and not finished and not node.defer:
+        elif (
+            isinstance(result, Finished | Stopped) and not finished and not node.defer and not receives_a_message(node)
+        ):
             assert now > started, f"Expected the node {node.name!r} to run after a goto to it."
 
     @precondition(lambda self: bool(self.thread.history))
@@ -1020,27 +1066,17 @@ class ThreadMachine(RuleBasedStateMachine):
         self.thread.diverge()
         self.deliver(None, checkpoint_id, delivery)
 
-    @precondition(lambda self: bool(self.waiting()))
+    @precondition(lambda self: bool(self.accepts()))
     @rule(pick=st.integers(min_value=0))
     def answer_with_a_wrong_type(self, pick: int) -> None:
         thread = self.thread
-        waiting = self.waiting()
+        waiting = list(self.accepts())
         chosen = waiting[pick % len(waiting)]
-        faults, shutdowns = dict(thread.trace.faults), dict(thread.trace.shutdowns)
-        thread.trace.faults.clear()
-        thread.trace.shutdowns.clear()
-        with pytest.raises((ValidationError, ExceptionGroup)) as caught:
-            self.runner.run(
-                thread.graph.ainvoke(
-                    Command[str](resume_by_interrupt_id={chosen.id: 0}), self.thread_id, step_limit=1000
-                )
-            )
-        thread.trace.faults.update(faults)
-        thread.trace.shutdowns.update(shutdowns)
-        found = [item for item in find_errors(caught.value) if isinstance(item, ValidationError)]
-        assert found, f"Expected a validation error for the answer 0 to {chosen}."
-        thread.result = None
-        self.check_questions_still_wait(waiting)
+        before = self.runner.run(thread.graph.aget_state(self.thread_id, subgraphs=True))
+        with pytest.raises(ValidationError):
+            self.runner.run(thread.graph.ainvoke(Message(0, chosen), self.thread_id, step_limit=1000))
+        after = self.runner.run(thread.graph.aget_state(self.thread_id, subgraphs=True))
+        assert after == before, f"Expected a refused message to leave the state {before}, got {after}."
 
     @precondition(is_started)
     @rule()
@@ -1166,6 +1202,8 @@ class ThreadMachine(RuleBasedStateMachine):
                         pass
                     case _ as unknown:
                         assert_never(unknown)
+        guessed_past_a_wait = node is None and len(spec.nodes) > 1 and any(map(receives_a_message, spec.nodes))
+        event(f"state update without a node in a graph with a node that waits: {guessed_past_a_wait}")
         thread.diverge()
         thread.steered = True
         thread.commanded = True
@@ -1208,12 +1246,14 @@ class ThreadMachine(RuleBasedStateMachine):
                 case _ as unknown:
                     assert_never(unknown)
         except ValueError:
-            assert writer is None, f"Expected the update as the node {writer!r} to be accepted."
+            assert writer is None or guessed_past_a_wait, f"Expected the update as the node {writer!r} to be accepted."
             updated = False
 
         after = self.runner.run(graph.aget_state(self.thread_id, checkpoint_ns=before.checkpoint_ns))
         event(f"state update without a node after a step of several nodes: {unclear}")
-        assert not (updated and unclear), "Expected an update without a node after a step of several nodes to raise."
+        assert not (updated and unclear) or guessed_past_a_wait, (
+            "Expected an update without a node after a step of several nodes to raise."
+        )
         if not updated:
             assert after == newest, f"Expected a refused update to leave the state {newest}, got {after}."
             return
@@ -1233,8 +1273,12 @@ class ThreadMachine(RuleBasedStateMachine):
             TypeAdapter(int).validate_python(result.get("clock", 0)) for result in finished
         )
         assert after.values.get("clock", 0) == clock, f"Expected the clock {clock}, got {after.values}."
-        if writer is not None:
-            targets = {spec.nodes[target].name for target in writer.targets if not spec.nodes[target].defer}
+        if writer is not None and not guessed_past_a_wait:
+            targets = {
+                spec.nodes[target].name
+                for target in writer.targets
+                if not spec.nodes[target].defer and not receives_a_message(spec.nodes[target])
+            }
             assert targets <= set(after.next), f"Expected {targets} among the next nodes, got {after.next}."
 
     @precondition(is_started)
@@ -1243,45 +1287,41 @@ class ThreadMachine(RuleBasedStateMachine):
         thread = self.thread
         delivery = Delivery(CallMode.asynchronous, None)
         result = None if thread.trace.faults else thread.result
-        answered: set[str] = set()
         while True:
             match result:
                 case Finished():
                     break
-                case Interrupted() | None:
+                case Waiting() | Stopped() | None:
                     pass
                 case _:
                     assert_never(result)
             snapshot = self.runner.run(thread.graph.aget_state(self.thread_id))
+            trace = thread.trace
             progress = (
                 snapshot.checkpoint_id,
-                snapshot.interrupts,
-                len(thread.trace.fired),
-                len(thread.trace.consumed),
-                len(thread.trace.shutdowns),
+                snapshot.accepts,
+                len(trace.fired),
+                len(trace.completed()),
+                len(trace.shutdowns),
             )
-            again = [item for item in snapshot.interrupts if item.id in answered]
-            assert not again, f"Expected no question to wait again after its answer, got {again}."
-            answers = {item.id: thread.make_text("") for item in snapshot.interrupts}
-            thread.trace.given.update({read_question(item): answers[item.id] for item in snapshot.interrupts})
-            trace = thread.trace
-            stops = (len(trace.fired), len(trace.requested), trace.aborts)
-            result = self.deliver(Command(resume_by_interrupt_id=answers) if answers else None, None, delivery)
-            if (len(trace.fired), len(trace.requested), trace.aborts) == stops:
-                answered.update(answers)
+            entrances = list(snapshot.accepts)
+            if entrances:
+                result = self.send_message(entrances[0], None, delivery)
+            else:
+                result = self.deliver(None, None, delivery)
             match result:
                 case Finished():
                     pass
-                case Interrupted() | None:
+                case Waiting() | Stopped() | None:
                     snapshot = self.runner.run(thread.graph.aget_state(self.thread_id))
                     now = (
                         snapshot.checkpoint_id,
-                        snapshot.interrupts,
-                        len(thread.trace.fired),
-                        len(thread.trace.consumed),
-                        len(thread.trace.shutdowns),
+                        snapshot.accepts,
+                        len(trace.fired),
+                        len(trace.completed()),
+                        len(trace.shutdowns),
                     )
-                    assert now != progress, f"Expected a run with all answers to change the thread, got {result} again."
+                    assert now != progress, f"Expected a run to change the thread, got {result} again."
                 case _:
                     assert_never(result)
 
@@ -1327,7 +1367,7 @@ class ThreadMachine(RuleBasedStateMachine):
         event(
             f"ran a deferred node: {ran(lambda graph: [index for index, node in enumerate(graph.nodes) if node.defer])}"
         )
-        event(f"received an answer: {any(item.received for item in completed)}")
+        event(f"received a message: {any(item.received is not None for item in completed)}")
         event(f"failed a node: {bool(thread.trace.fired)}")
         event(f"diverged from the plain run: {thread.diverged}")
 
@@ -1360,12 +1400,13 @@ class ThreadMachine(RuleBasedStateMachine):
                 unfired = [] if thread.steered else find_unfired_joins(thread.spec, thread.trace)
                 assert not unfired, f"Expected the target of each join to run after all its sources, not {unfired}."
                 assert snapshot.next == (), f"Expected no next node after the end, got {snapshot.next}."
+                assert snapshot.accepts == {}, f"Expected no open entrance after the end, got {snapshot.accepts}."
                 assert snapshot.values == output, f"Expected the output {output}, got {snapshot.values}."
-            case Interrupted(interrupts=interrupts, values=values):
+            case Waiting(values=values, accepts=accepts):
                 assert snapshot.values == values, f"Expected the values {values}, got {snapshot.values}."
-                assert {item.id for item in snapshot.interrupts} == {item.id for item in interrupts}, (
-                    f"Expected the interrupts {interrupts}, got {snapshot.interrupts}."
-                )
+                assert snapshot.accepts == accepts, f"Expected the entrances {accepts}, got {snapshot.accepts}."
+            case Stopped(values=values):
+                assert snapshot.values == values, f"Expected the values {values}, got {snapshot.values}."
             case None:
                 pass
             case _ as unknown:
@@ -1382,17 +1423,27 @@ class ThreadMachine(RuleBasedStateMachine):
                 f"Expected a deferred node to wait until no other node runs, got the tasks {level.tasks}."
             )
 
-        for waiting in snapshot.interrupts:
-            assert read_question(waiting) not in thread.trace.consumed, (
-                f"Expected no second question for an answer that a node received, got {waiting}."
-            )
         completed = thread.trace.completed()
         keys = Counter((item.path, item.era, item.origin, item.clock) for item in completed)
         repeated = [key for key, count in keys.items() if count > 1]
         assert not repeated, f"Expected each task to finish one time, got more for {repeated}."
+        messages = Counter((item.era, item.received) for item in completed if item.received is not None)
+        repeated_messages = [key for key, count in messages.items() if count > 1]
+        assert not repeated_messages, f"Expected each message to reach one node execution, got {repeated_messages}."
         for item in completed:
-            assert item.received == item.given, (
-                f"Expected the answers {item.given} for {item.path}, got {item.received}."
+            if item.received is not None:
+                expected_path = thread.trace.delivered.get(item.received)
+                assert item.path == expected_path, (
+                    f"Expected the message {item.received!r} at {expected_path}, got it at {item.path}."
+                )
+        for level in [snapshot, *find_namespaces(snapshot)]:
+            receivers = {
+                node.name for node in find_spec(thread.spec, level.checkpoint_ns).nodes if receives_a_message(node)
+            }
+            offered = {entrance.node for entrance in level.accepts if entrance.checkpoint_ns == level.checkpoint_ns}
+            assert offered <= receivers, f"Expected only nodes that receive a message as entrances, got {offered}."
+            assert not (level.next and offered), (
+                f"Expected a graph with the next nodes {level.next} to offer no entrance of its own, got {offered}."
             )
 
 

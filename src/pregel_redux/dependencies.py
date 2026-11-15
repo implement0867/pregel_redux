@@ -13,6 +13,10 @@ from enum import Enum
 from types import TracebackType
 from typing import Annotated, TypeAliasType, get_args, get_origin
 
+from typing_extensions import TypeForm
+
+from pregel_redux.channels import Stored, substitute_type_arguments
+
 
 class Scope(Enum):
     node = "node"
@@ -27,20 +31,29 @@ class Depends:
 
 class NodeValue(Enum):
     state = "state"
+    received = "received"
 
 
 type StateDep[StateT] = Annotated[StateT, NodeValue.state]
+type Received[MessageT] = Annotated[MessageT, NodeValue.received]
 type Supplied = NodeValue | type[object]
 type Request = Depends | Supplied
 
 
-def expand_alias(annotation: object) -> object:
+def expand_alias[HintT](annotation: HintT) -> HintT:
     match annotation:
         case TypeAliasType():
             return expand_alias(annotation.__value__)
         case _:
             origin = get_origin(annotation)
-            return expand_alias(origin) if isinstance(origin, TypeAliasType) else annotation
+            match origin:
+                case TypeAliasType():
+                    arguments: dict[object, TypeForm[object]] = dict(
+                        zip(origin.__type_params__, get_args(annotation), strict=True)
+                    )
+                    return expand_alias(substitute_type_arguments(origin.__value__, arguments))
+                case _:
+                    return annotation
 
 
 @dataclass(frozen=True)
@@ -57,6 +70,7 @@ class CallPlan:
     parameters: Mapping[str, Request]
     run_providers: tuple[ResolvedProvider, ...]
     node_providers: tuple[ResolvedProvider, ...]
+    received: TypeForm[object] | None
 
 
 def read_request(
@@ -90,6 +104,22 @@ def read_dependency_parameters(
     if len(parameters) < state_parameters:
         raise TypeError(f"{function!r} must accept the state as its first parameter")
     return {parameter.name: read_request(function, parameter, supplied) for parameter in parameters[state_parameters:]}
+
+
+def read_received_annotation(
+    function: Callable[..., object], requests: Mapping[str, Request]
+) -> TypeForm[object] | None:
+    parameters = inspect.signature(function, eval_str=True).parameters
+    annotations = [
+        expand_alias(parameters[name].annotation) for name, request in requests.items() if request is NodeValue.received
+    ]
+    match annotations:
+        case []:
+            return None
+        case [first, *others] if all(other == first for other in others):
+            return first
+        case _:
+            raise TypeError(f"{function!r} receives its message as more than one type: {annotations!r}")
 
 
 async def finish_despite_cancellation[ResultT](work: Awaitable[ResultT]) -> ResultT:
@@ -231,11 +261,19 @@ def plan_call(
                 resolve_provider(request, overrides, supplied, resolved, ())
             case _:
                 pass
+    received = read_received_annotation(function, parameters)
+    readers = [item.function for item in resolved.values() if NodeValue.received in item.parameters.values()]
+    if received is None and readers:
+        raise TypeError(
+            f"the dependencies {readers!r} of {function!r} request the received message, "
+            f"and {function!r} has no Received parameter that gives its type"
+        )
     return CallPlan(
         function,
         parameters,
         run_providers=tuple(item for item in resolved.values() if item.request.scope is Scope.run),
         node_providers=tuple(item for item in resolved.values() if item.request.scope is Scope.node),
+        received=received,
     )
 
 
@@ -250,9 +288,15 @@ async def open_providers(
 
 
 async def execute_plan(
-    plan: CallPlan, state: object, values: MutableMapping[Request, object], exits: AsyncExitStack
+    plan: CallPlan,
+    state: object,
+    received: Stored[object] | None,
+    values: MutableMapping[Request, object],
+    exits: AsyncExitStack,
 ) -> object:
     values[NodeValue.state] = state
+    if received is not None:
+        values[NodeValue.received] = received.value
     await open_providers(plan.node_providers, values, exits)
     return await call_without_blocking(
         plan.function, state, **{name: values[request] for name, request in plan.parameters.items()}

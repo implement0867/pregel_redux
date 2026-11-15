@@ -15,11 +15,12 @@ from pregel_redux import (
     Endpoint,
     Finished,
     InMemoryCheckpointer,
-    Interrupted,
     PersistentGraph,
     Reducer,
     Send,
     StateGraph,
+    Stopped,
+    Waiting,
 )
 from pregel_redux.checkpoints import PendingWrite
 from pregel_redux.snapshots import FailedTask, FinishedTask
@@ -439,7 +440,7 @@ def test_resume_does_not_run_a_node_that_finished_in_the_failed_step(finished_no
     """
     calls: list[str] = []
 
-    async def run_thread() -> Finished[Output] | Interrupted:
+    async def run_thread() -> Finished[Output] | Waiting | Stopped:
         saved = threading.Event()
         failures: list[Exception] = [ConnectionError("no network")]
 
@@ -523,7 +524,7 @@ def test_checkpoints_of_a_thread_form_a_chain_in_the_order_of_their_ids(runs: in
     """
     Arrange: a graph with a checkpointer.
     Act: run the graph on one thread a number of times.
-    Assert: each checkpoint has format version 1, a greater id than the one before it, and that one as its parent.
+    Assert: each checkpoint has format version 2, a greater id than the one before it, and that one as its parent.
     """
     checkpointer = InMemoryCheckpointer()
     graph = build_joke_graph(checkpointer, [], [])
@@ -537,7 +538,7 @@ def test_checkpoints_of_a_thread_form_a_chain_in_the_order_of_their_ids(runs: in
     versions = {checkpoint.v for checkpoint in stored}
     assert ids == sorted(set(ids)), f"Expected ids that increase, got {ids}."
     assert parents == [None, *ids[:-1]], f"Expected each parent to be the checkpoint before, got {parents}."
-    assert versions == {1}, f"Expected format version 1, got {versions}."
+    assert versions == {2}, f"Expected format version 2, got {versions}."
 
 
 def test_latest_checkpoint_is_the_one_with_the_greatest_id() -> None:
@@ -568,7 +569,7 @@ def test_latest_checkpoint_is_the_one_with_the_greatest_id() -> None:
 
 def test_checkpoint_of_another_format_version_is_rejected() -> None:
     """
-    Arrange: a thread whose stored records have format version 2.
+    Arrange: a thread whose stored records have format version 1.
     Act: run the thread again without an input.
     Assert: the run raises the ValidationError of Pydantic.
     """
@@ -576,7 +577,7 @@ def test_checkpoint_of_another_format_version_is_rejected() -> None:
     graph = build_joke_graph(checkpointer, [], [])
     asyncio.run(graph.ainvoke({"topics": ["cats"]}, "thread"))
     records = checkpointer.threads["thread"][""]
-    checkpointer.threads["thread"][""] = {key: record.replace('"v":1', '"v":2') for key, record in records.items()}
+    checkpointer.threads["thread"][""] = {key: record.replace('"v":2', '"v":1') for key, record in records.items()}
 
     with pytest.raises(ValidationError):
         asyncio.run(graph.ainvoke(None, "thread"))
@@ -614,7 +615,7 @@ def test_failure_of_a_node_lets_the_other_nodes_of_its_step_finish() -> None:
     saved = {task.name: task.status for task in asyncio.run(graph.aget_state("thread")).tasks}
     actual = asyncio.run(graph.ainvoke(None, "thread"))
 
-    expected = {"fail": FailedTask("ConnectionError()", ()), "slow": FinishedTask({"jokes": ["slow"]})}
+    expected = {"fail": FailedTask("ConnectionError()", {}), "slow": FinishedTask({"jokes": ["slow"]})}
     assert saved == expected, f"Expected the error of one node and the result of the slow node, got {saved}."
     assert actual == Finished(Output(jokes=["repaired", "slow"])), f"Expected the two writes, got {actual}."
     assert calls.count("slow") == 1, f"Expected the slow node to run one time, got {calls}."
