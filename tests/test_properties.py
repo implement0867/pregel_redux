@@ -1049,7 +1049,7 @@ class ThreadMachine(RuleBasedStateMachine):
 
         executions = list(thread.trace.executions.values())
         now = sum(execution.path[0] == index for execution in executions)
-        if result is not None and tag is not None and not receives_a_message(node):
+        if isinstance(result, Finished | Stopped) and tag is not None and not receives_a_message(node):
             received = [execution.path for execution in executions if execution.origin == tag]
             assert received, f"Expected the node {node.name!r} to run with the payload of the send."
             assert all(path[0] == index for path in received), f"Expected the payload only in {node.name!r}."

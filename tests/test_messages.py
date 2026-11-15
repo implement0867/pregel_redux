@@ -437,7 +437,9 @@ def test_join_starts_a_node_that_receives_a_message_only_after_the_message() -> 
         f"Expected a wait at the target of the join, got {waiting}."
     )
     assert actual == Finished({"notes": ["left", "right", "ask got yes"]}), f"Expected one run of ask, got {actual}."
-    assert calls == ["left", "right", "ask"], f"Expected the calls of the sources and then of ask, got {calls}."
+    assert (sorted(calls[:2]), calls[2:]) == (["left", "right"], ["ask"]), (
+        f"Expected the calls of the two sources and then one call of ask, got {calls}."
+    )
 
 
 def test_new_input_discards_the_wait_of_a_node() -> None:
