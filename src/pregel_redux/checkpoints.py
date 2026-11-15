@@ -9,12 +9,12 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, Typ
 
 
 class CheckpointSource(Enum):
-    """Names the action that saved a checkpoint.
+    """Classifies checkpoints by the action that saved them.
 
-    `input` marks the start of a run.
-    `loop` marks a step of a run.
-    `update` marks a call to `PersistentGraph.update_state`.
-    `fork` marks a run that continues from `fork_from`.
+    The start of a run saves an `input` checkpoint.
+    Each step saves a `loop` checkpoint.
+    `PersistentGraph.update_state` saves an `update` checkpoint.
+    A run with `fork_from` saves a `fork` checkpoint.
     """
 
     input = "input"
@@ -144,10 +144,7 @@ class ChannelVersions(Record):
 
 
 class Checkpoint(Record):
-    """Holds the saved state of one graph at one step of a thread.
-
-    A checkpointer stores the checkpoint as JSON.
-    """
+    """Records the state of one graph at one step of a thread."""
 
     v: Literal[2] = 2
     id: UUID
@@ -163,15 +160,13 @@ class Checkpoint(Record):
 
 
 class CheckpointTuple(Record):
-    """Holds a checkpoint and the results of the tasks that ran after the checkpoint."""
+    """Pairs a checkpoint with the `pending_writes` of the tasks that ran after the checkpoint."""
 
     checkpoint: Checkpoint
     pending_writes: tuple[PendingWrite, ...]
 
 
 class AsyncCheckpointer(Protocol):
-    """Defines the asynchronous form of `Checkpointer`."""
-
     async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None: ...
     async def aput_writes(
         self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite
@@ -186,9 +181,8 @@ class AsyncCheckpointer(Protocol):
 
 
 class Checkpointer(Protocol):
-    """Stores the checkpoints of each thread.
+    """Receives calls from worker threads of the graph.
 
-    The graph calls each method from a worker thread.
     Several calls run at the same time.
     """
 
@@ -207,7 +201,7 @@ class Checkpointer(Protocol):
         Raises
         ------
         KeyError
-            The checkpoint `checkpoint_id` is absent.
+            `checkpoint_id` differs from each stored checkpoint id.
         """
         ...
 
@@ -215,7 +209,6 @@ class Checkpointer(Protocol):
         """Returns the checkpoint `checkpoint_id` with its writes.
 
         `checkpoint_id` of `None` selects the checkpoint with the greatest id.
-        Returns `None` for an absent checkpoint.
         """
         ...
 
@@ -228,8 +221,6 @@ class Checkpointer(Protocol):
         ----------
         before
             Selects the checkpoints with an id less than `before`.
-        limit
-            The maximum number of checkpoints.
         """
         ...
 
@@ -268,7 +259,7 @@ class ThreadedCheckpointer:
 
 @dataclass
 class InMemoryCheckpointer:
-    """Stores checkpoints as JSON in the memory of the process."""
+    """Stores checkpoints for the lifetime of the process."""
 
     threads: dict[str, dict[str, dict[UUID, str]]] = field(default_factory=dict)
     pending: dict[tuple[str, str, UUID], dict[PendingKey, str]] = field(default_factory=dict)

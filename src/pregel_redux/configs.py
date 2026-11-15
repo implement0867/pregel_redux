@@ -5,7 +5,7 @@ from uuid import UUID
 
 @dataclass(frozen=True)
 class Segment:
-    """Identifies one child graph run by the parent node and the task that runs the child graph."""
+    """Identifies one subgraph run by the parent node and the task that runs the subgraph."""
 
     node: str
     task_id: str

@@ -9,7 +9,7 @@ from pregel_redux.messages import Entrance
 
 @dataclass(frozen=True)
 class Finished[OutputT]:
-    """Holds the output of a run that reached its end.
+    """`ainvoke` returns `Finished` for a run that reached its end.
 
     `output` is an instance of the output schema of the graph.
     """
@@ -19,14 +19,10 @@ class Finished[OutputT]:
 
 @dataclass(frozen=True)
 class Waiting:
-    """Holds the state of a run whose nodes wait for a message.
+    """`ainvoke` returns `Waiting` for a run whose nodes wait for a message.
 
     A `Message` continues the run.
-
-    Attributes
-    ----------
-    accepts
-        Maps each waiting node to the type of the message that it receives.
+    `accepts` maps each waiting node to its message type.
     """
 
     values: Mapping[str, object]
@@ -34,10 +30,10 @@ class Waiting:
 
 
 class StopReason(Enum):
-    """Names the cause of a `Stopped` run.
+    """Classifies the cause of a `Stopped` run.
 
-    `breakpoint` marks a node in `interrupt_before` or `interrupt_after`.
-    `shutdown` marks a shutdown request from the shutdown signal of the run.
+    A node in `interrupt_before` or `interrupt_after` causes a `breakpoint` stop.
+    A shutdown request from the shutdown signal of the run causes a `shutdown` stop.
     """
 
     breakpoint = "breakpoint"
@@ -46,7 +42,7 @@ class StopReason(Enum):
 
 @dataclass(frozen=True)
 class Stopped:
-    """Holds the state of a run that stopped before its end.
+    """`ainvoke` returns `Stopped` for a run that stopped before its end.
 
     A later run on the same thread with the input `None` continues from the stop.
     """

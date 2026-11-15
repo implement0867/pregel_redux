@@ -182,7 +182,7 @@ class CompiledNode:
 
 @dataclass(frozen=True)
 class CompiledGraph[StateT, InputT, OutputT]:
-    """Runs a graph without checkpoints."""
+    """Runs a graph in memory from its input to its output."""
 
     output_schema: Callable[..., OutputT]
     channels: Mapping[str, Channel]
@@ -196,13 +196,8 @@ class CompiledGraph[StateT, InputT, OutputT]:
         Parameters
         ----------
         step_limit
-            The maximum number of steps.
-            The default comes from the `PREGEL_REDUX_STEP_LIMIT` environment variable and is 25 when it is absent.
-
-        Raises
-        ------
-        RuntimeError
-            The run exceeds `step_limit`, waits for a message, or reaches a breakpoint.
+            The `PREGEL_REDUX_STEP_LIMIT` environment variable sets the default.
+            The built-in default is 25.
         """
         return await self.run_without_thread(input, step_limit, Stream(lambda part: None))
 
@@ -256,12 +251,10 @@ class CompiledGraph[StateT, InputT, OutputT]:
         *,
         step_limit: int | None = None,
     ) -> Generator[StreamPart | ChildPart]:
-        """Runs `astream` in a new event loop.
+        """Runs the graph on `input` and yields each part that the run emits.
 
-        Raises
-        ------
-        TypeError
-            A node is a coroutine function.
+        Each iteration blocks until the run emits the next part.
+        A coroutine node function raises `TypeError`.
         """
         self.reject_async_nodes("astream")
         return iterate_in_new_loop(lambda: self.astream(input, step_limit=step_limit))
@@ -285,12 +278,10 @@ class CompiledGraph[StateT, InputT, OutputT]:
             raise TypeError(f"nodes {async_nodes!r} have only an async function, so call {async_method}")
 
     def invoke(self, input: InputT, *, step_limit: int | None = None) -> OutputT:
-        """Runs `ainvoke` in a new event loop.
+        """Runs the graph on `input` and returns the output.
 
-        Raises
-        ------
-        TypeError
-            A node is a coroutine function.
+        The call blocks until the run ends.
+        A coroutine node function raises `TypeError`.
         """
         self.reject_async_nodes("ainvoke")
         return run_in_new_loop(lambda: self.ainvoke(input, step_limit=step_limit))

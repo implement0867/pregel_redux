@@ -31,10 +31,11 @@ class Scope(Enum):
 
 @dataclass(frozen=True)
 class Depends:
-    """Marks a node parameter for the value that `dependency` provides.
+    """Requests the value that `dependency` provides for a node parameter.
 
     The graph calls `dependency` with the values of its own parameters.
-    A generator function provides its first yielded value and runs its remaining code at the end of `scope`.
+    A generator function provides its first yielded value.
+    The remaining code of a generator function runs at the end of `scope`.
     A synchronous function runs in a worker thread.
 
     Parameters

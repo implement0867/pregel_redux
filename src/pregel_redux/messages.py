@@ -8,7 +8,7 @@ from pregel_redux.configs import Namespace
 
 @dataclass(frozen=True)
 class Entrance:
-    """Identifies a node that waits for a message and the graph that holds the node."""
+    """Identifies a node that waits for a message and the graph or subgraph that holds the node."""
 
     checkpoint_ns: Namespace
     node: str

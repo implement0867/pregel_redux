@@ -55,10 +55,7 @@ def read_tuple(session: Session, row: CheckpointRow) -> CheckpointTuple:
 class SqliteCheckpointer:
     """Stores checkpoints in a SQLite database file.
 
-    Raises
-    ------
-    ValueError
-        `engine` uses a `StaticPool` or an in-memory database.
+    Accepts an `engine` of a database file with a pool that opens one connection per thread.
     """
 
     engine: Engine

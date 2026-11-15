@@ -48,19 +48,16 @@ class Join:
 class StateGraph[StateT, InputT, OutputT]:
     """Builds a graph of nodes that read and write one shared state.
 
-    Each field of the schemas is a channel of the state.
     Each schema is a `TypedDict`, a dataclass or a Pydantic model.
 
     Parameters
     ----------
-    state_schema
-        The fields that the nodes read and write.
     input_schema
         The fields that the run input writes.
-        The default `input_schema` is `state_schema`.
+        The default is `state_schema`.
     output_schema
         The fields of the run output.
-        The default `output_schema` is `state_schema`.
+        The default is `state_schema`.
     """
 
     @overload
@@ -102,10 +99,10 @@ class StateGraph[StateT, InputT, OutputT]:
         input_schema: type[object] | None = None,
         defer: bool = False,
     ) -> None:
-        """Adds a node function or a child graph under `name`.
+        """Adds a node function or a subgraph under `name`.
 
         A node function receives the state as its first parameter.
-        Each other parameter requests a value through `Depends`, `Received`, `StreamWriter`, `RunTarget` or `ShutdownSignal`.
+        Each other parameter requests an injected value.
         The node function returns a state update or a `Command`.
 
         Parameters
@@ -115,10 +112,14 @@ class StateGraph[StateT, InputT, OutputT]:
         defer
             A deferred node runs after each other pending node finishes.
 
-        Raises
-        ------
-        ValueError
-            `name` is a node of the graph, is `__start__`, or contains `|` or `:`.
+        Examples
+        --------
+        >>> def summarize(
+        ...     state: State, client: Annotated[Client, Depends(open_client)], write: StreamWriter
+        ... ) -> Command[Literal["review"]]:
+        ...     write("summarizing")
+        ...     return Command(update={"summary": client.summarize(state["text"])}, goto="review")
+        >>> graph.add_node("summarize", summarize)
         """
         if name in self.nodes or name in self.child_graphs:
             raise ValueError(f"node {name!r} is already in this graph")
@@ -154,7 +155,6 @@ class StateGraph[StateT, InputT, OutputT]:
 
     @property
     def dependencies(self) -> frozenset[Callable[..., object]]:
-        """Returns each dependency function that the nodes and the child graphs request."""
         plans = [plan_call(node, {}, list_supplied(persistent=True)) for node in self.nodes.values()]
         return frozenset(
             item.request.dependency for plan in plans for item in (*plan.run_providers, *plan.node_providers)
@@ -184,28 +184,8 @@ class StateGraph[StateT, InputT, OutputT]:
         """Checks the graph and returns a graph that runs.
 
         A `checkpointer` selects a `PersistentGraph`, which saves a checkpoint after each step.
-
-        Parameters
-        ----------
-        dependency_overrides
-            Maps each dependency function to its replacement.
-        checkpointer
-            Stores the checkpoints of each thread.
-        interrupt_before
-            The nodes before which the run stops.
-            `"*"` selects each node.
-        interrupt_after
-            The nodes after which the run stops.
-            `"*"` selects each node.
-
-        Raises
-        ------
-        ValueError
-            An edge or a declared target refers to an unknown node.
-            The graph has zero edges from `Endpoint.start`.
-            A node receives a message in a graph without a `checkpointer`.
-        TypeError
-            A node parameter lacks a `Depends` annotation and a supplied type.
+        A run stops before each node in `interrupt_before` and after each node in `interrupt_after`.
+        `"*"` selects each node.
         """
         graph = self.compile_graph(dependency_overrides, list_supplied(persistent=checkpointer is not None))
         if checkpointer is None:

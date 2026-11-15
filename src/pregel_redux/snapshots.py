@@ -13,21 +13,24 @@ from pregel_redux.task_refs import TaskRef
 
 @dataclass(frozen=True)
 class PendingTask:
-    """Marks a task that waits to run."""
+    pass
 
 
 @dataclass(frozen=True)
 class FinishedTask:
-    """Holds the state writes of a task that returned."""
+    """`TaskSnapshot.status` is `FinishedTask` for a task that returned.
+
+    `result` maps each field that the task wrote to its value.
+    """
 
     result: Mapping[str, object]
 
 
 @dataclass(frozen=True)
 class WaitingTask:
-    """Marks a task whose child graph waits for a message.
+    """`TaskSnapshot.status` is `WaitingTask` for a task whose subgraph waits for a message.
 
-    `accepts` maps each waiting node of the child graph to its message type.
+    `accepts` maps each waiting node of the subgraph to its message type.
     """
 
     accepts: Mapping[Entrance, TypeForm[object]]
@@ -35,9 +38,10 @@ class WaitingTask:
 
 @dataclass(frozen=True)
 class FailedTask:
-    """Holds the error of a task that raised an exception.
+    """`TaskSnapshot.status` is `FailedTask` for a task that raised an exception.
 
-    `accepts` maps each waiting node of the child graph of the task to its message type.
+    `error` is the `repr` of the exception.
+    `accepts` maps each waiting node of the subgraph to its message type.
     """
 
     error: str
@@ -54,7 +58,7 @@ class TaskSnapshot:
     Attributes
     ----------
     state
-        The snapshot of the child graph that the task runs.
+        The snapshot of the subgraph that the task runs.
         `state` is `None` for a node function and for a snapshot read with `subgraphs` set to `False`.
     """
 
@@ -77,7 +81,7 @@ class StateSnapshot:
     tasks
         The tasks of the next step.
     accepts
-        Maps each waiting node to the type of the message that it receives.
+        Maps each waiting node to its message type.
     """
 
     values: Mapping[str, object]

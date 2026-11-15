@@ -11,14 +11,14 @@ from pregel_redux.snapshots import StateSnapshot
 
 @dataclass(frozen=True)
 class ValuesPart:
-    """Holds each state value after a step."""
+    """Follows each step with each state value and precedes each `StoppedPart`."""
 
     values: Mapping[str, object]
 
 
 @dataclass(frozen=True)
 class UpdatesPart:
-    """Holds the state writes of one node after the node returns."""
+    """Follows each node that returns."""
 
     node: str
     update: Mapping[str, object]
@@ -26,35 +26,35 @@ class UpdatesPart:
 
 @dataclass(frozen=True)
 class WaitingPart:
-    """Marks the end of a run whose nodes wait for a message."""
+    """Ends the stream of a run whose nodes wait for a message."""
 
     accepts: Mapping[Entrance, TypeForm[object]]
 
 
 @dataclass(frozen=True)
 class StoppedPart:
-    """Marks the end of a run that stopped before its end."""
+    """Ends the stream of a stopped run."""
 
     reason: StopReason
 
 
 @dataclass(frozen=True)
 class CustomPart:
-    """Holds the value that a node passes to its `StreamWriter`."""
+    """Follows each call to a `StreamWriter`."""
 
     data: object
 
 
 @dataclass(frozen=True)
 class CheckpointPart:
-    """Holds the snapshot of each saved checkpoint of a `PersistentGraph`."""
+    """Follows each checkpoint that a `PersistentGraph` saves."""
 
     state: StateSnapshot
 
 
 @dataclass(frozen=True)
 class TaskStartPart:
-    """Holds the input of a node task before the task runs."""
+    """Precedes each node task."""
 
     id: str
     name: str
@@ -63,7 +63,7 @@ class TaskStartPart:
 
 @dataclass(frozen=True)
 class TaskResultPart:
-    """Holds the state writes of a node task after the task returns."""
+    """Follows each node task that returns."""
 
     id: str
     name: str
@@ -77,10 +77,7 @@ type StreamPart = (
 
 @dataclass(frozen=True)
 class ChildPart:
-    """Wraps a part that a child graph emits.
-
-    `ns` identifies the child graph.
-    """
+    """Prefixes a part that a subgraph emits with the namespace `ns` of the subgraph."""
 
     ns: tuple[Segment, *tuple[Segment, ...]]
     part: StreamPart

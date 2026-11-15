@@ -8,7 +8,7 @@ from pregel_redux.channels import extract_writes
 
 
 class Endpoint(Enum):
-    """Marks the start and the end of a graph in edges and in `Command.goto`."""
+    """Replaces a node name in `StateGraph.add_edge` and in `Command.goto`."""
 
     start = "start"
     end = "end"
@@ -42,9 +42,8 @@ class Command[NameT: str]:
         A dataclass instance writes each field that differs from its default.
         A Pydantic model writes each field that the caller set.
     goto
-        Node names, `Send` objects and `Endpoint.end`.
         The node names add to the static edges of the node.
-        `Endpoint.end` adds zero targets.
+        `Endpoint.end` leaves the targets unchanged.
     """
 
     update: object = None
