@@ -29,6 +29,7 @@
 - (Pydantic OR Dataclass) prefer over (Namedtuple) prefer over (TypedDict OR dict[str, object]) prefer over (dict).
 - When working with a domain object that passes through stages where some fields are only valid at certain stages, design a type (Pydantic or dataclass) for each stage such that invariant violations are impossible to represent.
 - Parse, don't validate: parse data at the boundary into a type that records what was checked. Don't add a fallback value to satisfy a type, because the fallback shows the type is wrong.
+- Never write a function whose body only raises as a marker or a placeholder for a value that other code supplies. Request such a value by its type.
 - No `_` prefixes on code you write. That includes functions, classes, variables
 - Lowercase enum member names.
 - Module level constants should not be your first choice.

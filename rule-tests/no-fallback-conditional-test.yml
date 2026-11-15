@@ -1,0 +1,14 @@
+id: no-fallback-conditional
+valid:
+  - "modes = parse_modes(stream_mode)"
+  - "limit = default if limit is None else limit"
+  - "total = 0 if count == 0 else compute(count)"
+  - "origin = expand(origin) if isinstance(origin, Alias) else annotation"
+invalid:
+  - "modes = frozenset([mode] if isinstance(mode, StreamMode) else mode)"
+  - "modes = [mode] if isinstance(mode, StreamMode) else list(mode)"
+  - "modes = mode if not isinstance(mode, StreamMode) else [mode]"
+  - "error = status.error if isinstance(status, FailedTask) else None"
+  - "questions = asked.interrupts if isinstance(asked, Interrupted) else ()"
+  - "before = names if interrupt_before == '*' else frozenset(interrupt_before)"
+  - "before = frozenset(interrupt_before) if interrupt_before != '*' else names"

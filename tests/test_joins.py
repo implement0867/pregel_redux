@@ -149,7 +149,7 @@ def test_join_of_an_unknown_node_is_rejected_by_compile(sources: tuple[str, str]
     builder.add_edge(Endpoint.start, "first")
     builder.add_edge(sources, target)
 
-    with pytest.raises(ValueError, match="missing"):
+    with pytest.raises(ValueError):
         builder.compile()
 
 

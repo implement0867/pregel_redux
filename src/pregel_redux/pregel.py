@@ -1,9 +1,9 @@
 from collections.abc import Callable, Collection, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Literal, assert_never
 
-from pregel_redux.channels import Channel, FieldChannel, Stored, reject_unknown_channels
-from pregel_redux.commands import Endpoint, Send
+from pregel_redux.channels import Channel, FieldChannel, Stored, extract_writes, parse_updates, reject_unknown_channels
+from pregel_redux.commands import Command, Endpoint, Send, resolve_goto
 
 
 @dataclass(frozen=True)
@@ -249,6 +249,19 @@ def group_values[KeyT, ValueT](pairs: Sequence[tuple[KeyT, ValueT]]) -> dict[Key
     return groups
 
 
+def finish_channels(position: Position) -> Position:
+    channels = position.channels
+    branches, finished_branches = change_channels(channels.branches, lambda node, channel: channel.finish())
+    joins, finished_joins = change_channels(channels.joins, lambda key, channel: channel.finish())
+    changed: list[ChannelKey] = [*(BranchKey(node) for node in finished_branches), *finished_joins]
+    next_version = max(position.versions.values(), default=0) + 1
+    return Position(
+        Channels(channels.start, channels.fields, branches, joins, channels.tasks),
+        {**position.versions, **dict.fromkeys(changed, next_version)},
+        position.seen,
+    )
+
+
 def apply_writes(
     position: Position,
     tasks: Sequence[Task],
@@ -312,7 +325,8 @@ def apply_writes(
     }
     finished_branches: set[str] = set()
     finished_joins: set[JoinKey] = set()
-    if bump_step and not start_updated and updated_triggers.isdisjoint(trigger_keys):
+    pending_sends = (channels.tasks if tasks_channel is None else tasks_channel).values
+    if bump_step and not start_updated and not pending_sends and updated_triggers.isdisjoint(trigger_keys):
         branches, finished_branches = change_channels(branches, lambda node, channel: channel.finish())
         joins, finished_joins = change_channels(joins, lambda key, channel: channel.finish())
 
@@ -335,3 +349,22 @@ def apply_writes(
         {**position.versions, **dict.fromkeys(changed, next_version)},
         seen,
     )
+
+
+def read_command_writes(
+    node_names: Collection[str], channels: Mapping[str, Channel], command: Command[str]
+) -> TaskWrites:
+    routes = resolve_goto(command.goto, node_names)
+    return TaskWrites(parse_updates(channels, extract_writes(command.update)), routes.targets, (), routes.sends)
+
+
+def apply_command(
+    trigger_keys: Collection[TriggerKey],
+    triggers: Mapping[str, Sequence[TriggerKey]],
+    position: Position,
+    writes: TaskWrites,
+) -> Position:
+    sends = (*position.channels.tasks.values, *writes.sends) if writes.sends else ()
+    branches = frozenset(node for node in writes.branches if not position.channels.branches[node].is_available())
+    applied = apply_writes(position, [], [replace(writes, branches=branches, sends=sends)], [], trigger_keys)
+    return applied if plan_tasks(applied, triggers) else finish_channels(applied)

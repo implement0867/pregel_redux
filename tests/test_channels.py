@@ -43,6 +43,10 @@ class AppendState(TypedDict):
     items: Annotated[list[object], Reducer(append_item, initial_factory=list, update_type=object)]
 
 
+class NumberState(TypedDict):
+    items: Annotated[list[int], Reducer(append_item, initial_factory=list, update_type=object)]
+
+
 class Total(BaseModel):
     count: int
 
@@ -440,8 +444,8 @@ def test_first_write_to_a_reducer_channel_goes_through_the_reducer(
         "unknown-channel",
         "value-of-another-type",
         "none",
-        "reducer-result-of-another-type",
-        "second-reducer-result-of-another-type",
+        "reducer-update-of-another-type",
+        "second-reducer-update-of-another-type",
     ],
 )
 def test_invalid_writes_are_rejected(channels: dict[str, Channel], updates: Sequence[Mapping[str, object]]) -> None:
@@ -451,6 +455,19 @@ def test_invalid_writes_are_rejected(channels: dict[str, Channel], updates: Sequ
     Act: apply the updates.
     Assert: a ValueError is raised.
     """
+    with pytest.raises(ValueError):
+        apply_updates(channels, {"items": []}, updates)
+
+
+@pytest.mark.parametrize("updates", [[{"items": "text"}], [{"items": 1}, {"items": "text"}]], ids=["first", "second"])
+def test_reducer_result_that_is_not_of_the_channel_type_is_rejected(updates: Sequence[Mapping[str, object]]) -> None:
+    """
+    Arrange: a channel of numbers with a reducer that accepts an update of any type.
+    Act: apply writes of which the reducer makes a list with a text.
+    Assert: a ValueError is raised.
+    """
+    channels = build_channels(NumberState)
+
     with pytest.raises(ValueError):
         apply_updates(channels, {"items": []}, updates)
 

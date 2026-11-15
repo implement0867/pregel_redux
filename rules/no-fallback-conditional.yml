@@ -1,0 +1,20 @@
+id: no-fallback-conditional
+language: python
+severity: error
+message: A conditional expression must not substitute or convert a value that failed a test.
+note: Parse the value with a `match` that raises for each unexpected case.
+rule:
+  any:
+    - pattern: $A if isinstance($X, $$$T) else $X
+    - pattern: $A if isinstance($X, $$$T) else $F($X)
+    - pattern: $A if isinstance($X, $$$T) else $EMPTY
+    - pattern: $X if not isinstance($X, $$$T) else $A
+    - pattern: $F($X) if not isinstance($X, $$$T) else $A
+    - pattern: $EMPTY if not isinstance($X, $$$T) else $A
+    - pattern: $A if $X == $S else $CONVERT($X)
+    - pattern: $CONVERT($X) if $X != $S else $A
+constraints:
+  EMPTY:
+    regex: ^(None|\(\)|\[\]|\{\}|""|'')$
+  CONVERT:
+    regex: ^(frozenset|set|tuple|list|dict|str)$
