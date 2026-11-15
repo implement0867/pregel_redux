@@ -23,6 +23,7 @@
 - Inject dependencies through the constructor, typing strategies as a `Protocol` and passing configuration as the concrete Pydantic settings class.
 - I'm using `uv`, not `pip`. Run tools with `uv run`.
 - Target Python 3.12+ and use its syntax: `X | None`, built-in generics, PEP 695 type parameters.
+- Docstrings follow the `docstring-style` skill and are only written for user-facing code.
 - No assert statements in production code.
 - Raise built-in exception types unless a custom exception handler needs its own type. No bare or broad `except`, and don't swallow errors silently.
 - Matches should be provably exhaustive. Even if type checker says it's unreachable. End with `case _:` calling `typing.assert_never`, or raising an exception when that reads clearer.

@@ -2,6 +2,10 @@
 !.gitignore
 !.gitattributes
 !.github
+!.agents
+!.claude/
+.claude/*
+!.claude/skills
 
 __pycache__/
 *.py[cod]
