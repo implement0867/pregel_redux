@@ -182,6 +182,8 @@ class CompiledNode:
 
 @dataclass(frozen=True)
 class CompiledGraph[StateT, InputT, OutputT]:
+    """Runs a graph without checkpoints."""
+
     output_schema: Callable[..., OutputT]
     channels: Mapping[str, Channel]
     output_fields: frozenset[str]
@@ -189,6 +191,19 @@ class CompiledGraph[StateT, InputT, OutputT]:
     entry_nodes: frozenset[str]
 
     async def ainvoke(self, input: InputT, *, step_limit: int | None = None) -> OutputT:
+        """Runs the graph on `input` and returns the output.
+
+        Parameters
+        ----------
+        step_limit
+            The maximum number of steps.
+            The default comes from the `PREGEL_REDUX_STEP_LIMIT` environment variable and is 25 when it is absent.
+
+        Raises
+        ------
+        RuntimeError
+            The run exceeds `step_limit`, waits for a message, or reaches a breakpoint.
+        """
         return await self.run_without_thread(input, step_limit, Stream(lambda part: None))
 
     async def run_without_thread(self, input: InputT, step_limit: int | None, stream: Stream) -> OutputT:
@@ -229,6 +244,10 @@ class CompiledGraph[StateT, InputT, OutputT]:
         *,
         step_limit: int | None = None,
     ) -> AsyncGenerator[StreamPart | ChildPart]:
+        """Runs the graph on `input` and yields each part that the run emits.
+
+        The parameters match `ainvoke`.
+        """
         return stream_run(lambda emit: self.run_without_thread(input, step_limit, Stream(emit)))
 
     def stream(
@@ -237,6 +256,13 @@ class CompiledGraph[StateT, InputT, OutputT]:
         *,
         step_limit: int | None = None,
     ) -> Generator[StreamPart | ChildPart]:
+        """Runs `astream` in a new event loop.
+
+        Raises
+        ------
+        TypeError
+            A node is a coroutine function.
+        """
         self.reject_async_nodes("astream")
         return iterate_in_new_loop(lambda: self.astream(input, step_limit=step_limit))
 
@@ -259,6 +285,13 @@ class CompiledGraph[StateT, InputT, OutputT]:
             raise TypeError(f"nodes {async_nodes!r} have only an async function, so call {async_method}")
 
     def invoke(self, input: InputT, *, step_limit: int | None = None) -> OutputT:
+        """Runs `ainvoke` in a new event loop.
+
+        Raises
+        ------
+        TypeError
+            A node is a coroutine function.
+        """
         self.reject_async_nodes("ainvoke")
         return run_in_new_loop(lambda: self.ainvoke(input, step_limit=step_limit))
 

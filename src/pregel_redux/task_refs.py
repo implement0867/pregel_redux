@@ -7,16 +7,25 @@ from pregel_redux.pregel import PullTask, PushTask, StartTask, Task
 
 @dataclass(frozen=True)
 class StartRef:
+    """Identifies the task that writes the run input."""
+
     name: Literal["__start__"] = "__start__"
 
 
 @dataclass(frozen=True)
 class PullRef:
+    """Identifies the task that runs a node after its edges trigger."""
+
     name: str
 
 
 @dataclass(frozen=True)
 class PushRef:
+    """Identifies the task that runs a node for a `Send`.
+
+    `index` is the position of the `Send` among the sends of the step.
+    """
+
     name: str
     index: int
 

@@ -5,6 +5,8 @@ from uuid import UUID
 
 @dataclass(frozen=True)
 class Segment:
+    """Identifies one child graph run by the parent node and the task that runs the child graph."""
+
     node: str
     task_id: str
 
@@ -18,6 +20,17 @@ def encode_namespace(ns: Namespace) -> str:
 
 @dataclass(frozen=True)
 class RunTarget:
+    """Identifies the thread and the start checkpoint of a run.
+
+    A node or a dependency of a `PersistentGraph` receives it through a parameter annotated `RunTarget`.
+
+    Attributes
+    ----------
+    fork_from
+        The checkpoint that the run continues from in a new branch of the thread.
+        `None` selects the latest checkpoint.
+    """
+
     thread_id: str
     fork_from: UUID | None
 

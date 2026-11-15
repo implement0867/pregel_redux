@@ -46,6 +46,23 @@ class Join:
 
 
 class StateGraph[StateT, InputT, OutputT]:
+    """Builds a graph of nodes that read and write one shared state.
+
+    Each field of the schemas is a channel of the state.
+    Each schema is a `TypedDict`, a dataclass or a Pydantic model.
+
+    Parameters
+    ----------
+    state_schema
+        The fields that the nodes read and write.
+    input_schema
+        The fields that the run input writes.
+        The default `input_schema` is `state_schema`.
+    output_schema
+        The fields of the run output.
+        The default `output_schema` is `state_schema`.
+    """
+
     @overload
     def __init__[S](self: "StateGraph[S, S, S]", state_schema: type[S]) -> None: ...
     @overload
@@ -85,6 +102,24 @@ class StateGraph[StateT, InputT, OutputT]:
         input_schema: type[object] | None = None,
         defer: bool = False,
     ) -> None:
+        """Adds a node function or a child graph under `name`.
+
+        A node function receives the state as its first parameter.
+        Each other parameter requests a value through `Depends`, `Received`, `StreamWriter`, `RunTarget` or `ShutdownSignal`.
+        The node function returns a state update or a `Command`.
+
+        Parameters
+        ----------
+        input_schema
+            The type that the node function receives in place of the state.
+        defer
+            A deferred node runs after each other pending node finishes.
+
+        Raises
+        ------
+        ValueError
+            `name` is a node of the graph, is `__start__`, or contains `|` or `:`.
+        """
         if name in self.nodes or name in self.child_graphs:
             raise ValueError(f"node {name!r} is already in this graph")
         if name == StartRef().name:
@@ -107,6 +142,10 @@ class StateGraph[StateT, InputT, OutputT]:
         source: str | Literal[Endpoint.start] | tuple[str, str, *tuple[str, ...]],
         target: str | Literal[Endpoint.end],
     ) -> None:
+        """Runs `target` in the step after `source`.
+
+        A tuple of sources makes `target` wait until each source finishes.
+        """
         match source:
             case tuple():
                 self.joins.add(Join(frozenset(source), target))
@@ -115,6 +154,7 @@ class StateGraph[StateT, InputT, OutputT]:
 
     @property
     def dependencies(self) -> frozenset[Callable[..., object]]:
+        """Returns each dependency function that the nodes and the child graphs request."""
         plans = [plan_call(node, {}, list_supplied(persistent=True)) for node in self.nodes.values()]
         return frozenset(
             item.request.dependency for plan in plans for item in (*plan.run_providers, *plan.node_providers)
@@ -141,6 +181,32 @@ class StateGraph[StateT, InputT, OutputT]:
         interrupt_before: Collection[str] | Literal["*"] = (),
         interrupt_after: Collection[str] | Literal["*"] = (),
     ) -> CompiledGraph[StateT, InputT, OutputT] | PersistentGraph[StateT, InputT, OutputT]:
+        """Checks the graph and returns a graph that runs.
+
+        A `checkpointer` selects a `PersistentGraph`, which saves a checkpoint after each step.
+
+        Parameters
+        ----------
+        dependency_overrides
+            Maps each dependency function to its replacement.
+        checkpointer
+            Stores the checkpoints of each thread.
+        interrupt_before
+            The nodes before which the run stops.
+            `"*"` selects each node.
+        interrupt_after
+            The nodes after which the run stops.
+            `"*"` selects each node.
+
+        Raises
+        ------
+        ValueError
+            An edge or a declared target refers to an unknown node.
+            The graph has zero edges from `Endpoint.start`.
+            A node receives a message in a graph without a `checkpointer`.
+        TypeError
+            A node parameter lacks a `Depends` annotation and a supplied type.
+        """
         graph = self.compile_graph(dependency_overrides, list_supplied(persistent=checkpointer is not None))
         if checkpointer is None:
             receivers = graph.find_receivers()

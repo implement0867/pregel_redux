@@ -8,12 +8,19 @@ from pregel_redux.channels import extract_writes
 
 
 class Endpoint(Enum):
+    """Marks the start and the end of a graph in edges and in `Command.goto`."""
+
     start = "start"
     end = "end"
 
 
 @dataclass(frozen=True)
 class Send:
+    """Runs `node` once with `arg` as its input in place of the graph state.
+
+    The task runs in the step after the node that returns the `Send`.
+    """
+
     node: str
     arg: object
 
@@ -23,6 +30,23 @@ type Target[NameT: str] = NameT | Literal[Endpoint.end] | Send
 
 @dataclass(frozen=True, kw_only=True)
 class Command[NameT: str]:
+    """Writes `update` to the state and selects the nodes of the next step.
+
+    A node declares its `goto` targets as `Literal` arguments of `Command` in its return annotation.
+    `StateGraph.compile` checks each declared target against the nodes of the graph.
+
+    Parameters
+    ----------
+    update
+        A mapping, a dataclass instance or a Pydantic model.
+        A dataclass instance writes each field that differs from its default.
+        A Pydantic model writes each field that the caller set.
+    goto
+        Node names, `Send` objects and `Endpoint.end`.
+        The node names add to the static edges of the node.
+        `Endpoint.end` adds zero targets.
+    """
+
     update: object = None
     goto: Target[NameT] | Sequence[Target[NameT]] = ()
 

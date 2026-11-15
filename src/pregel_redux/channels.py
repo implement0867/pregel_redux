@@ -32,6 +32,32 @@ MISSING = Missing()
 
 @dataclass(init=False)
 class Reducer[ValueT, UpdateT]:
+    """Merges each write to a state field into the stored value of the field.
+
+    A state field carries a `Reducer` as `Annotated` metadata.
+    A field without a `Reducer` stores the last write and accepts one write per step.
+
+    Parameters
+    ----------
+    function
+        Receives the stored value and one write and returns the new stored value.
+        The field type validates each returned value.
+    initial
+        The stored value before the first write.
+        Each run starts from a separate copy of `initial`.
+    initial_factory
+        Returns the stored value before the first write.
+        Each run calls `initial_factory` once.
+    update_type
+        The type that validates each write.
+        The default `update_type` is the field type.
+
+    Raises
+    ------
+    TypeError
+        Both `initial` and `initial_factory` are present, or both are absent.
+    """
+
     function: Callable[..., object]
     initial: object
     initial_factory: Callable[[], object] | None
@@ -89,6 +115,11 @@ class Stored[ValueT]:
 
 @dataclass(frozen=True)
 class Channel:
+    """Holds the type and the `Reducer` of one state field.
+
+    `StateGraph` builds one channel for each field of its schemas.
+    """
+
     name: str
     value_type: object
     reducer: Reducer[object, object] | None

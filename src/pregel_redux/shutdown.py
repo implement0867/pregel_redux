@@ -9,7 +9,7 @@ from typing import Protocol, assert_never
 
 
 class RunAborted(Exception):
-    pass
+    """Signals that the shutdown signal of a run cancelled the running nodes."""
 
 
 @dataclass(frozen=True)
@@ -31,6 +31,13 @@ type ShutdownState = NotRequested | Graceful | Aborted
 
 
 class ShutdownSignal(Protocol):
+    """Reports shutdown requests to a run.
+
+    A requested shutdown stops the run before its next step.
+    An abort cancels the running nodes and raises `RunAborted`.
+    `seconds_until_abort` returns `None` until a shutdown request with a grace period.
+    """
+
     @property
     def requested(self) -> bool: ...
 
@@ -44,6 +51,14 @@ class ShutdownSignal(Protocol):
 
 @dataclass(eq=False)
 class ShutdownController:
+    """Sends shutdown requests to each run that receives `signal`.
+
+    Parameters
+    ----------
+    clock
+        Returns the current time in seconds for the grace period.
+    """
+
     clock: Callable[[], float] = time.monotonic
     state: ShutdownState = field(default_factory=NotRequested, init=False)
     listeners: list[Callable[[], object]] = field(default_factory=list, init=False)
@@ -79,6 +94,10 @@ class ShutdownController:
                 assert_never(self.state)
 
     def subscribe(self, listener: Callable[[], object]) -> Callable[[], None]:
+        """Calls `listener` after each shutdown request and after each abort.
+
+        Returns a function that removes `listener`.
+        """
         listeners = self.listeners
         listeners.append(listener)
 
@@ -89,6 +108,15 @@ class ShutdownController:
         return unsubscribe
 
     def shutdown(self, grace_period: float | None = None) -> None:
+        """Stops each run before its next step.
+
+        Parameters
+        ----------
+        grace_period
+            The seconds until the abort.
+            `None` lets the running nodes finish.
+            Several calls keep the earliest deadline.
+        """
         deadline = None if grace_period is None else self.clock() + grace_period
         match self.state:
             case NotRequested():
@@ -102,6 +130,10 @@ class ShutdownController:
                 assert_never(self.state)
 
     def abort(self) -> None:
+        """Cancels the running nodes of each run.
+
+        Each run raises `RunAborted`.
+        """
         self.enter(Aborted())
 
     def enter(self, state: ShutdownState) -> None:
@@ -155,6 +187,17 @@ def graceful_shutdown(
     grace_period: float | None = None,
     signals: Collection[signal.Signals] = (signal.SIGINT, signal.SIGTERM),
 ) -> Generator[ShutdownSignal]:
+    """Converts operating system signals to shutdown requests for the duration of the context.
+
+    The first signal requests a shutdown.
+    The second signal aborts each run.
+    The context restores the earlier signal handlers at exit.
+
+    Parameters
+    ----------
+    grace_period
+        The seconds from the first signal until the abort.
+    """
     controller = ShutdownController()
 
     def handle(number: int, frame: FrameType | None) -> None:

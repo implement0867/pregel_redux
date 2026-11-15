@@ -9,6 +9,14 @@ from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, Typ
 
 
 class CheckpointSource(Enum):
+    """Names the action that saved a checkpoint.
+
+    `input` marks the start of a run.
+    `loop` marks a step of a run.
+    `update` marks a call to `PersistentGraph.update_state`.
+    `fork` marks a run that continues from `fork_from`.
+    """
+
     input = "input"
     loop = "loop"
     update = "update"
@@ -136,6 +144,11 @@ class ChannelVersions(Record):
 
 
 class Checkpoint(Record):
+    """Holds the saved state of one graph at one step of a thread.
+
+    A checkpointer stores the checkpoint as JSON.
+    """
+
     v: Literal[2] = 2
     id: UUID
     parent_id: UUID | None
@@ -150,11 +163,15 @@ class Checkpoint(Record):
 
 
 class CheckpointTuple(Record):
+    """Holds a checkpoint and the results of the tasks that ran after the checkpoint."""
+
     checkpoint: Checkpoint
     pending_writes: tuple[PendingWrite, ...]
 
 
 class AsyncCheckpointer(Protocol):
+    """Defines the asynchronous form of `Checkpointer`."""
+
     async def aput(self, thread_id: str, checkpoint: Checkpoint) -> None: ...
     async def aput_writes(
         self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite
@@ -169,13 +186,56 @@ class AsyncCheckpointer(Protocol):
 
 
 class Checkpointer(Protocol):
-    def put(self, thread_id: str, checkpoint: Checkpoint) -> None: ...
-    def put_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None: ...
-    def get_tuple(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None) -> CheckpointTuple | None: ...
+    """Stores the checkpoints of each thread.
+
+    The graph calls each method from a worker thread.
+    Several calls run at the same time.
+    """
+
+    def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
+        """Stores `checkpoint` under `thread_id`.
+
+        A checkpoint with the same id replaces the stored checkpoint.
+        """
+        ...
+
+    def put_writes(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID, write: PendingWrite) -> None:
+        """Stores `write` for the checkpoint `checkpoint_id`.
+
+        A write with the same `key` replaces the stored write.
+
+        Raises
+        ------
+        KeyError
+            The checkpoint `checkpoint_id` is absent.
+        """
+        ...
+
+    def get_tuple(self, thread_id: str, checkpoint_ns: str, checkpoint_id: UUID | None) -> CheckpointTuple | None:
+        """Returns the checkpoint `checkpoint_id` with its writes.
+
+        `checkpoint_id` of `None` selects the checkpoint with the greatest id.
+        Returns `None` for an absent checkpoint.
+        """
+        ...
+
     def list(
         self, thread_id: str, checkpoint_ns: str, *, before: UUID | None, limit: int | None
-    ) -> Iterator[CheckpointTuple]: ...
-    def delete_thread(self, thread_id: str) -> None: ...
+    ) -> Iterator[CheckpointTuple]:
+        """Yields the checkpoints of the graph `checkpoint_ns` in descending id order.
+
+        Parameters
+        ----------
+        before
+            Selects the checkpoints with an id less than `before`.
+        limit
+            The maximum number of checkpoints.
+        """
+        ...
+
+    def delete_thread(self, thread_id: str) -> None:
+        """Removes each checkpoint and each write of the thread."""
+        ...
 
 
 @dataclass(frozen=True)
@@ -208,6 +268,8 @@ class ThreadedCheckpointer:
 
 @dataclass
 class InMemoryCheckpointer:
+    """Stores checkpoints as JSON in the memory of the process."""
+
     threads: dict[str, dict[str, dict[UUID, str]]] = field(default_factory=dict)
     pending: dict[tuple[str, str, UUID], dict[PendingKey, str]] = field(default_factory=dict)
 

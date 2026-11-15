@@ -40,6 +40,8 @@ from pregel_redux.task_refs import refer_task
 
 @dataclass(frozen=True)
 class PersistentGraph[StateT, InputT, OutputT]:
+    """Runs a graph and saves a checkpoint of each step under a thread id."""
+
     graph: CompiledGraph[StateT, InputT, OutputT]
     checkpointer: Checkpointer
     breakpoints: Breakpoints
@@ -122,6 +124,32 @@ class PersistentGraph[StateT, InputT, OutputT]:
         step_limit: int | None = None,
         signal: ShutdownSignal | None = None,
     ) -> Finished[OutputT] | Waiting | Stopped:
+        """Runs the graph on the thread `thread_id` and returns the result.
+
+        Parameters
+        ----------
+        input
+            An input value starts a run from the state of the latest checkpoint.
+            `None` continues a `Stopped` run.
+            A `Command` writes its `update` and `goto` to the latest checkpoint and continues the run.
+            A `Message` continues a `Waiting` run.
+        fork_from
+            The checkpoint that the run continues from in a new branch of the thread.
+        step_limit
+            The maximum number of steps.
+            The default comes from the `PREGEL_REDUX_STEP_LIMIT` environment variable and is 25 when it is absent.
+        signal
+            Stops or aborts the run.
+
+        Raises
+        ------
+        LookupError
+            The thread has zero checkpoints and `input` is `None`, a `Command` or a `Message`.
+        RunAborted
+            `signal` aborts the run.
+        RuntimeError
+            The run exceeds `step_limit`.
+        """
         stream = Stream(lambda part: None)
         target = parse_run_target(thread_id, fork_from)
         return await self.run(input, target, step_limit, stream, signal)
@@ -135,6 +163,13 @@ class PersistentGraph[StateT, InputT, OutputT]:
         step_limit: int | None = None,
         signal: ShutdownSignal | None = None,
     ) -> Finished[OutputT] | Waiting | Stopped:
+        """Runs `ainvoke` in a new event loop.
+
+        Raises
+        ------
+        TypeError
+            A node is a coroutine function.
+        """
         self.graph.reject_async_nodes("ainvoke")
         stream = Stream(lambda part: None)
         target = parse_run_target(thread_id, fork_from)
@@ -149,6 +184,10 @@ class PersistentGraph[StateT, InputT, OutputT]:
         step_limit: int | None = None,
         signal: ShutdownSignal | None = None,
     ) -> AsyncGenerator[StreamPart | ChildPart]:
+        """Runs the graph on the thread `thread_id` and yields each part that the run emits.
+
+        The parameters match `ainvoke`.
+        """
         target = parse_run_target(thread_id, fork_from)
         return stream_run(
             lambda emit: self.run(
@@ -169,6 +208,13 @@ class PersistentGraph[StateT, InputT, OutputT]:
         step_limit: int | None = None,
         signal: ShutdownSignal | None = None,
     ) -> Generator[StreamPart | ChildPart]:
+        """Runs `astream` in a new event loop.
+
+        Raises
+        ------
+        TypeError
+            A node is a coroutine function.
+        """
         self.graph.reject_async_nodes("astream")
         target = parse_run_target(thread_id, fork_from)
         return iterate_in_new_loop(
@@ -199,6 +245,23 @@ class PersistentGraph[StateT, InputT, OutputT]:
         checkpoint_id: UUID | None = None,
         subgraphs: bool = False,
     ) -> StateSnapshot:
+        """Returns the snapshot of the thread at the checkpoint `checkpoint_id`.
+
+        Parameters
+        ----------
+        checkpoint_ns
+            Selects a child graph.
+            The empty tuple selects the root graph.
+        checkpoint_id
+            `None` selects the latest checkpoint.
+        subgraphs
+            Adds the snapshot of each child graph to its task.
+
+        Raises
+        ------
+        LookupError
+            The checkpoint is absent.
+        """
         address = parse_state_address(thread_id, checkpoint_ns, checkpoint_id)
         return await self.read_state(address, subgraphs=subgraphs)
 
@@ -210,6 +273,7 @@ class PersistentGraph[StateT, InputT, OutputT]:
         checkpoint_id: UUID | None = None,
         subgraphs: bool = False,
     ) -> StateSnapshot:
+        """Runs `aget_state` in a new event loop."""
         address = parse_state_address(thread_id, checkpoint_ns, checkpoint_id)
         return run_in_new_loop(lambda: self.read_state(address, subgraphs=subgraphs))
 
@@ -226,12 +290,30 @@ class PersistentGraph[StateT, InputT, OutputT]:
     def aget_state_history(
         self, thread_id: str, *, checkpoint_ns: Namespace = (), before: UUID | None = None, limit: int | None = None
     ) -> AsyncIterator[StateSnapshot]:
+        """Yields the snapshots of the thread from the latest checkpoint to the earliest checkpoint.
+
+        Parameters
+        ----------
+        checkpoint_ns
+            Selects a child graph.
+            The empty tuple selects the root graph.
+        before
+            Selects the checkpoints with an id less than `before`.
+        limit
+            The maximum number of snapshots.
+
+        Raises
+        ------
+        ValueError
+            `limit` is negative.
+        """
         address = parse_state_address(thread_id, checkpoint_ns, None)
         return self.read_state_history(address, before, limit)
 
     def get_state_history(
         self, thread_id: str, *, checkpoint_ns: Namespace = (), before: UUID | None = None, limit: int | None = None
     ) -> Iterator[StateSnapshot]:
+        """Runs `aget_state_history` in a new event loop."""
         address = parse_state_address(thread_id, checkpoint_ns, None)
         return iterate_in_new_loop(lambda: self.read_state_history(address, before, limit))
 
@@ -276,6 +358,26 @@ class PersistentGraph[StateT, InputT, OutputT]:
         checkpoint_ns: Namespace = (),
         checkpoint_id: UUID | None = None,
     ) -> UUID:
+        """Writes `values` to the thread as the result of `as_node` and returns the id of the new checkpoint.
+
+        The edges of `as_node` select the nodes of the next run with the input `None`.
+
+        Parameters
+        ----------
+        as_node
+            `None` selects the node that wrote last.
+        checkpoint_ns
+            Selects a child graph.
+            The empty tuple selects the root graph.
+        checkpoint_id
+            The checkpoint that the update follows.
+            `None` selects the latest checkpoint.
+
+        Raises
+        ------
+        ValueError
+            `as_node` is an unknown node, or the node that wrote last is ambiguous.
+        """
         address = parse_state_address(thread_id, checkpoint_ns, checkpoint_id)
         return await self.write_update(address, values, as_node)
 
@@ -288,5 +390,6 @@ class PersistentGraph[StateT, InputT, OutputT]:
         checkpoint_ns: Namespace = (),
         checkpoint_id: UUID | None = None,
     ) -> UUID:
+        """Runs `aupdate_state` in a new event loop."""
         address = parse_state_address(thread_id, checkpoint_ns, checkpoint_id)
         return run_in_new_loop(lambda: self.write_update(address, values, as_node))

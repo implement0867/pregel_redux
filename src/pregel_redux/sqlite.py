@@ -53,6 +53,14 @@ def read_tuple(session: Session, row: CheckpointRow) -> CheckpointTuple:
 
 @dataclass(frozen=True)
 class SqliteCheckpointer:
+    """Stores checkpoints in a SQLite database file.
+
+    Raises
+    ------
+    ValueError
+        `engine` uses a `StaticPool` or an in-memory database.
+    """
+
     engine: Engine
 
     def __post_init__(self) -> None:
@@ -67,6 +75,10 @@ class SqliteCheckpointer:
                 pass
 
     def setup(self) -> None:
+        """Creates the `checkpoints` table and the `writes` table.
+
+        Existing tables stay unchanged.
+        """
         Base.metadata.create_all(self.engine)
 
     def put(self, thread_id: str, checkpoint: Checkpoint) -> None:
