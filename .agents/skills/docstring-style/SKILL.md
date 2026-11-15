@@ -1,4 +1,16 @@
+---
+name: docstring-style
+description: Writes, reviews and removes Python docstrings according to the project docstring rules. Use when a task adds, changes or reviews a docstring.
+---
+
 # Docstring style guide
+
+For each construct in scope:
+
+1. The "When to write a docstring" rules decide whether the construct needs a docstring.
+2. A construct that needs no docstring loses its existing docstring.
+3. A docstring that only explains a name leads to a proposal for a better name or structure.
+4. A construct that needs a docstring gets one that obeys every rule below.
 
 Docstrings use the NumPy style.
 mkdocstrings renders names, signatures, type annotations and defaults.
