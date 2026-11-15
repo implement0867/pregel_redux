@@ -18,7 +18,8 @@ Docstrings hold only information that these do not show.
 
 ## When to write a docstring
 
-1. A docstring exists only for behavior that names, signatures and annotations cannot show.
+1. A docstring exists only on user-facing code.
+   It describes only behavior that names, signatures and annotations cannot show.
    A docstring that only explains a name shows that the name or the structure needs to change.
 2. Observable behavior appears only when it affects how the caller uses the construct.
    The internal mechanism stays out.
