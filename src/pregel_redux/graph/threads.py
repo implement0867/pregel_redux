@@ -1,10 +1,10 @@
-from collections.abc import Mapping, Sequence
+from collections.abc import Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import assert_never
 from uuid import UUID, uuid5
 
-from pydantic import JsonValue
+from typing_extensions import TypeForm
 
 from pregel_redux.channels import (
     extract_writes,
@@ -16,14 +16,12 @@ from pregel_redux.checkpoints import (
     CheckpointTuple,
     PendingWrite,
     RunCommandRecord,
-    TaskAnswersRecord,
     TaskFailed,
     TaskStopRecord,
     TaskWaiting,
     TaskWritesRecord,
     TriggerVersions,
 )
-from pregel_redux.commands import Command
 from pregel_redux.configs import Namespace, Segment, encode_namespace
 from pregel_redux.dependencies import CallPlan, finish_despite_cancellation
 from pregel_redux.graph.compiled import CompiledGraph, Continuation, FreshStart, Start
@@ -36,11 +34,12 @@ from pregel_redux.graph.conversion import (
     load_writes,
     make_checkpoint_id,
 )
-from pregel_redux.interrupts import Interrupt, ResumeInput, Scratchpad, make_interrupt_id
+from pregel_redux.messages import Entrance, Message
 from pregel_redux.pregel import (
     Position,
     TaskWrites,
     apply_command,
+    deliver,
     plan_tasks,
 )
 from pregel_redux.snapshots import (
@@ -100,24 +99,60 @@ class ThreadScope:
             raise LookupError(f"thread {self.thread_id!r} has no checkpoint {checkpoint_id}")
         return Loaded(saved, newest.checkpoint.id)
 
-    async def open_run(self, checkpoint_id: UUID | None, *, answers: bool) -> "OpenedRun | None":
-        loaded = await self.find(checkpoint_id)
-        if loaded is None:
-            return None
+    async def open_loaded(self, loaded: "Loaded", *, fork: bool) -> "OpenedRun":
         saved = loaded.saved
         position = self.read_position(saved)
-        if checkpoint_id is None:
+        if not fork:
             return OpenedRun(position, ThreadJournal(self, saved, loaded.newest_id))
-        if answers:
-            superseded = saved.checkpoint.id != loaded.newest_id
-            kept = tuple(
-                write for write in saved.pending_writes if not (superseded and isinstance(write, TaskWritesRecord))
-            )
-            replayed = CheckpointTuple(checkpoint=saved.checkpoint, pending_writes=kept)
-            return OpenedRun(position, ThreadJournal(self, replayed, loaded.newest_id))
-        step = saved.checkpoint.step
-        fork = await self.put(position, step, CheckpointSource.fork, checkpoint_id, loaded.newest_id)
-        return OpenedRun(position, ThreadJournal(self, CheckpointTuple(checkpoint=fork, pending_writes=()), fork.id))
+        checkpoint = saved.checkpoint
+        forked = await self.put(position, checkpoint.step, CheckpointSource.fork, checkpoint.id, loaded.newest_id)
+        return OpenedRun(
+            position, ThreadJournal(self, CheckpointTuple(checkpoint=forked, pending_writes=()), forked.id)
+        )
+
+    async def open_run(self, checkpoint_id: UUID | None) -> "OpenedRun | None":
+        loaded = await self.find(checkpoint_id)
+        return None if loaded is None else await self.open_loaded(loaded, fork=checkpoint_id is not None)
+
+    async def receive(self, message: Message, fork_from: UUID | None) -> Start:
+        loaded = await self.find(fork_from)
+        if loaded is None:
+            raise LookupError(f"thread {self.thread_id!r} has no checkpoint, so it accepts no message")
+        level = (
+            await self.read_level(loaded.saved, subgraphs=False) if fork_from is None else SavedLevel(loaded.saved, {})
+        )
+        accepts = self.build_snapshot(level, subgraphs=False).accepts
+        match message.to:
+            case None:
+                match list(accepts):
+                    case [entrance]:
+                        pass
+                    case []:
+                        raise ValueError(f"thread {self.thread_id!r} accepts no message at this checkpoint")
+                    case several:
+                        raise ValueError(f"the thread accepts a message at each of {several!r}, so give Message.to")
+            case Entrance() as entrance:
+                if entrance not in accepts:
+                    raise ValueError(
+                        f"the thread accepts no message at {entrance!r}, it accepts one at {list(accepts)!r}"
+                    )
+            case _:
+                assert_never(message.to)
+        graph = find_graph(self.graph, entrance.checkpoint_ns)
+        value = graph.receivers[entrance.node].adapter.validate_python(message.value)
+        if entrance.checkpoint_ns == self.checkpoint_ns:
+            opened = await self.open_loaded(loaded, fork=fork_from is not None)
+            delivered = deliver(opened.position, graph.triggers, entrance.node, value)
+            checkpoint = opened.journal.saved.checkpoint
+            return FreshStart(delivered, await self.begin(delivered, checkpoint.step + 1, checkpoint.id))
+        child = ThreadScope(graph, self.checkpointer, self.thread_id, entrance.checkpoint_ns)
+        resting = await child.find(None)
+        if resting is None:
+            raise LookupError(f"the child graph at {entrance.checkpoint_ns!r} has no checkpoint")
+        checkpoint = resting.saved.checkpoint
+        delivered = deliver(child.read_position(resting.saved), graph.triggers, entrance.node, value)
+        await child.begin(delivered, checkpoint.step + 1, checkpoint.id)
+        return Continuation(self.read_position(loaded.saved), ThreadJournal(self, loaded.saved, loaded.newest_id))
 
     def find_child_scope(self, journal: "ThreadJournal", task: TaskRef) -> "ThreadScope | None":
         match task:
@@ -158,23 +193,17 @@ class ThreadScope:
         scope = self.find_child_scope(journal, task)
         child_level = level.children.get(task_id)
         child = None if scope is None or child_level is None else scope.build_snapshot(child_level, subgraphs=True)
+        accepts: Mapping[Entrance, TypeForm[object]] = {} if child is None else child.accepts
         status: TaskStatus
         if writes is not None:
             status = FinishedTask(writes.fields)
         else:
-            waiting = journal.find_waiting(task) if child is None else child.interrupts
             stop = journal.find_stop(task)
             match stop:
                 case TaskFailed():
-                    status = FailedTask(stop.error, waiting)
+                    status = FailedTask(stop.error, accepts)
                 case TaskWaiting() | None:
-                    match waiting:
-                        case ():
-                            status = PendingTask()
-                        case (first, *rest):
-                            status = WaitingTask((first, *rest))
-                        case _:
-                            raise TypeError(f"the waiting interrupts {waiting!r} are not a tuple")
+                    status = WaitingTask(accepts) if accepts else PendingTask()
                 case _:
                     assert_never(stop)
         return TaskSnapshot(id=task_id, path=task, status=status, state=child if subgraphs else None)
@@ -182,17 +211,26 @@ class ThreadScope:
     def build_snapshot(self, level: "SavedLevel", *, subgraphs: bool) -> StateSnapshot:
         saved = level.saved
         journal = ThreadJournal(self, saved, saved.checkpoint.id)
+        position = self.read_position(saved)
+        tasks = tuple(
+            self.build_task_snapshot(journal, task, level, subgraphs=subgraphs) for task in self.plan_refs(saved)
+        )
+        waiting: dict[Entrance, TypeForm[object]] = {
+            entrance: message_type
+            for task in tasks
+            if isinstance(task.status, WaitingTask | FailedTask)
+            for entrance, message_type in task.status.accepts.items()
+        }
         return StateSnapshot(
-            values=self.read_position(saved).channels.read_values(),
+            values=position.channels.read_values(),
             checkpoint_ns=self.checkpoint_ns,
             checkpoint_id=saved.checkpoint.id,
             parent_id=saved.checkpoint.parent_id,
             created_at=saved.checkpoint.ts,
             step=saved.checkpoint.step,
             source=saved.checkpoint.source,
-            tasks=tuple(
-                self.build_task_snapshot(journal, task, level, subgraphs=subgraphs) for task in self.plan_refs(saved)
-            ),
+            tasks=tasks,
+            accepts=waiting if tasks else self.graph.list_entrances(self.checkpoint_ns, position),
         )
 
     async def read_snapshot(self, saved: CheckpointTuple, *, subgraphs: bool) -> StateSnapshot:
@@ -234,9 +272,6 @@ class ThreadJournal:
     async def read_snapshot(self) -> StateSnapshot:
         return await self.scope.read_snapshot(self.saved, subgraphs=False)
 
-    async def read_waiting(self) -> tuple[Interrupt, ...]:
-        return (await self.read_snapshot()).interrupts
-
     async def read_checkpoint(self) -> CheckpointPart:
         return CheckpointPart(await self.read_snapshot())
 
@@ -256,17 +291,11 @@ class ThreadJournal:
         saved = dump_writes(self.scope.graph, writes)
         await self.put_write(TaskWritesRecord(task_id=self.make_task_id(task), writes=saved))
 
-    async def record_waiting(self, task: TaskRef, interrupts: Sequence[Interrupt]) -> None:
-        stop = TaskWaiting(interrupts=tuple(interrupts))
-        await self.put_write(TaskStopRecord(task_id=self.make_task_id(task), stop=stop))
-
     async def record_failure(self, task: TaskRef, error: str) -> None:
-        earlier = self.find_stop(task)
-        stop = TaskFailed(error=error, interrupts=() if earlier is None else earlier.interrupts)
-        await self.put_write(TaskStopRecord(task_id=self.make_task_id(task), stop=stop))
+        await self.put_write(TaskStopRecord(task_id=self.make_task_id(task), stop=TaskFailed(error=error)))
 
-    async def record_answers(self, task: TaskRef, answers: Sequence[JsonValue]) -> None:
-        await self.put_write(TaskAnswersRecord(task_id=self.make_task_id(task), answers=tuple(answers)))
+    async def record_waiting(self, task: TaskRef) -> None:
+        await self.put_write(TaskStopRecord(task_id=self.make_task_id(task), stop=TaskWaiting()))
 
     def find_writes(self, task: TaskRef) -> TaskWrites | None:
         task_id = self.make_task_id(task)
@@ -286,48 +315,13 @@ class ThreadJournal:
         ]
         return stops[0] if stops else None
 
-    def find_answers(self, task: TaskRef) -> tuple[JsonValue, ...]:
-        task_id = self.make_task_id(task)
-        return tuple(
-            answer
-            for write in self.saved.pending_writes
-            if isinstance(write, TaskAnswersRecord) and write.task_id == task_id
-            for answer in write.answers
-        )
-
-    def find_waiting(self, task: TaskRef) -> tuple[Interrupt, ...]:
-        stop = self.find_stop(task)
-        if stop is None:
-            return ()
-        task_ns = encode_namespace(self.make_task_ns(task))
-        answered = {make_interrupt_id(task_ns, index) for index in range(len(self.find_answers(task)))}
-        return tuple(interrupt for interrupt in stop.interrupts if interrupt.id not in answered)
-
-    def open_scratchpad(self, task: TaskRef, resume: ResumeInput) -> Scratchpad:
-        return Scratchpad(encode_namespace(self.make_task_ns(task)), list(self.find_answers(task)), resume, 0)
-
-    async def read_resume(self, command: Command[str] | None) -> ResumeInput:
-        if command is None:
-            return ResumeInput([], {})
-        given = command.resume_by_interrupt_id or {}
-        if command.resume is not None:
-            waiting = [interrupt.id for interrupt in await self.read_waiting()]
-            match waiting:
-                case []:
-                    return ResumeInput([command.resume], given)
-                case [interrupt_id]:
-                    return ResumeInput([], {**given, interrupt_id: command.resume})
-                case _:
-                    raise ValueError(f"the interrupts {waiting!r} wait for an answer, so give resume_by_interrupt_id")
-        return ResumeInput([], given)
-
     async def record_command(self, writes: TaskWrites) -> None:
         index = sum(1 for write in self.saved.pending_writes if isinstance(write, RunCommandRecord))
         await self.put_write(RunCommandRecord(index=index, command=dump_writes(self.scope.graph, writes)))
 
     async def enter_child(self, child: AnyGraph, call: NodeCall) -> Start:
         scope = ThreadScope(child, self.scope.checkpointer, self.scope.thread_id, self.make_task_ns(call.task))
-        opened = await scope.open_run(None, answers=False)
+        opened = await scope.open_run(None)
         if opened is not None:
             return Continuation(opened.position, opened.journal)
         start = child.feed(child.open(extract_writes(call.node_input)), {})

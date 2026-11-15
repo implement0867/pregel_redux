@@ -37,7 +37,7 @@ def build_join() -> JoinKey:
 def open_position() -> Position:
     branches: dict[str, BranchChannel] = {node: EphemeralValue(None) for node in ("first", "second", "target")}
     joins: dict[JoinKey, JoinChannel] = {build_join(): NamedBarrierValue(build_join().sources, frozenset())}
-    return open_channels(build_channels(State), {"topic": "dogs"}, branches, joins)
+    return open_channels(build_channels(State), {"topic": "dogs"}, branches, joins, [])
 
 
 @pytest.mark.parametrize(

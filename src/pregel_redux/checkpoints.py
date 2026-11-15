@@ -7,8 +7,6 @@ from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
 
-from pregel_redux.interrupts import Interrupt
-
 
 class CheckpointSource(Enum):
     input = "input"
@@ -42,7 +40,6 @@ class SavedWrites(Record):
 class PendingKind(StrEnum):
     writes = "writes"
     stop = "stop"
-    answers = "answers"
     command = "command"
 
 
@@ -69,29 +66,17 @@ class StopKind(StrEnum):
 
 class TaskWaiting(Record):
     outcome: Literal[StopKind.waiting] = StopKind.waiting
-    interrupts: tuple[Interrupt, ...]
 
 
 class TaskFailed(Record):
     outcome: Literal[StopKind.failed] = StopKind.failed
     error: str
-    interrupts: tuple[Interrupt, ...]
 
 
 class TaskStopRecord(Record):
     kind: Literal[PendingKind.stop] = PendingKind.stop
     task_id: str
     stop: Annotated[TaskWaiting | TaskFailed, Field(discriminator="outcome")]
-
-    @property
-    def key(self) -> PendingKey:
-        return PendingKey(self.kind, self.task_id)
-
-
-class TaskAnswersRecord(Record):
-    kind: Literal[PendingKind.answers] = PendingKind.answers
-    task_id: str
-    answers: tuple[JsonValue, ...]
 
     @property
     def key(self) -> PendingKey:
@@ -108,9 +93,7 @@ class RunCommandRecord(Record):
         return PendingKey(self.kind, str(self.index))
 
 
-type PendingWrite = Annotated[
-    TaskWritesRecord | TaskStopRecord | TaskAnswersRecord | RunCommandRecord, Field(discriminator="kind")
-]
+type PendingWrite = Annotated[TaskWritesRecord | TaskStopRecord | RunCommandRecord, Field(discriminator="kind")]
 
 
 class SavedBranch(Record):
@@ -131,6 +114,7 @@ class ChannelValues(Record):
     branches: tuple[SavedBranch, ...]
     joins: tuple[SavedJoin, ...]
     tasks: tuple[PendingSend, ...]
+    received: dict[str, JsonValue]
 
 
 class JoinVersion(Record):
@@ -152,7 +136,7 @@ class ChannelVersions(Record):
 
 
 class Checkpoint(Record):
-    v: Literal[1] = 1
+    v: Literal[2] = 2
     id: UUID
     parent_id: UUID | None
     ts: AwareDatetime

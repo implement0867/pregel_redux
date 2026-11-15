@@ -9,18 +9,18 @@ from sqlalchemy import create_engine
 
 from pregel_redux import (
     Checkpointer,
-    Command,
     Endpoint,
     Finished,
     InMemoryCheckpointer,
+    Message,
     PersistentGraph,
+    Received,
     Reducer,
     StateGraph,
-    interrupt,
 )
 from pregel_redux.checkpoints import RunCommandRecord, SavedWrites
 from pregel_redux.sqlite import SqliteCheckpointer
-from pregel_redux.streams import InterruptsPart, UpdatesPart
+from pregel_redux.streams import UpdatesPart, WaitingPart
 from tests.conftest import join_lists
 
 
@@ -44,8 +44,8 @@ def checkpointer(request: pytest.FixtureRequest, tmp_path: Path) -> Iterator[Che
     engine.dispose()
 
 
-def ask(state: State) -> State:
-    return {"notes": [interrupt("question", response_schema=str)]}
+def ask(state: State, answer: Received[str]) -> State:
+    return {"notes": [answer]}
 
 
 def build_writer(name: str) -> Callable[[State], State]:
@@ -63,16 +63,16 @@ def build_graph(checkpointer: Checkpointer) -> PersistentGraph[State, State, Out
     return builder.compile(checkpointer=checkpointer)
 
 
-def test_run_with_an_interrupt_continues_from_the_stored_checkpoint(checkpointer: Checkpointer) -> None:
+def test_run_with_a_message_continues_from_the_stored_checkpoint(checkpointer: Checkpointer) -> None:
     """
-    Arrange: a thread that stopped at an interrupt, with its checkpoints in the given checkpointer.
-    Act: run the thread with a resume value, with the sync function.
+    Arrange: a thread that waits for a message, with its checkpoints in the given checkpointer.
+    Act: run the thread with a message, with the sync function.
     Assert: the output has the notes of all nodes and the answer.
     """
     graph = build_graph(checkpointer)
     graph.invoke({}, "thread")
 
-    actual = graph.invoke(Command(resume="answer"), "thread")
+    actual = graph.invoke(Message("answer"), "thread")
 
     expected = Finished(Output(notes=["first", "answer", "last"]))
     assert actual == expected, f"Expected {expected}, got {actual}."
@@ -80,20 +80,20 @@ def test_run_with_an_interrupt_continues_from_the_stored_checkpoint(checkpointer
 
 def test_threads_do_not_share_checkpoints(checkpointer: Checkpointer) -> None:
     """
-    Arrange: two threads, of which one stopped at an interrupt.
+    Arrange: two threads, of which one waits for a message.
     Act: read the latest checkpoint of a third thread and the steps of the two threads.
     Assert: the third thread has no checkpoint, and each thread has its own latest step.
     """
     graph = build_graph(checkpointer)
-    graph.invoke({}, "stopped")
+    graph.invoke({}, "waiting")
     graph.invoke({}, "finished")
-    graph.invoke(Command(resume="answer"), "finished")
+    graph.invoke(Message("answer"), "finished")
 
     missing = checkpointer.get_tuple("other", "", None)
-    steps = [graph.get_state(thread_id).step for thread_id in ("stopped", "finished")]
+    steps = [graph.get_state(thread_id).step for thread_id in ("waiting", "finished")]
 
     assert missing is None, f"Expected no checkpoint, got {missing}."
-    assert steps == [1, 3], f"Expected the steps [1, 3], got {steps}."
+    assert steps == [1, 4], f"Expected the steps [1, 4], got {steps}."
 
 
 @pytest.mark.parametrize(("skipped", "limit"), [(0, None), (0, 2), (1, None), (2, 1)])
@@ -119,9 +119,9 @@ def test_list_gives_the_checkpoints_before_an_id_with_the_newest_first(
 
 def test_checkpoint_is_found_by_its_id_with_its_pending_writes(checkpointer: Checkpointer) -> None:
     """
-    Arrange: a thread that stopped at an interrupt and got a record of its first command two times.
-    Act: read the checkpoint of the interrupt by its id, and read an id that the thread does not have.
-    Assert: the checkpoint has one record for the stop and one for the last record of the command.
+    Arrange: a thread that waits for a message and got a record of its first command two times.
+    Act: read the newest checkpoint by its id, and read an id that the thread does not have.
+    Assert: the checkpoint has only the last record of the command.
     """
     graph = build_graph(checkpointer)
     graph.invoke({}, "thread")
@@ -136,12 +136,8 @@ def test_checkpoint_is_found_by_its_id_with_its_pending_writes(checkpointer: Che
     actual = checkpointer.get_tuple("thread", "", stopped.id)
     missing = checkpointer.get_tuple("thread", "", UUID(int=1))
 
-    assert actual is not None, "Expected a checkpoint for the id of the stop, got None."
-    writes = actual.pending_writes
-    kinds = sorted(write.kind.value for write in writes)
-    commands = [write for write in writes if isinstance(write, RunCommandRecord)]
-    assert kinds == ["command", "stop"], f"Expected one stop record and one command record, got {kinds}."
-    assert commands == [two], f"Expected the last record of commands, got {commands}."
+    assert actual is not None, "Expected a checkpoint for the id of the newest checkpoint, got None."
+    assert actual.pending_writes == (two,), f"Expected only the last record of the command, got {actual}."
     assert missing is None, f"Expected no checkpoint for an unknown id, got {missing}."
 
 
@@ -166,24 +162,24 @@ def test_deleted_thread_has_no_checkpoints(checkpointer: Checkpointer) -> None:
 def test_sync_functions_of_the_graph_work_with_each_checkpointer(checkpointer: Checkpointer) -> None:
     """
     Arrange: a graph with a checkpointer.
-    Act: run a thread to an interrupt, update its state, resume it and read its history, with the sync functions.
+    Act: run a thread until it waits, update its state, send a message and read its history, with the sync functions.
     Assert: the run finishes with the notes of the nodes, the update and the answer, and the history has each step.
     """
     graph = build_graph(checkpointer)
     stopped = list(graph.stream({}, "thread"))
     graph.update_state("thread", {"notes": ["update"]}, as_node="first")
 
-    actual = graph.invoke(Command(resume="answer"), "thread")
+    actual = graph.invoke(Message("answer"), "thread")
 
     steps = [snapshot.step for snapshot in graph.get_state_history("thread")]
     expected = Finished(Output(notes=["first", "update", "answer", "last"]))
-    kinds = [type(part) for part in stopped if isinstance(part, UpdatesPart | InterruptsPart)]
-    assert kinds == [UpdatesPart, InterruptsPart], (
-        f"Expected the update of the first node and then the interrupt, got {stopped}."
+    kinds = [type(part) for part in stopped if isinstance(part, UpdatesPart | WaitingPart)]
+    assert kinds == [UpdatesPart, WaitingPart], (
+        f"Expected the update of the first node and then the waiting part, got {stopped}."
     )
     assert actual == expected, f"Expected {expected}, got {actual}."
-    assert steps == [4, 3, 2, 1, 0, -1], f"Expected the steps from 4 to -1, got {steps}."
-    assert graph.get_state("thread").step == 4, "Expected the state of the last step."
+    assert steps == [5, 4, 3, 2, 1, 0, -1], f"Expected the steps from 5 to -1, got {steps}."
+    assert graph.get_state("thread").step == 5, "Expected the state of the last step."
 
 
 def test_sync_functions_of_the_checkpointer_give_the_stored_checkpoints(checkpointer: Checkpointer) -> None:
@@ -207,14 +203,14 @@ def test_sync_functions_of_the_checkpointer_give_the_stored_checkpoints(checkpoi
 
 def test_async_functions_of_the_graph_work_with_each_checkpointer(checkpointer: Checkpointer) -> None:
     """
-    Arrange: a thread that stopped at an interrupt, made with the async function.
-    Act: resume the thread with the async function.
+    Arrange: a thread that waits for a message, made with the async function.
+    Act: run the thread with a message, with the async function.
     Assert: the output has the notes of all nodes and the answer.
     """
     graph = build_graph(checkpointer)
     asyncio.run(graph.ainvoke({}, "thread"))
 
-    actual = asyncio.run(graph.ainvoke(Command(resume="answer"), "thread"))
+    actual = asyncio.run(graph.ainvoke(Message("answer"), "thread"))
 
     expected = Finished(Output(notes=["first", "answer", "last"]))
     assert actual == expected, f"Expected {expected}, got {actual}."

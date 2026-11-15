@@ -37,6 +37,7 @@ from pregel_redux.pregel import (
     Channels,
     EphemeralValue,
     FieldKey,
+    HeldValue,
     JoinChannel,
     JoinKey,
     LastValueAfterFinish,
@@ -115,7 +116,7 @@ def load_writes(graph: AnyGraph, saved: SavedWrites) -> TaskWrites:
 
 def dump_branch(node: str, channel: BranchChannel) -> SavedBranch | None:
     match channel:
-        case EphemeralValue(stored=Stored()):
+        case EphemeralValue(stored=Stored()) | HeldValue(stored=Stored()):
             return SavedBranch(node=node, finished=None)
         case LastValueAfterFinish(stored=Stored()):
             return SavedBranch(node=node, finished=channel.finished)
@@ -127,6 +128,8 @@ def load_branch(channel: BranchChannel, saved: SavedBranch) -> BranchChannel:
     match channel:
         case EphemeralValue():
             return EphemeralValue(Stored(None))
+        case HeldValue():
+            return HeldValue(Stored(None))
         case LastValueAfterFinish():
             return LastValueAfterFinish(Stored(None), finished=bool(saved.finished))
         case _:
@@ -189,6 +192,11 @@ def dump_position(
             branches=tuple(branch for branch in branches if branch is not None),
             joins=tuple(dump_join(key, channel) for key, channel in channels.joins.items() if channel.seen),
             tasks=tuple(dump_send(graph, send) for send in channels.tasks.values),
+            received={
+                node: dump_json(graph.receivers[node].adapter, message.value)
+                for node, message in channels.received.items()
+                if message is not None
+            },
         ),
         channel_versions=ChannelVersions(
             start=versions.get(StartKey()),
@@ -219,6 +227,11 @@ def load_position(graph: AnyGraph, checkpoint: Checkpoint) -> Position:
         raise ValueError(
             f"the checkpoint refers to nodes {unknown_nodes!r} and joins {unknown_joins!r}, which are not in this graph"
         )
+    unknown_receivers = sorted(values.received.keys() - graph.receivers.keys())
+    if unknown_receivers:
+        raise ValueError(
+            f"the checkpoint has a message for each of {unknown_receivers!r}, which receive no message in this graph"
+        )
     channels = Channels(
         start=EphemeralValue(None if values.start is None else Stored(load_updates(graph, values.start))),
         fields={
@@ -231,6 +244,13 @@ def load_position(graph: AnyGraph, checkpoint: Checkpoint) -> Position:
         },
         joins={**opened.joins, **{key: load_join(opened.joins[key], join) for key, join in joins.items()}},
         tasks=Topic(tuple(load_send(graph, send) for send in values.tasks)),
+        received={
+            **opened.received,
+            **{
+                node: Stored(load_json(graph.receivers[node].adapter, message))
+                for node, message in values.received.items()
+            },
+        },
     )
     versions: dict[ChannelKey, int] = {
         **({} if checkpoint.channel_versions.start is None else {StartKey(): checkpoint.channel_versions.start}),

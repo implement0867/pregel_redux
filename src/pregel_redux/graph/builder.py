@@ -1,6 +1,8 @@
 from collections.abc import Callable, Collection, Mapping
 from dataclasses import dataclass
-from typing import Any, Concatenate, Literal, Never, Protocol, assert_never, overload, runtime_checkable
+from typing import Any, Concatenate, Literal, Never, Protocol, assert_never, get_args, overload, runtime_checkable
+
+from pydantic import TypeAdapter
 
 from pregel_redux.channels import build_channels, merge_channels
 from pregel_redux.checkpoints import Checkpointer
@@ -9,6 +11,7 @@ from pregel_redux.configs import RunTarget
 from pregel_redux.dependencies import CallPlan, NodeValue, Scope, Supplied, plan_call
 from pregel_redux.graph.compiled import Breakpoints, CompiledGraph, CompiledNode
 from pregel_redux.graph.persistent import PersistentGraph
+from pregel_redux.messages import MessageSchema
 from pregel_redux.pregel import BranchKey, JoinKey
 from pregel_redux.shutdown import ShutdownSignal
 from pregel_redux.streams import StreamWriter
@@ -140,6 +143,11 @@ class StateGraph[StateT, InputT, OutputT]:
     ) -> CompiledGraph[StateT, InputT, OutputT] | PersistentGraph[StateT, InputT, OutputT]:
         graph = self.compile_graph(dependency_overrides, list_supplied(persistent=checkpointer is not None))
         if checkpointer is None:
+            receivers = graph.find_receivers()
+            if receivers:
+                raise ValueError(
+                    f"the nodes {receivers!r} receive a message, and only a graph with a checkpointer can wait for one"
+                )
             return graph
         names = frozenset(graph.nodes)
         before = parse_breakpoints(interrupt_before, names)
@@ -183,6 +191,16 @@ class StateGraph[StateT, InputT, OutputT]:
             **{name: plan_call(node, overrides, supplied) for name, node in self.nodes.items()},
             **{name: child.compile_graph(overrides, supplied) for name, child in self.child_graphs.items()},
         }
+        waiting_deferred = sorted(
+            name
+            for name, action in actions.items()
+            if name in self.deferred and isinstance(action, CallPlan) and action.received is not None
+        )
+        if waiting_deferred:
+            raise ValueError(
+                f"the nodes {waiting_deferred!r} receive a message and are deferred, "
+                f"and a deferred node runs only when no other node waits"
+            )
         join_keys = sorted(
             (JoinKey(join.sources, join.target) for join in self.joins if isinstance(join.target, str)),
             key=lambda key: sorted(key.sources),
@@ -204,11 +222,23 @@ class StateGraph[StateT, InputT, OutputT]:
                     joins=frozenset(key for key in join_keys if name in key.sources),
                     defer=name in self.deferred,
                     triggers=(BranchKey(name), *(key for key in join_keys if key.target == name)),
+                    message=read_message_schema(action),
                 )
                 for name, action in actions.items()
             },
             entry_nodes=entry_nodes,
         )
+
+
+def read_message_schema(action: CallPlan | CompiledGraph[object, Never, object]) -> MessageSchema | None:
+    match action:
+        case CompiledGraph():
+            return None
+        case CallPlan():
+            annotation = action.received
+            return None if annotation is None else MessageSchema(get_args(annotation)[0], TypeAdapter(annotation))
+        case _:
+            assert_never(action)
 
 
 def parse_breakpoints(nodes: Collection[str] | Literal["*"], names: frozenset[str]) -> frozenset[str]:
@@ -226,7 +256,11 @@ def parse_breakpoints(nodes: Collection[str] | Literal["*"], names: frozenset[st
 
 
 def list_supplied(*, persistent: bool) -> Mapping[Supplied, Scope]:
-    supplied: dict[Supplied, Scope] = {NodeValue.state: Scope.node, StreamWriter: Scope.node}
+    supplied: dict[Supplied, Scope] = {
+        NodeValue.state: Scope.node,
+        NodeValue.received: Scope.node,
+        StreamWriter: Scope.node,
+    }
     if persistent:
         supplied |= {RunTarget: Scope.run, ShutdownSignal: Scope.run}
     return supplied

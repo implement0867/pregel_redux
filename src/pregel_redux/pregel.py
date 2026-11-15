@@ -76,6 +76,23 @@ class LastValueAfterFinish[ValueT]:
         return LastValueAfterFinish(self.stored, finished=True)
 
 
+@dataclass(frozen=True)
+class HeldValue[ValueT]:
+    stored: Stored[ValueT] | None
+
+    def is_available(self) -> bool:
+        return self.stored is not None
+
+    def update(self, values: Sequence[ValueT]) -> "HeldValue[ValueT] | None":
+        return HeldValue(Stored(values[-1])) if values else None
+
+    def consume(self) -> "HeldValue[ValueT] | None":
+        return None if self.stored is None else HeldValue(None)
+
+    def finish(self) -> "HeldValue[ValueT] | None":
+        return None
+
+
 def add_names(names: frozenset[str], seen: frozenset[str], values: Sequence[str]) -> frozenset[str] | None:
     unknown = sorted(set(values) - names)
     if unknown:
@@ -135,7 +152,7 @@ class Topic[ItemT]:
         return Topic(tuple(values)) if values or self.values else None
 
 
-type BranchChannel = EphemeralValue[None] | LastValueAfterFinish[None]
+type BranchChannel = EphemeralValue[None] | LastValueAfterFinish[None] | HeldValue[None]
 type JoinChannel = NamedBarrierValue | NamedBarrierValueAfterFinish
 
 
@@ -146,6 +163,7 @@ class Channels:
     branches: Mapping[str, BranchChannel]
     joins: Mapping[JoinKey, JoinChannel]
     tasks: Topic[Send]
+    received: Mapping[str, Stored[object] | None]
 
     def is_available(self, key: TriggerKey) -> bool:
         match key:
@@ -210,6 +228,7 @@ def open_channels(
     given: Mapping[str, object],
     branches: Mapping[str, BranchChannel],
     joins: Mapping[JoinKey, JoinChannel],
+    receivers: Collection[str],
 ) -> Position:
     reject_unknown_channels(fields, given)
     opened = {name: channel.open() for name, channel in fields.items()}
@@ -219,6 +238,7 @@ def open_channels(
         branches=branches,
         joins=joins,
         tasks=Topic(()),
+        received=dict.fromkeys(receivers),
     )
     return Position(channels, {FieldKey(name): 1 for name in channels.read_values()}, {})
 
@@ -227,12 +247,28 @@ def plan_tasks(position: Position, triggers: Mapping[str, Sequence[TriggerKey]])
     stored = position.channels.start.stored
     seen_start = position.seen.get(Endpoint.start, {}).get(StartKey(), 0)
     starts = [StartTask(stored.value)] if stored is not None and position.versions[StartKey()] > seen_start else []
+    waiting = find_waiting(position, triggers)
     pulls = [
         PullTask(node, tuple(triggers[node]))
         for node in sorted(triggers)
-        if position.is_triggered(node, triggers[node])
+        if position.is_triggered(node, triggers[node]) and node not in waiting
     ]
     return [*starts, *pulls, *(PushTask(index, send) for index, send in enumerate(position.channels.tasks.values))]
+
+
+def find_waiting(position: Position, triggers: Mapping[str, Sequence[TriggerKey]]) -> list[str]:
+    return [
+        node
+        for node, message in sorted(position.channels.received.items())
+        if message is None and position.is_triggered(node, triggers[node])
+    ]
+
+
+def deliver(position: Position, triggers: Mapping[str, Sequence[TriggerKey]], node: str, message: object) -> Position:
+    if plan_tasks(position, triggers) or node not in find_waiting(position, triggers):
+        raise ValueError(f"node {node!r} does not wait for a message at this checkpoint")
+    channels = position.channels
+    return replace(position, channels=replace(channels, received={**channels.received, node: Stored(message)}))
 
 
 def change_channels[KeyT, ChannelT](
@@ -256,7 +292,7 @@ def finish_channels(position: Position) -> Position:
     changed: list[ChannelKey] = [*(BranchKey(node) for node in finished_branches), *finished_joins]
     next_version = max(position.versions.values(), default=0) + 1
     return Position(
-        Channels(channels.start, channels.fields, branches, joins, channels.tasks),
+        replace(channels, branches=branches, joins=joins),
         {**position.versions, **dict.fromkeys(changed, next_version)},
         position.seen,
     )
@@ -326,7 +362,10 @@ def apply_writes(
     finished_branches: set[str] = set()
     finished_joins: set[JoinKey] = set()
     pending_sends = (channels.tasks if tasks_channel is None else tasks_channel).values
-    if bump_step and not start_updated and not pending_sends and updated_triggers.isdisjoint(trigger_keys):
+    held = any(branches[node].is_available() for node in channels.received) or any(
+        channel.is_available() for key, channel in joins.items() if key.target in channels.received
+    )
+    if bump_step and not start_updated and not pending_sends and not held and updated_triggers.isdisjoint(trigger_keys):
         branches, finished_branches = change_channels(branches, lambda node, channel: channel.finish())
         joins, finished_joins = change_channels(joins, lambda key, channel: channel.finish())
 
@@ -345,6 +384,10 @@ def apply_writes(
             branches=branches,
             joins=joins,
             tasks=channels.tasks if tasks_channel is None else tasks_channel,
+            received={
+                **channels.received,
+                **{key.node: None for key in consumed if isinstance(key, BranchKey) and key.node in channels.received},
+            },
         ),
         {**position.versions, **dict.fromkeys(changed, next_version)},
         seen,
@@ -367,4 +410,6 @@ def apply_command(
     sends = (*position.channels.tasks.values, *writes.sends) if writes.sends else ()
     branches = frozenset(node for node in writes.branches if not position.channels.branches[node].is_available())
     applied = apply_writes(position, [], [replace(writes, branches=branches, sends=sends)], [], trigger_keys)
-    return applied if plan_tasks(applied, triggers) else finish_channels(applied)
+    if plan_tasks(applied, triggers) or find_waiting(applied, triggers):
+        return applied
+    return finish_channels(applied)

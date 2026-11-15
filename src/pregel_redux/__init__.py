@@ -10,9 +10,10 @@ from pregel_redux.checkpoints import (
 )
 from pregel_redux.commands import Command, Endpoint, Send
 from pregel_redux.configs import Namespace, RunTarget, Segment
-from pregel_redux.dependencies import Depends, Scope, StateDep
+from pregel_redux.dependencies import Depends, Received, Scope, StateDep
 from pregel_redux.graph import CompiledGraph, PersistentGraph, StateGraph
-from pregel_redux.interrupts import Finished, Interrupt, Interrupted, StopReason, interrupt
+from pregel_redux.messages import Entrance, Message
+from pregel_redux.results import Finished, Stopped, StopReason, Waiting
 from pregel_redux.shutdown import RunAborted, ShutdownController, ShutdownSignal, graceful_shutdown
 from pregel_redux.snapshots import (
     FailedTask,
@@ -27,13 +28,14 @@ from pregel_redux.streams import (
     CheckpointPart,
     ChildPart,
     CustomPart,
-    InterruptsPart,
+    StoppedPart,
     StreamPart,
     StreamWriter,
     TaskResultPart,
     TaskStartPart,
     UpdatesPart,
     ValuesPart,
+    WaitingPart,
 )
 from pregel_redux.task_refs import PullRef, PushRef, StartRef, TaskRef
 
@@ -51,19 +53,19 @@ __all__ = [
     "CustomPart",
     "Depends",
     "Endpoint",
+    "Entrance",
     "FailedTask",
     "Finished",
     "FinishedTask",
     "InMemoryCheckpointer",
-    "Interrupt",
-    "Interrupted",
-    "InterruptsPart",
+    "Message",
     "Namespace",
     "PendingTask",
     "PendingWrite",
     "PersistentGraph",
     "PullRef",
     "PushRef",
+    "Received",
     "Reducer",
     "RunAborted",
     "RunTarget",
@@ -77,6 +79,8 @@ __all__ = [
     "StateGraph",
     "StateSnapshot",
     "StopReason",
+    "Stopped",
+    "StoppedPart",
     "StreamPart",
     "StreamWriter",
     "TaskRef",
@@ -86,7 +90,8 @@ __all__ = [
     "TaskStatus",
     "UpdatesPart",
     "ValuesPart",
+    "Waiting",
+    "WaitingPart",
     "WaitingTask",
     "graceful_shutdown",
-    "interrupt",
 ]

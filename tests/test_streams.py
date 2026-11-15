@@ -5,25 +5,26 @@ from typing import Annotated, Concatenate, TypedDict
 import pytest
 
 from pregel_redux import (
-    Command,
     CompiledGraph,
     Endpoint,
+    Entrance,
     InMemoryCheckpointer,
+    Message,
+    Received,
     Reducer,
     StateGraph,
     StreamWriter,
-    interrupt,
 )
 from pregel_redux.streams import (
     CheckpointPart,
     ChildPart,
     CustomPart,
-    InterruptsPart,
     StreamPart,
     TaskResultPart,
     TaskStartPart,
     UpdatesPart,
     ValuesPart,
+    WaitingPart,
 )
 from tests.conftest import collect, join_lists
 
@@ -49,8 +50,8 @@ async def write_async(state: State, writer: StreamWriter) -> State:
     return {"notes": ["async"]}
 
 
-def ask(state: State) -> State:
-    return {"notes": [interrupt("question", response_schema=str)]}
+def ask(state: State, answer: Received[str]) -> State:
+    return {"notes": [answer]}
 
 
 def fail(state: State) -> State:
@@ -96,12 +97,12 @@ def test_stream_gives_each_part_in_the_order_of_the_run() -> None:
 
     ids = [part.id for part in actual if isinstance(part, TaskStartPart)]
     expected: list[StreamPart | ChildPart] = [
-        ValuesPart({"notes": []}, ()),
+        ValuesPart({"notes": []}),
         TaskStartPart(ids[0], "first", {"notes": []}),
         CustomPart("first works"),
         UpdatesPart("first", {"notes": ["first"]}),
-        TaskResultPart(ids[0], "first", {"notes": ["first"]}, ()),
-        ValuesPart({"notes": ["first"]}, ()),
+        TaskResultPart(ids[0], "first", {"notes": ["first"]}),
+        ValuesPart({"notes": ["first"]}),
     ]
     assert actual == expected, f"Expected {expected}, got {actual}."
 
@@ -118,9 +119,9 @@ def test_values_parts_give_the_state_after_each_step() -> None:
 
     actual = [part for part in parts if isinstance(part, ValuesPart)]
     expected = [
-        ValuesPart({"notes": ["input"]}, ()),
-        ValuesPart({"notes": ["input", "first"]}, ()),
-        ValuesPart({"notes": ["input", "first", "second"]}, ()),
+        ValuesPart({"notes": ["input"]}),
+        ValuesPart({"notes": ["input", "first"]}),
+        ValuesPart({"notes": ["input", "first", "second"]}),
     ]
     assert actual == expected, f"Expected {expected}, got {actual}."
 
@@ -249,36 +250,34 @@ def test_stream_that_the_reader_leaves_cancels_the_run() -> None:
     assert calls == [], f"Expected no call of the second node, got {calls}."
 
 
-def test_stream_of_a_thread_gives_the_interrupt_and_continues_with_a_resume_value() -> None:
+def test_stream_of_a_thread_gives_the_entrance_and_continues_with_a_message() -> None:
     """
-    Arrange: a graph with a checkpointer whose second node calls interrupt.
-    Act: stream a run, then stream a run with a resume value.
-    Assert: the first stream ends with a values part and an interrupts part that have the interrupt, and the
-    second stream has the update with the answer.
+    Arrange: a graph with a checkpointer whose second node receives a message.
+    Act: stream a run, then stream a run with a message.
+    Assert: the first stream ends with the values after the first node and a waiting part that has the entrance
+    of the second node, and the second stream has the update with the answer.
     """
     graph = build_builder(("first", build_writer("first")), ("ask", ask)).compile(checkpointer=InMemoryCheckpointer())
 
     stopped = asyncio.run(collect(graph.astream({}, "thread")))
-    resumed = list(graph.stream(Command(resume="answer"), "thread"))
+    resumed = list(graph.stream(Message("answer"), "thread"))
 
-    values = [part.interrupts[0].value for part in stopped[-2:] if isinstance(part, ValuesPart | InterruptsPart)]
-    kinds = [type(part) for part in stopped[-2:]]
+    expected = [ValuesPart({"notes": ["first"]}), WaitingPart({Entrance((), "ask"): str})]
     updates = [part for part in resumed if isinstance(part, UpdatesPart)]
-    assert kinds == [ValuesPart, InterruptsPart], f"Expected a values part and an interrupts part, got {kinds}."
-    assert values == ["question", "question"], f"Expected the value of the interrupt in each part, got {values}."
+    assert stopped[-2:] == expected, f"Expected {expected} at the end of the stream, got {stopped[-2:]}."
     assert updates == [UpdatesPart("ask", {"notes": ["answer"]})], f"Expected the answer, got {updates}."
 
 
-def test_stream_without_a_checkpointer_rejects_an_interrupt() -> None:
+def test_graph_without_a_checkpointer_rejects_a_node_that_receives_a_message() -> None:
     """
-    Arrange: a graph without a checkpointer whose node calls interrupt.
-    Act: stream a run.
-    Assert: the stream raises RuntimeError.
+    Arrange: a builder whose node receives a message.
+    Act: compile the graph without a checkpointer.
+    Assert: compile raises ValueError.
     """
-    graph = build_builder(("ask", ask)).compile()
+    builder = build_builder(("ask", ask))
 
-    with pytest.raises(RuntimeError):
-        list(graph.stream({}))
+    with pytest.raises(ValueError):
+        builder.compile()
 
 
 def test_invoke_ignores_the_data_that_a_node_writes() -> None:
@@ -323,20 +322,31 @@ def test_task_parts_give_the_start_and_the_result_of_each_node() -> None:
     assert len({part.id for part in starts}) == 2, f"Expected a different id for each task, got {starts}."
 
 
-def test_task_result_part_gives_the_interrupts_of_a_node_that_stops() -> None:
+def test_task_of_a_child_graph_that_waits_has_a_start_part_and_no_result_part() -> None:
     """
-    Arrange: a graph with a checkpointer whose node calls interrupt.
+    Arrange: a graph with a checkpointer whose child graph has a node that receives a message.
     Act: stream a run.
-    Assert: the result part of the node has the interrupt and no update.
+    Assert: the stream has the start part of the task of the child graph, no result part for it, and a waiting
+    part with the entrance in the child graph.
     """
-    graph = build_builder(("ask", ask)).compile(checkpointer=InMemoryCheckpointer())
+    child = StateGraph(State, output_schema=State)
+    child.add_node("ask", ask)
+    child.add_edge(Endpoint.start, "ask")
+    parent = StateGraph(State, output_schema=Output)
+    parent.add_node("child", child)
+    parent.add_edge(Endpoint.start, "child")
+    graph = parent.compile(checkpointer=InMemoryCheckpointer())
 
     actual = list(graph.stream({}, "thread"))
 
-    results = [part for part in actual if isinstance(part, TaskResultPart)]
-    values = [[item.value for item in part.interrupts] for part in results]
-    assert values == [["question"]], f"Expected one result part with the interrupt, got {actual}."
-    assert [part.update for part in results] == [{}], f"Expected no update, got {results}."
+    kinds = [(type(part), part.name) for part in actual if isinstance(part, TaskStartPart | TaskResultPart)]
+    entrances = [
+        [(len(entrance.checkpoint_ns), entrance.node) for entrance in part.accepts]
+        for part in actual
+        if isinstance(part, WaitingPart)
+    ]
+    assert kinds == [(TaskStartPart, "child")], f"Expected only the start part of the child task, got {kinds}."
+    assert entrances == [[(1, "ask")]], f"Expected one waiting part with the entrance of the child, got {entrances}."
 
 
 def test_checkpoint_parts_give_the_state_of_each_checkpoint() -> None:
@@ -361,17 +371,35 @@ def test_checkpoint_parts_give_the_state_of_each_checkpoint() -> None:
 
 def test_stream_gives_no_checkpoint_part_for_a_run_that_continues_without_a_new_checkpoint() -> None:
     """
-    Arrange: a thread that stopped at an interrupt after its first node.
-    Act: resume the thread with a stream.
-    Assert: the stream has only the checkpoint that the resumed node made.
+    Arrange: a thread that stopped before its second node.
+    Act: continue the thread without an input, with a stream.
+    Assert: the stream has only the checkpoint that the second node made.
+    """
+    graph = build_builder(("first", build_writer("first")), ("second", build_writer("second"))).compile(
+        checkpointer=InMemoryCheckpointer(), interrupt_before=["second"]
+    )
+    graph.invoke({}, "thread")
+
+    actual = list(graph.stream(None, "thread"))
+
+    steps = [part.state.step for part in actual if isinstance(part, CheckpointPart)]
+    assert steps == [2], f"Expected only the checkpoint of step 2, got {steps}."
+
+
+def test_stream_of_a_message_gives_the_checkpoint_of_the_message_and_of_its_node() -> None:
+    """
+    Arrange: a thread that waits for a message after its first node.
+    Act: stream a run with a message.
+    Assert: the stream has the checkpoint that holds the message, with its node next, then the checkpoint of the node.
     """
     graph = build_builder(("first", build_writer("first")), ("ask", ask)).compile(checkpointer=InMemoryCheckpointer())
     graph.invoke({}, "thread")
 
-    actual = list(graph.stream(Command(resume="answer"), "thread"))
+    actual = list(graph.stream(Message("answer"), "thread"))
 
-    steps = [part.state.step for part in actual if isinstance(part, CheckpointPart)]
-    assert steps == [2], f"Expected only the checkpoint of step 2, got {steps}."
+    steps = [(part.state.step, part.state.next) for part in actual if isinstance(part, CheckpointPart)]
+    expected = [(2, ("ask",)), (3, ())]
+    assert steps == expected, f"Expected {expected}, got {steps}."
 
 
 def test_stream_without_a_checkpointer_gives_no_checkpoint_part() -> None:

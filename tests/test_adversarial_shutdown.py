@@ -265,5 +265,5 @@ def test_stream_gives_no_task_result_for_a_child_graph_that_a_graceful_shutdown_
     assert snapshot.next == ("child",), f"Expected the child graph task to wait, got {snapshot.next}."
     assert results == [], (
         f"Expected no result for the child graph task that did not finish, got {results}. "
-        "The part has no update and no interrupt, the same as a task that ended with an empty update."
+        "A task that did not finish has no result."
     )
