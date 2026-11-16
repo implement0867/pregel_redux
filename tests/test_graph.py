@@ -7,7 +7,7 @@ from typing import Annotated, Literal, TypedDict
 import pytest
 from pydantic import BaseModel
 
-from pregel_redux import Command, Endpoint, Reducer, StateGraph
+from pregel_redux import Command, Endpoint, Overwrite, Reducer, StateGraph
 from tests.conftest import append_item, join_lists
 
 
@@ -226,6 +226,25 @@ def test_value_that_is_not_of_the_declared_type_of_its_channel_is_rejected(
     """
     builder = StateGraph(schema)
     builder.add_node("write", lambda state: {"items": node_write})
+    builder.add_edge(Endpoint.start, "write")
+
+    with pytest.raises(ValueError):
+        asyncio.run(builder.compile().ainvoke(input_state))
+
+
+@pytest.mark.parametrize(
+    "input_state",
+    [{"items": Overwrite(["input"])}, {"items": Overwrite("input")}],
+    ids=["value-of-the-channel-type", "value-of-the-update-type"],
+)
+def test_overwrite_in_the_input_of_a_graph_is_rejected(input_state: AppendDict) -> None:
+    """
+    Arrange: a graph with a reducer channel.
+    Act: run the graph with an input that has an Overwrite.
+    Assert: a ValueError is raised.
+    """
+    builder = StateGraph(AppendDict)
+    builder.add_node("write", lambda state: None)
     builder.add_edge(Endpoint.start, "write")
 
     with pytest.raises(ValueError):

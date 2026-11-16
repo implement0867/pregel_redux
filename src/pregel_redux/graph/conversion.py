@@ -6,6 +6,8 @@ from datetime import datetime
 from typing import Never, assert_never
 from uuid import UUID
 
+from pydantic import JsonValue
+
 from pregel_redux.channels import (
     Overwrite,
     Stored,
@@ -82,7 +84,16 @@ def load_send(graph: AnyGraph, send: PendingSend) -> Send:
     return Send(send.node, load_json(graph.nodes[send.node].input_adapter, send.node_input))
 
 
-def dump_updates(graph: AnyGraph, updates: Mapping[str, object]) -> SavedUpdates:
+def dump_updates(graph: AnyGraph, updates: Mapping[str, object]) -> dict[str, JsonValue]:
+    return {name: dump_json(graph.channels[name].update_adapter, value) for name, value in updates.items()}
+
+
+def load_updates(graph: AnyGraph, updates: Mapping[str, JsonValue]) -> dict[str, object]:
+    reject_unknown_channels(graph.channels, updates)
+    return {name: load_json(graph.channels[name].update_adapter, value) for name, value in updates.items()}
+
+
+def dump_field_writes(graph: AnyGraph, updates: Mapping[str, object]) -> SavedUpdates:
     return SavedUpdates(
         updates={
             name: dump_json(graph.channels[name].update_adapter, value)
@@ -97,7 +108,7 @@ def dump_updates(graph: AnyGraph, updates: Mapping[str, object]) -> SavedUpdates
     )
 
 
-def load_updates(graph: AnyGraph, saved: SavedUpdates) -> dict[str, object]:
+def load_field_writes(graph: AnyGraph, saved: SavedUpdates) -> dict[str, object]:
     reject_unknown_channels(graph.channels, [*saved.updates, *saved.overwrites])
     repeated = sorted(saved.updates.keys() & saved.overwrites.keys())
     if repeated:
@@ -110,7 +121,7 @@ def load_updates(graph: AnyGraph, saved: SavedUpdates) -> dict[str, object]:
 
 def dump_writes(graph: AnyGraph, writes: TaskWrites) -> SavedWrites:
     return SavedWrites(
-        fields=dump_updates(graph, writes.fields),
+        fields=dump_field_writes(graph, writes.fields),
         branches=tuple(sorted(writes.branches)),
         arrivals=tuple(
             SavedArrival(sources=tuple(sorted(arrival.join.sources)), target=arrival.join.target, source=arrival.source)
@@ -122,7 +133,7 @@ def dump_writes(graph: AnyGraph, writes: TaskWrites) -> SavedWrites:
 
 def load_writes(graph: AnyGraph, saved: SavedWrites) -> TaskWrites:
     return TaskWrites(
-        fields=load_updates(graph, saved.fields),
+        fields=load_field_writes(graph, saved.fields),
         branches=frozenset(saved.branches),
         arrivals=tuple(
             Arrival(JoinKey(frozenset(arrival.sources), arrival.target), arrival.source) for arrival in saved.arrivals

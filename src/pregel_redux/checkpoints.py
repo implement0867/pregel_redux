@@ -114,7 +114,7 @@ class SavedJoin(Record):
 
 
 class ChannelValues(Record):
-    start: SavedUpdates | None
+    start: dict[str, JsonValue] | None
     fields: dict[str, JsonValue]
     branches: tuple[SavedBranch, ...]
     joins: tuple[SavedJoin, ...]

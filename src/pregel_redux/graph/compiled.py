@@ -11,7 +11,7 @@ from uuid import NAMESPACE_OID, uuid5
 from pydantic import TypeAdapter
 from typing_extensions import TypeForm
 
-from pregel_redux.channels import Channel, extract_writes, parse_updates
+from pregel_redux.channels import Channel, Overwrite, extract_writes, parse_updates
 from pregel_redux.checkpoints import CheckpointSource
 from pregel_redux.commands import Send, read_outcome
 from pregel_redux.configs import Namespace, Segment, encode_namespace
@@ -316,6 +316,12 @@ class CompiledGraph[StateT, InputT, OutputT]:
             *plan_tasks(position, self.triggers),
             *(PullTask(node, self.triggers[node]) for node in find_waiting(position, self.triggers)),
         ]
+        overwritten = sorted(name for name, value in input_writes.items() if isinstance(value, Overwrite))
+        if overwritten:
+            raise ValueError(
+                f"the input has an Overwrite for each of {overwritten!r}, "
+                "and only the result of a node or the update of a command can have one"
+            )
         return apply_writes(position, discarded, [], [parse_updates(self.channels, input_writes)], self.trigger_keys)
 
     def build_call(self, task: Task, position: Position) -> NodeCall:
