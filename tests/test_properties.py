@@ -1,7 +1,16 @@
 import asyncio
 import threading
 from collections import Counter
-from collections.abc import AsyncGenerator, AsyncIterator, Callable, Generator, Iterator, Mapping, Sequence
+from collections.abc import (
+    AsyncGenerator,
+    AsyncIterator,
+    Callable,
+    Collection,
+    Generator,
+    Iterator,
+    Mapping,
+    Sequence,
+)
 from contextlib import AbstractContextManager, ExitStack, aclosing, closing, contextmanager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -12,7 +21,7 @@ from typing import Annotated, TypedDict, assert_never
 from uuid import UUID
 
 import pytest
-from hypothesis import event, find, settings
+from hypothesis import event, example, find, given, settings
 from hypothesis import strategies as st
 from hypothesis.stateful import RuleBasedStateMachine, initialize, invariant, precondition, rule
 from pydantic import TypeAdapter, ValidationError
@@ -150,6 +159,8 @@ class Execution:
     clock: int
     observed: tuple[str, ...]
     received: str | None
+    ns: Namespace
+    routed: tuple[int, ...] = ()
     completed: bool = False
 
 
@@ -165,6 +176,10 @@ class Trace:
     requested: list[datetime] = field(default_factory=list)
     aborts: int = 0
     era: int = 0
+    direct_views: set[tuple[str, ...]] = field(default_factory=set)
+    granted: set[tuple[int, ...]] = field(default_factory=set)
+    discarded: set[str] = field(default_factory=set)
+    command_sends: set[str] = field(default_factory=set)
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def begin(self, execution: Execution) -> str:
@@ -201,6 +216,10 @@ class Trace:
                 self.controller.abort()
             case _:
                 assert_never(stop)
+
+    def discard_pending_sends(self, kept: Collection[str]) -> None:
+        arrived = {run.origin for label, run in list(self.executions.items()) if label in kept}
+        self.discarded.update(tag for tag, (sender, _) in self.tags.items() if sender in kept and tag not in arrived)
 
     def start_era(self) -> None:
         self.era += 1
@@ -336,7 +355,13 @@ def build_function(spec: GraphSpec, work: FunctionSpec, path: tuple[int, ...], b
 
     def start(state: State, writer: StreamWriter, received: str | None) -> tuple[Execution, str]:
         execution = Execution(
-            path, trace.era, state.get("origin"), state.get("clock", 0), tuple(state.get("visits", [])), received
+            path,
+            trace.era,
+            state.get("origin"),
+            state.get("clock", 0),
+            tuple(state.get("visits", [])),
+            received,
+            writer.ns,
         )
         label = trace.begin(execution)
         writer(label)
@@ -355,6 +380,7 @@ def build_function(spec: GraphSpec, work: FunctionSpec, path: tuple[int, ...], b
                     visit in trace.executions and trace.executions[visit].path == path for visit in execution.observed
                 )
                 back = router.back if rounds < router.rounds else ()
+                execution.routed = (*router.forward, *back)
                 result = Command[str](
                     update=update,
                     goto=[
@@ -553,6 +579,204 @@ def find_unfired_joins(spec: GraphSpec, trace: Trace) -> list[JoinSpec]:
     ]
 
 
+@dataclass(frozen=True)
+class Level:
+    graph: GraphSpec
+    path: tuple[int, ...]
+    runs: Mapping[str, Execution]
+
+
+def find_levels(spec: GraphSpec, trace: Trace) -> list[Level]:
+    graphs = dict(walk_graphs(spec, ()))
+    groups: dict[tuple[int, Namespace], dict[str, Execution]] = {}
+    for label, run in list(trace.executions.items()):
+        groups.setdefault((run.era, run.ns), {})[label] = run
+    levels: list[Level] = []
+    for runs in groups.values():
+        path = next(iter(runs.values())).path[:-1]
+        levels.append(Level(graphs[path], path, runs))
+    return levels
+
+
+def find_nodes_with_a_way_other_than_a_join(graph: GraphSpec) -> set[int]:
+    found = set(graph.entries)
+    for node in graph.nodes:
+        found.update(node.targets)
+        match node.work:
+            case FunctionSpec(action=RouterSpec() as router):
+                found.update((*router.forward, *router.sends, *router.back))
+            case FunctionSpec() | ChildSpec():
+                pass
+            case _:
+                assert_never(node.work)
+    return found
+
+
+def find_sender(trace: Trace, run: Execution) -> str | None:
+    if run.origin in trace.tags and run.observed[-1:] == (run.origin,):
+        return trace.tags[run.origin][0]
+    return None
+
+
+def is_started_by_a_send(trace: Trace, run: Execution) -> bool:
+    return find_sender(trace, run) is not None or (run.origin in trace.command_sends and len(run.path) == 1)
+
+
+def find_early_deferred(trace: Trace, levels: Sequence[Level]) -> list[tuple[str, str]]:
+    early: list[tuple[str, str]] = []
+    for level in levels:
+        nodes = level.graph.nodes
+        late = {
+            label
+            for label, run in level.runs.items()
+            if nodes[run.path[-1]].defer and not is_started_by_a_send(trace, run)
+        }
+        for late_label in late:
+            seen = set(level.runs[late_label].observed)
+            for label, run in level.runs.items():
+                if not run.completed or nodes[run.path[-1]].defer or label in seen:
+                    continue
+                sender = find_sender(trace, run)
+                if sender is not None:
+                    waited = sender not in seen
+                elif is_started_by_a_send(trace, run):
+                    waited = True
+                else:
+                    waited = not (late - seen).isdisjoint(run.observed) or (
+                        run.observed == level.runs[late_label].observed and run.observed in trace.direct_views
+                    )
+                if not waited:
+                    early.append((late_label, label))
+    return early
+
+
+def find_uncaused(trace: Trace, levels: Sequence[Level]) -> list[str]:
+    uncaused: list[str] = []
+    for level in levels:
+        graph = level.graph
+        depth = len(level.path)
+        other_ways = find_nodes_with_a_way_other_than_a_join(graph)
+        for label, run in level.runs.items():
+            index = run.path[-1]
+            if (
+                is_started_by_a_send(trace, run)
+                or run.path in trace.granted
+                or run.observed in trace.direct_views
+                or (
+                    index in graph.entries
+                    and not any(
+                        seen in level.runs
+                        and level.runs[seen].path == run.path
+                        and not is_started_by_a_send(trace, level.runs[seen])
+                        for seen in run.observed
+                    )
+                )
+            ):
+                continue
+            known = [
+                seen
+                for seen in run.observed
+                if seen in trace.executions and trace.executions[seen].path[:depth] == level.path
+            ]
+            earlier = [
+                seen
+                for seen in known
+                if trace.executions[seen].path == run.path and not is_started_by_a_send(trace, trace.executions[seen])
+            ]
+            old = set(trace.executions[earlier[-1]].observed) if earlier else set[str]()
+            fresh = [trace.executions[seen] for seen in known if seen not in old]
+            finished = {trace.executions[seen].path[depth] for seen in known}
+            finished_again = {item.path[depth] for item in fresh}
+            routed = {target for item in fresh if item.path[:-1] == level.path for target in item.routed}
+            joins = [join for join in graph.joins if join.target == index]
+            only_join = index not in other_ways and len(joins) == 1
+            by_join = any(
+                finished_again >= set(join.sources)
+                if only_join
+                else finished >= set(join.sources) and not finished_again.isdisjoint(join.sources)
+                for join in joins
+            )
+            by_edge = any(index in graph.nodes[source].targets for source in finished_again)
+            if not (by_edge or by_join or index in routed):
+                uncaused.append(label)
+    return uncaused
+
+
+def find_wrong_views(trace: Trace, levels: Sequence[Level]) -> list[tuple[str, str]]:
+    wrong: list[tuple[str, str]] = []
+    for label, run in list(trace.executions.items()):
+        wrong.extend((label, seen) for seen, count in Counter(run.observed).items() if count > 1)
+        wrong.extend(
+            (label, seen) for seen in run.observed if seen in trace.executions and not trace.executions[seen].completed
+        )
+    for level in levels:
+        pulls = {label: run for label, run in level.runs.items() if not is_started_by_a_send(trace, run)}
+        for label, run in pulls.items():
+            for seen in run.observed:
+                if seen not in pulls:
+                    continue
+                earlier = pulls[seen].observed
+                if run.observed[: len(earlier)] != earlier:
+                    wrong.append((label, seen))
+                wrong.extend(
+                    (label, other)
+                    for other, peer in pulls.items()
+                    if peer.completed and peer.observed == earlier and other not in run.observed
+                )
+    return wrong
+
+
+def find_wrong_sends(spec: GraphSpec, trace: Trace, visits: Sequence[str] | None) -> list[tuple[str, str]]:
+    graphs = dict(walk_graphs(spec, ()))
+    runs = list(trace.executions.items())
+    wrong: list[tuple[str, str]] = []
+    for tag, (sender_label, position) in list(trace.tags.items()):
+        sender = trace.executions[sender_label]
+        graph = graphs[sender.path[:-1]]
+        match graph.nodes[sender.path[-1]].work:
+            case FunctionSpec(action=RouterSpec(sends=sends)):
+                target = (*sender.path[:-1], sends[position])
+            case _:
+                raise TypeError(f"Expected the sender of {tag!r} to be a router.")
+        started = [(label, run) for label, run in runs if run.origin == tag]
+        arrived = (
+            None
+            if visits is None or sender_label not in visits or tag in trace.discarded
+            else [label for label, _ in started if label in visits]
+        )
+        match graph.nodes[target[-1]].work:
+            case FunctionSpec():
+                expected = (target, sender.ns, sender.clock, (*sender.observed, sender_label, tag))
+                wrong.extend(
+                    (tag, label) for label, run in started if (run.path, run.ns, run.clock, run.observed) != expected
+                )
+                if arrived is not None and len(arrived) != 1:
+                    wrong.append((tag, sender_label))
+            case ChildSpec():
+                wrong.extend(
+                    (tag, label)
+                    for label, run in started
+                    if run.path[: len(target)] != target or len(run.path) == len(target) or tag in run.observed
+                )
+                if arrived is not None and not arrived:
+                    wrong.append((tag, sender_label))
+            case _ as unknown:
+                assert_never(unknown)
+    return wrong
+
+
+def check_order_rules(spec: GraphSpec, trace: Trace, visits: Sequence[str] | None) -> None:
+    levels = find_levels(spec, trace)
+    broken = {
+        "a deferred node waits until no other node can run": find_early_deferred(trace, levels),
+        "an edge, a goto, a send or a full join comes before each node execution": find_uncaused(trace, levels),
+        "a node sees each write of the earlier steps one time": find_wrong_views(trace, levels),
+        "a send starts one execution of its node with its payload": find_wrong_sends(spec, trace, visits),
+    }
+    failures = {rule: found for rule, found in broken.items() if found}
+    assert not failures, f"Expected the trace to follow each order rule, got {failures} in {trace.executions}."
+
+
 def run_plain(spec: GraphSpec, origin: str) -> tuple[Trace, State]:
     trace = Trace()
     graph = build_graph(spec, Build(interactive=False, async_nodes=True, trace=trace)).compile()
@@ -626,6 +850,16 @@ def find_path(spec: GraphSpec, entrance: Entrance) -> tuple[int, ...]:
                 pass
             case _ as unknown:
                 assert_never(unknown)
+    return tuple(path)
+
+
+def find_level_path(spec: GraphSpec, checkpoint_ns: Namespace) -> tuple[int, ...]:
+    found = spec
+    path: list[int] = []
+    for segment in checkpoint_ns:
+        index = next(index for index, node in enumerate(found.nodes) if node.name == segment.node)
+        path.append(index)
+        found = find_spec(found, (segment,))
     return tuple(path)
 
 
@@ -719,6 +953,7 @@ class ThreadMachine(RuleBasedStateMachine):
         plain_trace, output = run_plain(spec, origin)
         unfired = find_unfired_joins(spec, plain_trace)
         assert not unfired, f"Expected the target of each join to run after all its sources, not {unfired}."
+        check_order_rules(spec, plain_trace, output.get("visits", []))
         trace = Trace()
         interrupt_before = data.draw(stops, label="interrupt_before")
         interrupt_after = data.draw(stops, label="interrupt_after")
@@ -949,7 +1184,9 @@ class ThreadMachine(RuleBasedStateMachine):
 
     @rule(delivery=deliveries(), origin=st.text())
     def send_input(self, delivery: Delivery, origin: str) -> None:
-        if self.is_started():
+        snapshot = self.thread.snapshot
+        if snapshot is not None:
+            self.thread.trace.discard_pending_sends(read_visits(snapshot.values))
             self.thread.diverge()
             self.deliver(State(origin=origin), None, delivery)
         else:
@@ -1029,10 +1266,14 @@ class ThreadMachine(RuleBasedStateMachine):
         thread.steered = True
         thread.commanded = True
         thread.trace.start_era()
+        thread.trace.granted.add((index,))
+        if snapshot is not None:
+            thread.trace.direct_views.add(tuple(read_visits(snapshot.values)))
         event(f"goto of a command with a send: {tag is not None}")
 
         target: str | Send = node.name
         if tag is not None and not receives_a_message(node):
+            thread.trace.command_sends.add(tag)
             match node.work:
                 case FunctionSpec():
                     target = Send(node.name, State(origin=tag))
@@ -1267,6 +1508,17 @@ class ThreadMachine(RuleBasedStateMachine):
         if not updated:
             assert after == newest, f"Expected a refused update to leave the state {newest}, got {after}."
             return
+        thread.trace.discard_pending_sends(read_visits(before.values))
+        thread.trace.direct_views.add(tuple(read_visits(after.values)))
+        level = find_level_path(thread.spec, before.checkpoint_ns)
+        source = None if node is None else spec.nodes.index(node)
+        thread.trace.granted.update(
+            (*level, index)
+            for index in range(len(spec.nodes))
+            if source is None
+            or index in spec.nodes[source].targets
+            or any(join.target == index and source in join.sources for join in spec.joins)
+        )
         finished = [
             task.status.result
             for task in before.tasks
@@ -1385,6 +1637,13 @@ class ThreadMachine(RuleBasedStateMachine):
     def thread_is_consistent(self) -> None:
         thread = self.thread
         graph = thread.graph
+        match thread.result:
+            case Finished(output=finished):
+                check_order_rules(thread.spec, thread.trace, finished.get("visits", []))
+            case Waiting() | Stopped() | None:
+                check_order_rules(thread.spec, thread.trace, None)
+            case _ as unknown:
+                assert_never(unknown)
         history = self.runner.run(collect(graph.aget_state_history(self.thread_id)))
         thread.history = history
         if not history:
@@ -1516,6 +1775,49 @@ def runs_a_send(spec: GraphSpec) -> bool:
 def runs_two_levels_down(spec: GraphSpec) -> bool:
     trace, _ = run_plain(spec, "")
     return any(len(execution.path) > 2 for execution in trace.completed())
+
+
+@settings(max_examples=500, deadline=None)
+@given(spec=graph_specs((), 0), origin=st.text())
+@example(
+    spec=GraphSpec(
+        nodes=(
+            NodeSpec(
+                "route",
+                FunctionSpec(RouterSpec((), (1,), (), 0), is_async=False, pauses=0, late_pauses=0, resource=None),
+                defer=False,
+                targets=(),
+                to_end=False,
+            ),
+            NodeSpec(
+                "work",
+                FunctionSpec(WriterSpec(), is_async=False, pauses=0, late_pauses=0, resource=None),
+                defer=False,
+                targets=(),
+                to_end=False,
+            ),
+            NodeSpec(
+                "late",
+                FunctionSpec(WriterSpec(), is_async=False, pauses=0, late_pauses=0, resource=None),
+                defer=True,
+                targets=(),
+                to_end=False,
+            ),
+        ),
+        entries=(0, 2),
+        joins=(),
+    ),
+    origin="",
+)
+def test_run_without_a_checkpointer_follows_the_order_rules(spec: GraphSpec, origin: str) -> None:
+    """
+    Arrange: a drawn graph whose nodes record their executions in a trace.
+    Act: run the graph without a checkpointer.
+    Assert: the trace follows each order rule, and no rule reads a second run of the engine.
+    """
+    trace, output = run_plain(spec, origin)
+
+    check_order_rules(spec, trace, output.get("visits", []))
 
 
 def test_generator_reaches_each_way_to_run_a_node() -> None:

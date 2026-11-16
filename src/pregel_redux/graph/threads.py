@@ -1,4 +1,4 @@
-from collections.abc import Mapping
+from collections.abc import Collection, Mapping
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import assert_never
@@ -173,6 +173,23 @@ class ThreadScope:
     def plan_refs(self, saved: CheckpointTuple) -> list[TaskRef]:
         return [refer_task(task) for task in plan_tasks(self.read_position(saved), self.graph.triggers)]
 
+    async def list_nodes_of_the_last_step(self, checkpoint: Checkpoint) -> set[str]:
+        if checkpoint.source is not CheckpointSource.loop or checkpoint.parent_id is None:
+            return set()
+        before = await self.checkpointer.aget_tuple(self.thread_id, self.stored_ns, checkpoint.parent_id)
+        if before is None:
+            raise LookupError(f"thread {self.thread_id!r} has no checkpoint {checkpoint.parent_id}")
+        nodes: set[str] = set()
+        for task in self.plan_refs(before):
+            match task:
+                case StartRef():
+                    pass
+                case PullRef(name=name) | PushRef(name=name):
+                    nodes.add(name)
+                case _:
+                    assert_never(task)
+        return nodes
+
     async def read_level(self, saved: CheckpointTuple, *, subgraphs: bool) -> "SavedLevel":
         journal = ThreadJournal(self, saved, saved.checkpoint.id)
         children: dict[str, SavedLevel] = {}
@@ -334,9 +351,16 @@ class OpenedRun:
     journal: ThreadJournal
 
 
-def infer_writer(graph: AnyGraph, versions_seen: Mapping[str, TriggerVersions]) -> str:
+def infer_writer(
+    graph: AnyGraph, versions_seen: Mapping[str, TriggerVersions], nodes_of_the_last_step: Collection[str]
+) -> str:
     if len(graph.nodes) == 1:
         return next(iter(graph.nodes))
+    if len(nodes_of_the_last_step) > 1:
+        raise ValueError(
+            f"the node that made the last update is not clear, because the nodes {sorted(nodes_of_the_last_step)!r} "
+            "ran in the last step, so give as_node"
+        )
     last_seen = sorted(
         (max(versions), node)
         for node, seen in versions_seen.items()

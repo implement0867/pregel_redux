@@ -287,6 +287,24 @@ def test_state_update_infers_a_node_that_ran_after_an_edge_and_a_join() -> None:
     assert summary == expected, f"Expected {expected}, got {summary}."
 
 
+def test_state_update_without_a_node_after_a_step_that_a_goto_extended_is_rejected() -> None:
+    """
+    Arrange: a thread that stopped before its first node, and a run with a goto that put a second node in the same step.
+    Act: update the state without as_node.
+    Assert: the update raises ValueError, because two nodes ran in the last step.
+    """
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("first", build_writer("first", []))
+    builder.add_node("other", build_writer("other", []))
+    builder.add_edge(Endpoint.start, "first")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer(), interrupt_before=("first",))
+    graph.invoke({}, "thread")
+    graph.invoke(Command(goto="other"), "thread")
+
+    with pytest.raises(ValueError, match="not clear"):
+        graph.update_state("thread", {"notes": ["edit"]})
+
+
 def test_state_update_from_an_earlier_checkpoint_becomes_the_newest_state() -> None:
     """
     Arrange: a thread of a run that finished, and the id of the state before the third node.
