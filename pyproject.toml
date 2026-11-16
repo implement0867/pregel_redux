@@ -1,6 +1,6 @@
 [project]
 name = "pregel-redux"
-version = "0.5.0"
+version = "0.5.1"
 description = "Pregel-style graph computation"
 readme = "README.md"
 requires-python = ">=3.12"
