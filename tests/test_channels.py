@@ -17,7 +17,7 @@ from pregel_redux.channels import (
     build_channels,
     extract_writes,
     merge_channels,
-    parse_updates,
+    parse_writes,
     reject_unknown_channels,
 )
 from pregel_redux.pregel import TaskWrites, apply_writes, open_channels
@@ -109,7 +109,7 @@ def build_append_marker() -> Reducer[list[int], int]:
 def apply_updates(
     channels: Mapping[str, Channel], values: Mapping[str, object], updates: Sequence[Mapping[str, object]]
 ) -> dict[str, object]:
-    writes = [TaskWrites(parse_updates(channels, update), frozenset(), (), ()) for update in updates]
+    writes = [TaskWrites(parse_writes(channels, update), frozenset(), (), ()) for update in updates]
     return apply_writes(open_channels(channels, values, {}, {}, []), [], writes, [], []).channels.read_values()
 
 

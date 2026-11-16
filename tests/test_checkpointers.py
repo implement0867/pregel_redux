@@ -18,7 +18,7 @@ from pregel_redux import (
     Reducer,
     StateGraph,
 )
-from pregel_redux.checkpoints import RunCommandRecord, SavedUpdates, SavedWrites
+from pregel_redux.checkpoints import RunCommandRecord, SavedWrites
 from pregel_redux.sqlite import SqliteCheckpointer
 from pregel_redux.streams import UpdatesPart, WaitingPart
 from tests.conftest import join_lists
@@ -129,9 +129,7 @@ def test_checkpoint_is_found_by_its_id_with_its_pending_writes(checkpointer: Che
     one, two = (
         RunCommandRecord(
             index=0,
-            command=SavedWrites(
-                fields=SavedUpdates(updates={}, overwrites={}), branches=(node,), arrivals=(), sends=()
-            ),
+            command=SavedWrites(fields={}, branches=(node,), arrivals=(), sends=()),
         )
         for node in ("one", "two")
     )

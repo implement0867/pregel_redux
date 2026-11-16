@@ -2,7 +2,7 @@ from collections.abc import Callable, Collection, Mapping, Sequence
 from dataclasses import dataclass, replace
 from typing import Literal, assert_never
 
-from pregel_redux.channels import Channel, FieldChannel, Stored, extract_writes, parse_updates, reject_unknown_channels
+from pregel_redux.channels import Channel, FieldChannel, Stored, extract_writes, parse_writes, reject_unknown_channels
 from pregel_redux.commands import Command, Endpoint, Send, resolve_goto
 
 
@@ -398,7 +398,7 @@ def read_command_writes(
     node_names: Collection[str], channels: Mapping[str, Channel], command: Command[str]
 ) -> TaskWrites:
     routes = resolve_goto(command.goto, node_names)
-    return TaskWrites(parse_updates(channels, extract_writes(command.update)), routes.targets, (), routes.sends)
+    return TaskWrites(parse_writes(channels, extract_writes(command.update)), routes.targets, (), routes.sends)
 
 
 def apply_command(

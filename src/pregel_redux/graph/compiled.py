@@ -11,7 +11,7 @@ from uuid import NAMESPACE_OID, uuid5
 from pydantic import TypeAdapter
 from typing_extensions import TypeForm
 
-from pregel_redux.channels import Channel, Overwrite, extract_writes, parse_updates
+from pregel_redux.channels import Channel, extract_writes, parse_inputs, parse_writes
 from pregel_redux.checkpoints import CheckpointSource
 from pregel_redux.commands import Send, read_outcome
 from pregel_redux.configs import Namespace, Segment, encode_namespace
@@ -316,13 +316,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
             *plan_tasks(position, self.triggers),
             *(PullTask(node, self.triggers[node]) for node in find_waiting(position, self.triggers)),
         ]
-        overwritten = sorted(name for name, value in input_writes.items() if isinstance(value, Overwrite))
-        if overwritten:
-            raise ValueError(
-                f"the input has an Overwrite for each of {overwritten!r}, "
-                "and only the result of a node or the update of a command can have one"
-            )
-        return apply_writes(position, discarded, [], [parse_updates(self.channels, input_writes)], self.trigger_keys)
+        return apply_writes(position, discarded, [], [parse_inputs(self.channels, input_writes)], self.trigger_keys)
 
     def build_call(self, task: Task, position: Position) -> NodeCall:
         ref = refer_task(task)
@@ -469,7 +463,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         match call.task:
             case StartRef():
                 return TaskWrites(
-                    parse_updates(self.channels, extract_writes(call.node_input)), self.entry_nodes, (), ()
+                    parse_inputs(self.channels, extract_writes(call.node_input)), self.entry_nodes, (), ()
                 )
             case PullRef(name=name) | PushRef(name=name):
                 action = self.nodes[name].action
@@ -496,7 +490,7 @@ class CompiledGraph[StateT, InputT, OutputT]:
         outcome = read_outcome(result, node.targets, self.nodes.keys())
         self.reject_sends_to_receivers(outcome.routes.sends)
         return TaskWrites(
-            fields=parse_updates(self.channels, outcome.writes),
+            fields=parse_writes(self.channels, outcome.writes),
             branches=outcome.routes.targets,
             arrivals=tuple(Arrival(key, name) for key in node.joins),
             sends=outcome.routes.sends,

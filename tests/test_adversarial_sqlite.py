@@ -21,7 +21,7 @@ from pregel_redux import (
     ShutdownController,
     StateGraph,
 )
-from pregel_redux.checkpoints import RunCommandRecord, SavedUpdates, SavedWrites
+from pregel_redux.checkpoints import RunCommandRecord, SavedWrites
 from pregel_redux.sqlite import SqliteCheckpointer
 from tests.conftest import join_lists
 
@@ -192,9 +192,7 @@ def test_pending_write_for_a_checkpoint_that_is_not_stored_is_refused(checkpoint
     build_parallel_graph(checkpointer, 1).invoke({}, "thread")
     record = RunCommandRecord(
         index=0,
-        command=SavedWrites(
-            fields=SavedUpdates(updates={}, overwrites={}), branches=("node 0",), arrivals=(), sends=()
-        ),
+        command=SavedWrites(fields={}, branches=("node 0",), arrivals=(), sends=()),
     )
 
     with pytest.raises(KeyError):

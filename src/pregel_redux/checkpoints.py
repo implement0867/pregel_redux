@@ -32,13 +32,26 @@ class SavedArrival(Record):
     source: str
 
 
-class SavedUpdates(Record):
-    updates: dict[str, JsonValue]
-    overwrites: dict[str, JsonValue]
+class FieldWriteKind(StrEnum):
+    update = "update"
+    overwrite = "overwrite"
+
+
+class SavedUpdate(Record):
+    kind: Literal[FieldWriteKind.update] = FieldWriteKind.update
+    value: JsonValue
+
+
+class SavedOverwrite(Record):
+    kind: Literal[FieldWriteKind.overwrite] = FieldWriteKind.overwrite
+    value: JsonValue
+
+
+type SavedFieldWrite = Annotated[SavedUpdate | SavedOverwrite, Field(discriminator="kind")]
 
 
 class SavedWrites(Record):
-    fields: SavedUpdates
+    fields: dict[str, SavedFieldWrite]
     branches: tuple[str, ...]
     arrivals: tuple[SavedArrival, ...]
     sends: tuple[PendingSend, ...]

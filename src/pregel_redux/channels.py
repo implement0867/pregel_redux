@@ -107,15 +107,28 @@ class Channel:
             raise ValueError(f"channel {self.name!r} cannot hold {value!r}, its type is {self.value_type!r}") from error
 
     def parse_update(self, value: object) -> object:
+        try:
+            return self.update_adapter.validate_python(value)
+        except ValidationError as error:
+            raise ValueError(f"channel {self.name!r} cannot take the update {value!r}") from error
+
+    def parse_input(self, value: object) -> object:
+        match value:
+            case Overwrite():
+                raise ValueError(
+                    f"channel {self.name!r} cannot take an Overwrite from an input, "
+                    "only the result of a node or the update of a command can have one"
+                )
+            case _:
+                return self.parse_update(value)
+
+    def parse_write(self, value: object) -> object:
         match value:
             case Overwrite(value=replacement):
                 parsed = self.parse(replacement)
                 return parsed if self.reducer is None else Overwrite(parsed)
             case _:
-                try:
-                    return self.update_adapter.validate_python(value)
-                except ValidationError as error:
-                    raise ValueError(f"channel {self.name!r} cannot take the update {value!r}") from error
+                return self.parse_update(value)
 
     def open(self) -> "LastValue | BinaryOperatorAggregate":
         match self.reducer:
@@ -316,6 +329,11 @@ def reject_unknown_channels(channels: Mapping[str, object], names: Iterable[str]
         raise ValueError(f"{unknown!r} are not channels of this graph")
 
 
-def parse_updates(channels: Mapping[str, Channel], updates: Mapping[str, object]) -> dict[str, object]:
-    reject_unknown_channels(channels, updates)
-    return {name: channels[name].parse_update(value) for name, value in updates.items()}
+def parse_inputs(channels: Mapping[str, Channel], inputs: Mapping[str, object]) -> dict[str, object]:
+    reject_unknown_channels(channels, inputs)
+    return {name: channels[name].parse_input(value) for name, value in inputs.items()}
+
+
+def parse_writes(channels: Mapping[str, Channel], writes: Mapping[str, object]) -> dict[str, object]:
+    reject_unknown_channels(channels, writes)
+    return {name: channels[name].parse_write(value) for name, value in writes.items()}
