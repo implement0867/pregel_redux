@@ -1,10 +1,12 @@
-from collections.abc import Callable
+from collections.abc import Callable, Iterator
 from typing import Annotated, TypedDict
 from uuid import UUID, uuid4
 
 import pytest
 
 from pregel_redux import (
+    Command,
+    Depends,
     Endpoint,
     Finished,
     InMemoryCheckpointer,
@@ -12,6 +14,7 @@ from pregel_redux import (
     PersistentGraph,
     Received,
     Reducer,
+    Scope,
     StateGraph,
 )
 from tests.conftest import join_lists
@@ -167,4 +170,41 @@ def test_state_update_as_a_failed_node_keeps_the_edge_of_the_finished_node() -> 
     state = graph.get_state(thread_id)
     summary = (state.values, state.next)
     expected = ({"notes": ["finished", "update"]}, ("after failed", "after finished"))
+    assert summary == expected, f"Expected {expected}, got {summary}."
+
+
+def test_goto_to_a_child_graph_uses_the_saved_write_of_its_node_after_a_cleanup_failure() -> None:
+    """
+    Arrange: a child graph of one node whose write is saved, and whose provider failed in its cleanup, so the
+    task of the child graph in the parent is not finished.
+    Act: run the thread with a command that has a goto to the node of the child graph.
+    Assert: the run finishes with the saved write, and the node of the child graph ran one time.
+    """
+    executions: list[str] = []
+    cleanups: list[str] = []
+
+    def open_link() -> Iterator[str]:
+        yield "link"
+        cleanups.append("cleanup")
+        if len(cleanups) == 1:
+            raise ConnectionError("cleanup failed")
+
+    def write_inside(state: State, link: Annotated[str, Depends(open_link, scope=Scope.node)]) -> State:
+        executions.append("inside")
+        return {"notes": ["inside"]}
+
+    child = StateGraph(State)
+    child.add_node("inside", write_inside)
+    child.add_edge(Endpoint.start, "inside")
+    builder = StateGraph(State)
+    builder.add_node("child", child)
+    builder.add_edge(Endpoint.start, "child")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    with pytest.raises(ConnectionError):
+        graph.invoke({}, "thread")
+
+    actual = graph.invoke(Command(goto="child"), "thread")
+
+    summary = (actual, executions)
+    expected = (Finished(State(notes=["inside"])), ["inside"])
     assert summary == expected, f"Expected {expected}, got {summary}."

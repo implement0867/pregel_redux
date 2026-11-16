@@ -1042,6 +1042,7 @@ class ThreadMachine(RuleBasedStateMachine):
                     assert_never(node.work)
         requested = len(thread.trace.requested)
         unanswered = list(self.accepts())
+        known = {item.checkpoint_id for item in thread.history}
         result = self.deliver(Command(goto=target), None, delivery)
         self.check_entrances_still_wait(unanswered)
         if len(thread.trace.requested) > requested:
@@ -1056,7 +1057,16 @@ class ThreadMachine(RuleBasedStateMachine):
         elif (
             isinstance(result, Finished | Stopped) and not finished and not node.defer and not receives_a_message(node)
         ):
-            assert now > started, f"Expected the node {node.name!r} to run after a goto to it."
+            ran: dict[UUID | None, tuple[str, ...]] = {item.checkpoint_id: item.next for item in thread.history}
+            committed = any(
+                item.checkpoint_id not in known
+                and item.source is CheckpointSource.loop
+                and node.name in ran.get(item.parent_id, ())
+                for item in thread.history
+            )
+            assert now > started or committed, (
+                f"Expected the node {node.name!r} to run, or its step to finish with saved writes, after a goto to it."
+            )
 
     @precondition(lambda self: bool(self.thread.history))
     @rule(delivery=deliveries(), data=st.data())
