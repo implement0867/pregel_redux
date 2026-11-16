@@ -1,4 +1,4 @@
-from pregel_redux.channels import Channel, Reducer
+from pregel_redux.channels import Channel, Overwrite, Reducer
 from pregel_redux.checkpoints import (
     AsyncCheckpointer,
     Checkpoint,
@@ -60,6 +60,7 @@ __all__ = [
     "InMemoryCheckpointer",
     "Message",
     "Namespace",
+    "Overwrite",
     "PendingTask",
     "PendingWrite",
     "PersistentGraph",

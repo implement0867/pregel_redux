@@ -88,6 +88,11 @@ class Stored[ValueT]:
 
 
 @dataclass(frozen=True)
+class Overwrite[ValueT]:
+    value: ValueT
+
+
+@dataclass(frozen=True)
 class Channel:
     name: str
     value_type: object
@@ -106,6 +111,24 @@ class Channel:
             return self.update_adapter.validate_python(value)
         except ValidationError as error:
             raise ValueError(f"channel {self.name!r} cannot take the update {value!r}") from error
+
+    def parse_input(self, value: object) -> object:
+        match value:
+            case Overwrite():
+                raise ValueError(
+                    f"channel {self.name!r} cannot take an Overwrite from an input, "
+                    "only the result of a node or the update of a command can have one"
+                )
+            case _:
+                return self.parse_update(value)
+
+    def parse_write(self, value: object) -> object:
+        match value:
+            case Overwrite(value=replacement):
+                parsed = self.parse(replacement)
+                return parsed if self.reducer is None else Overwrite(parsed)
+            case _:
+                return self.parse_update(value)
 
     def open(self) -> "LastValue | BinaryOperatorAggregate":
         match self.reducer:
@@ -161,10 +184,17 @@ class BinaryOperatorAggregate:
     def update(self, values: Sequence[object]) -> "BinaryOperatorAggregate | None":
         if not values:
             return None
-        current = self.value
-        for value in values:
-            current = self.spec.parse(self.reducer.function(current, value))
-        return BinaryOperatorAggregate(self.spec, self.reducer, current)
+        overwrites = [value for value in values if isinstance(value, Overwrite)]
+        match overwrites:
+            case []:
+                current = self.value
+                for value in values:
+                    current = self.spec.parse(self.reducer.function(current, value))
+                return BinaryOperatorAggregate(self.spec, self.reducer, current)
+            case [overwrite]:
+                return BinaryOperatorAggregate(self.spec, self.reducer, overwrite.value)
+            case _:
+                raise ValueError(f"channel {self.spec.name!r} received more than one Overwrite in one step")
 
     def checkpoint(self) -> Stored[JsonValue] | None:
         return Stored(dump_json(self.spec.adapter, self.value))
@@ -299,6 +329,11 @@ def reject_unknown_channels(channels: Mapping[str, object], names: Iterable[str]
         raise ValueError(f"{unknown!r} are not channels of this graph")
 
 
-def parse_updates(channels: Mapping[str, Channel], updates: Mapping[str, object]) -> dict[str, object]:
-    reject_unknown_channels(channels, updates)
-    return {name: channels[name].parse_update(value) for name, value in updates.items()}
+def parse_inputs(channels: Mapping[str, Channel], inputs: Mapping[str, object]) -> dict[str, object]:
+    reject_unknown_channels(channels, inputs)
+    return {name: channels[name].parse_input(value) for name, value in inputs.items()}
+
+
+def parse_writes(channels: Mapping[str, Channel], writes: Mapping[str, object]) -> dict[str, object]:
+    reject_unknown_channels(channels, writes)
+    return {name: channels[name].parse_write(value) for name, value in writes.items()}

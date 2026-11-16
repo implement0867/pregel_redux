@@ -12,11 +12,12 @@ from pydantic import BaseModel, ConfigDict, Field, PydanticSchemaGenerationError
 from pregel_redux import Depends
 from pregel_redux.channels import (
     Channel,
+    Overwrite,
     Reducer,
     build_channels,
     extract_writes,
     merge_channels,
-    parse_updates,
+    parse_writes,
     reject_unknown_channels,
 )
 from pregel_redux.pregel import TaskWrites, apply_writes, open_channels
@@ -108,7 +109,7 @@ def build_append_marker() -> Reducer[list[int], int]:
 def apply_updates(
     channels: Mapping[str, Channel], values: Mapping[str, object], updates: Sequence[Mapping[str, object]]
 ) -> dict[str, object]:
-    writes = [TaskWrites(parse_updates(channels, update), frozenset(), (), ()) for update in updates]
+    writes = [TaskWrites(parse_writes(channels, update), frozenset(), (), ()) for update in updates]
     return apply_writes(open_channels(channels, values, {}, {}, []), [], writes, [], []).channels.read_values()
 
 
@@ -452,6 +453,83 @@ def test_invalid_writes_are_rejected(channels: dict[str, Channel], updates: Sequ
     """
     Arrange: updates with two writes to a channel without a reducer, a write to an unknown channel,
         or a write that gives a value that is not of the declared type of the channel.
+    Act: apply the updates.
+    Assert: a ValueError is raised.
+    """
+    with pytest.raises(ValueError):
+        apply_updates(channels, {"items": []}, updates)
+
+
+@pytest.mark.parametrize(
+    ("updates", "expected"),
+    [
+        ([{"items": Overwrite([7])}], [7]),
+        ([{"items": Overwrite([])}], []),
+        ([{"items": Overwrite([7])}, {"items": [1]}], [7]),
+        ([{"items": [1]}, {"items": Overwrite([7])}, {"items": [2]}], [7]),
+    ],
+    ids=["overwrite-alone", "overwrite-with-an-empty-list", "overwrite-before-an-update", "overwrite-between-updates"],
+)
+def test_overwrite_sets_the_value_of_a_reducer_channel_without_the_reducer(
+    channels: dict[str, Channel], updates: Sequence[Mapping[str, object]], expected: Sequence[int]
+) -> None:
+    """
+    Arrange: a reducer channel with a value, and the updates of one step with one Overwrite.
+    Act: apply the updates.
+    Assert: the channel holds the value of the Overwrite, and the reducer did not combine it with other values.
+    """
+    actual = apply_updates(channels, {"items": [0]}, updates)["items"]
+
+    assert actual == expected, f"Expected {expected}, got {actual}. The Overwrite must bypass the reducer."
+
+
+def test_overwrite_takes_a_value_of_the_channel_type_and_not_of_the_update_type() -> None:
+    """
+    Arrange: a channel with a reducer whose update type is not its channel type.
+    Act: apply an Overwrite with a list.
+    Assert: the channel holds the list, and the reducer did not append the list as one item.
+    """
+    channels = build_channels(AppendState)
+
+    actual = apply_updates(channels, {"items": [0]}, [{"items": Overwrite([7])}])["items"]
+
+    assert actual == [7], f"Expected [7], got {actual}. The Overwrite must give the channel value itself."
+
+
+def test_overwrite_sets_the_value_of_a_channel_without_a_reducer(channels: dict[str, Channel]) -> None:
+    """
+    Arrange: a channel without a reducer.
+    Act: apply an Overwrite to the channel.
+    Assert: the channel holds the value of the Overwrite.
+    """
+    actual = apply_updates(channels, {"items": [], "latest": 1}, [{"latest": Overwrite(2)}])["latest"]
+
+    assert actual == 2, f"Expected 2, got {actual!r}. The channel must hold the value and not the wrapper."
+
+
+@pytest.mark.parametrize(
+    "updates",
+    [
+        [{"items": Overwrite([1])}, {"items": Overwrite([2])}],
+        [{"items": Overwrite(["text"])}],
+        [{"items": Overwrite(1)}],
+        [{"items": Overwrite(None)}],
+        [{"latest": Overwrite("text")}],
+        [{"missing": Overwrite(1)}],
+    ],
+    ids=[
+        "two-overwrites-in-one-step",
+        "item-of-another-type",
+        "value-of-another-type",
+        "none",
+        "channel-without-reducer",
+        "unknown-channel",
+    ],
+)
+def test_invalid_overwrites_are_rejected(channels: dict[str, Channel], updates: Sequence[Mapping[str, object]]) -> None:
+    """
+    Arrange: updates with two Overwrite values for one channel, an Overwrite whose value is not of
+        the declared type of the channel, or an Overwrite for an unknown channel.
     Act: apply the updates.
     Assert: a ValueError is raised.
     """

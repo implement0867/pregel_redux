@@ -9,6 +9,8 @@ from uuid import UUID
 from pydantic import JsonValue
 
 from pregel_redux.channels import (
+    Channel,
+    Overwrite,
     Stored,
     dump_json,
     load_json,
@@ -24,6 +26,8 @@ from pregel_redux.checkpoints import (
     SavedArrival,
     SavedBranch,
     SavedJoin,
+    SavedOverwrite,
+    SavedUpdate,
     SavedWrites,
     TriggerVersions,
 )
@@ -91,9 +95,32 @@ def load_updates(graph: AnyGraph, updates: Mapping[str, JsonValue]) -> dict[str,
     return {name: load_json(graph.channels[name].update_adapter, value) for name, value in updates.items()}
 
 
+def dump_field_write(channel: Channel, write: object) -> SavedUpdate | SavedOverwrite:
+    match write:
+        case Overwrite(value=replacement):
+            return SavedOverwrite(value=dump_json(channel.adapter, replacement))
+        case _:
+            return SavedUpdate(value=dump_json(channel.update_adapter, write))
+
+
+def load_field_write(channel: Channel, saved: SavedUpdate | SavedOverwrite) -> object:
+    match saved:
+        case SavedUpdate():
+            return load_json(channel.update_adapter, saved.value)
+        case SavedOverwrite():
+            return Overwrite(load_json(channel.adapter, saved.value))
+        case _:
+            assert_never(saved)
+
+
+def load_field_writes(graph: AnyGraph, saved: Mapping[str, SavedUpdate | SavedOverwrite]) -> dict[str, object]:
+    reject_unknown_channels(graph.channels, saved)
+    return {name: load_field_write(graph.channels[name], write) for name, write in saved.items()}
+
+
 def dump_writes(graph: AnyGraph, writes: TaskWrites) -> SavedWrites:
     return SavedWrites(
-        fields=dump_updates(graph, writes.fields),
+        fields={name: dump_field_write(graph.channels[name], write) for name, write in writes.fields.items()},
         branches=tuple(sorted(writes.branches)),
         arrivals=tuple(
             SavedArrival(sources=tuple(sorted(arrival.join.sources)), target=arrival.join.target, source=arrival.source)
@@ -105,7 +132,7 @@ def dump_writes(graph: AnyGraph, writes: TaskWrites) -> SavedWrites:
 
 def load_writes(graph: AnyGraph, saved: SavedWrites) -> TaskWrites:
     return TaskWrites(
-        fields=load_updates(graph, saved.fields),
+        fields=load_field_writes(graph, saved.fields),
         branches=frozenset(saved.branches),
         arrivals=tuple(
             Arrival(JoinKey(frozenset(arrival.sources), arrival.target), arrival.source) for arrival in saved.arrivals

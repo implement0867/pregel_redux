@@ -2,10 +2,12 @@ import asyncio
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Final, Literal, Protocol
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
+
+CHECKPOINT_FORMAT_VERSION: Final = 3
 
 
 class CheckpointSource(Enum):
@@ -30,8 +32,26 @@ class SavedArrival(Record):
     source: str
 
 
+class FieldWriteKind(StrEnum):
+    update = "update"
+    overwrite = "overwrite"
+
+
+class SavedUpdate(Record):
+    kind: Literal[FieldWriteKind.update] = FieldWriteKind.update
+    value: JsonValue
+
+
+class SavedOverwrite(Record):
+    kind: Literal[FieldWriteKind.overwrite] = FieldWriteKind.overwrite
+    value: JsonValue
+
+
+type SavedFieldWrite = Annotated[SavedUpdate | SavedOverwrite, Field(discriminator="kind")]
+
+
 class SavedWrites(Record):
-    fields: dict[str, JsonValue]
+    fields: dict[str, SavedFieldWrite]
     branches: tuple[str, ...]
     arrivals: tuple[SavedArrival, ...]
     sends: tuple[PendingSend, ...]
@@ -136,7 +156,7 @@ class ChannelVersions(Record):
 
 
 class Checkpoint(Record):
-    v: Literal[2] = 2
+    v: Literal[3] = CHECKPOINT_FORMAT_VERSION
     id: UUID
     parent_id: UUID | None
     ts: AwareDatetime

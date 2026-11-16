@@ -127,7 +127,10 @@ def test_checkpoint_is_found_by_its_id_with_its_pending_writes(checkpointer: Che
     graph.invoke({}, "thread")
     stopped = next(checkpointer.list("thread", "", before=None, limit=1)).checkpoint
     one, two = (
-        RunCommandRecord(index=0, command=SavedWrites(fields={}, branches=(node,), arrivals=(), sends=()))
+        RunCommandRecord(
+            index=0,
+            command=SavedWrites(fields={}, branches=(node,), arrivals=(), sends=()),
+        )
         for node in ("one", "two")
     )
     checkpointer.put_writes("thread", "", stopped.id, one)

@@ -190,7 +190,10 @@ def test_pending_write_for_a_checkpoint_that_is_not_stored_is_refused(checkpoint
     Assert: the checkpointer raises KeyError, as InMemoryCheckpointer does.
     """
     build_parallel_graph(checkpointer, 1).invoke({}, "thread")
-    record = RunCommandRecord(index=0, command=SavedWrites(fields={}, branches=("node 0",), arrivals=(), sends=()))
+    record = RunCommandRecord(
+        index=0,
+        command=SavedWrites(fields={}, branches=("node 0",), arrivals=(), sends=()),
+    )
 
     with pytest.raises(KeyError):
         checkpointer.put_writes("thread", "", UUID(int=1), record)

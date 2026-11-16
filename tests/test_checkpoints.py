@@ -15,6 +15,7 @@ from pregel_redux import (
     Endpoint,
     Finished,
     InMemoryCheckpointer,
+    Overwrite,
     PersistentGraph,
     Reducer,
     Send,
@@ -22,7 +23,7 @@ from pregel_redux import (
     Stopped,
     Waiting,
 )
-from pregel_redux.checkpoints import PendingWrite
+from pregel_redux.checkpoints import CHECKPOINT_FORMAT_VERSION, PendingWrite
 from pregel_redux.snapshots import FailedTask, FinishedTask
 from tests.conftest import join_lists
 
@@ -524,7 +525,7 @@ def test_checkpoints_of_a_thread_form_a_chain_in_the_order_of_their_ids(runs: in
     """
     Arrange: a graph with a checkpointer.
     Act: run the graph on one thread a number of times.
-    Assert: each checkpoint has format version 2, a greater id than the one before it, and that one as its parent.
+    Assert: each checkpoint has the current format version, a greater id than the one before it, and that one as its parent.
     """
     checkpointer = InMemoryCheckpointer()
     graph = build_joke_graph(checkpointer, [], [])
@@ -538,7 +539,9 @@ def test_checkpoints_of_a_thread_form_a_chain_in_the_order_of_their_ids(runs: in
     versions = {checkpoint.v for checkpoint in stored}
     assert ids == sorted(set(ids)), f"Expected ids that increase, got {ids}."
     assert parents == [None, *ids[:-1]], f"Expected each parent to be the checkpoint before, got {parents}."
-    assert versions == {2}, f"Expected format version 2, got {versions}."
+    assert versions == {CHECKPOINT_FORMAT_VERSION}, (
+        f"Expected format version {CHECKPOINT_FORMAT_VERSION}, got {versions}."
+    )
 
 
 def test_latest_checkpoint_is_the_one_with_the_greatest_id() -> None:
@@ -567,9 +570,61 @@ def test_latest_checkpoint_is_the_one_with_the_greatest_id() -> None:
     assert calls == ["review"], f"Expected the calls ['review'], got {calls}."
 
 
+def test_resume_applies_the_overwrite_of_a_node_that_finished_in_the_failed_step() -> None:
+    """
+    Arrange: a step with a node that returns an Overwrite and a node that fails, on a thread with a value.
+    Act: run the thread, and resume it after the failure.
+    Assert: the resume gives the value of the Overwrite, and the node that returned it did not run again.
+    """
+    calls: list[str] = []
+    failures: list[Exception] = [RuntimeError("no review")]
+
+    def reset_jokes(state: State) -> dict[str, object]:
+        calls.append("reset")
+        return {"jokes": Overwrite(["new joke"])}
+
+    def review_jokes(state: State) -> None:
+        calls.append("review")
+        if failures:
+            raise failures.pop()
+
+    builder = StateGraph(State, output_schema=Output)
+    builder.add_node("reset", reset_jokes)
+    builder.add_node("review", review_jokes)
+    builder.add_edge(Endpoint.start, "reset")
+    builder.add_edge(Endpoint.start, "review")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    with pytest.raises(RuntimeError):
+        asyncio.run(graph.ainvoke({"jokes": ["old joke"]}, "thread"))
+
+    actual = asyncio.run(graph.ainvoke(None, "thread"))
+
+    expected = Finished(Output(jokes=["new joke"]))
+    assert actual == expected, f"Expected {expected}, got {actual}. The stored Overwrite must bypass the reducer."
+    assert calls.count("reset") == 1, f"Expected one call of the reset node, got {calls}."
+
+
+def test_overwrite_in_a_command_replaces_the_value_of_the_latest_checkpoint_of_a_thread() -> None:
+    """
+    Arrange: a thread whose latest checkpoint has a value in a reducer channel.
+    Act: run the thread again with a command that has an Overwrite in its update and a target node.
+    Assert: the output has the value of the Overwrite and the write of the node, without the earlier value.
+    """
+    builder = StateGraph(NarrowState, output_schema=Output)
+    builder.add_node("first", build_failing_writer("first", [], []))
+    builder.add_edge(Endpoint.start, "first")
+    graph = builder.compile(checkpointer=InMemoryCheckpointer())
+    asyncio.run(graph.ainvoke({"jokes": ["old joke"]}, "thread"))
+
+    actual = asyncio.run(graph.ainvoke(Command(update={"jokes": Overwrite(["new joke"])}, goto="first"), "thread"))
+
+    expected = Finished(Output(jokes=["new joke", "first"]))
+    assert actual == expected, f"Expected {expected}, got {actual}. The Overwrite must replace the stored value."
+
+
 def test_checkpoint_of_another_format_version_is_rejected() -> None:
     """
-    Arrange: a thread whose stored records have format version 1.
+    Arrange: a thread whose stored records have the format version before the current one.
     Act: run the thread again without an input.
     Assert: the run raises the ValidationError of Pydantic.
     """
@@ -577,7 +632,8 @@ def test_checkpoint_of_another_format_version_is_rejected() -> None:
     graph = build_joke_graph(checkpointer, [], [])
     asyncio.run(graph.ainvoke({"topics": ["cats"]}, "thread"))
     records = checkpointer.threads["thread"][""]
-    checkpointer.threads["thread"][""] = {key: record.replace('"v":2', '"v":1') for key, record in records.items()}
+    current, earlier = f'"v":{CHECKPOINT_FORMAT_VERSION}', f'"v":{CHECKPOINT_FORMAT_VERSION - 1}'
+    checkpointer.threads["thread"][""] = {key: record.replace(current, earlier) for key, record in records.items()}
 
     with pytest.raises(ValidationError):
         asyncio.run(graph.ainvoke(None, "thread"))
