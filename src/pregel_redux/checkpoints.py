@@ -30,8 +30,13 @@ class SavedArrival(Record):
     source: str
 
 
+class SavedUpdates(Record):
+    updates: dict[str, JsonValue]
+    overwrites: dict[str, JsonValue]
+
+
 class SavedWrites(Record):
-    fields: dict[str, JsonValue]
+    fields: SavedUpdates
     branches: tuple[str, ...]
     arrivals: tuple[SavedArrival, ...]
     sends: tuple[PendingSend, ...]
@@ -109,7 +114,7 @@ class SavedJoin(Record):
 
 
 class ChannelValues(Record):
-    start: dict[str, JsonValue] | None
+    start: SavedUpdates | None
     fields: dict[str, JsonValue]
     branches: tuple[SavedBranch, ...]
     joins: tuple[SavedJoin, ...]
@@ -136,7 +141,7 @@ class ChannelVersions(Record):
 
 
 class Checkpoint(Record):
-    v: Literal[2] = 2
+    v: Literal[3] = 3
     id: UUID
     parent_id: UUID | None
     ts: AwareDatetime

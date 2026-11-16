@@ -88,6 +88,11 @@ class Stored[ValueT]:
 
 
 @dataclass(frozen=True)
+class Overwrite[ValueT]:
+    value: ValueT
+
+
+@dataclass(frozen=True)
 class Channel:
     name: str
     value_type: object
@@ -102,10 +107,15 @@ class Channel:
             raise ValueError(f"channel {self.name!r} cannot hold {value!r}, its type is {self.value_type!r}") from error
 
     def parse_update(self, value: object) -> object:
-        try:
-            return self.update_adapter.validate_python(value)
-        except ValidationError as error:
-            raise ValueError(f"channel {self.name!r} cannot take the update {value!r}") from error
+        match value:
+            case Overwrite(value=replacement):
+                parsed = self.parse(replacement)
+                return parsed if self.reducer is None else Overwrite(parsed)
+            case _:
+                try:
+                    return self.update_adapter.validate_python(value)
+                except ValidationError as error:
+                    raise ValueError(f"channel {self.name!r} cannot take the update {value!r}") from error
 
     def open(self) -> "LastValue | BinaryOperatorAggregate":
         match self.reducer:
@@ -161,10 +171,17 @@ class BinaryOperatorAggregate:
     def update(self, values: Sequence[object]) -> "BinaryOperatorAggregate | None":
         if not values:
             return None
-        current = self.value
-        for value in values:
-            current = self.spec.parse(self.reducer.function(current, value))
-        return BinaryOperatorAggregate(self.spec, self.reducer, current)
+        overwrites = [value for value in values if isinstance(value, Overwrite)]
+        match overwrites:
+            case []:
+                current = self.value
+                for value in values:
+                    current = self.spec.parse(self.reducer.function(current, value))
+                return BinaryOperatorAggregate(self.spec, self.reducer, current)
+            case [overwrite]:
+                return BinaryOperatorAggregate(self.spec, self.reducer, overwrite.value)
+            case _:
+                raise ValueError(f"channel {self.spec.name!r} received more than one Overwrite in one step")
 
     def checkpoint(self) -> Stored[JsonValue] | None:
         return Stored(dump_json(self.spec.adapter, self.value))

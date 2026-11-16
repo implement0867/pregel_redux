@@ -6,9 +6,8 @@ from datetime import datetime
 from typing import Never, assert_never
 from uuid import UUID
 
-from pydantic import JsonValue
-
 from pregel_redux.channels import (
+    Overwrite,
     Stored,
     dump_json,
     load_json,
@@ -24,6 +23,7 @@ from pregel_redux.checkpoints import (
     SavedArrival,
     SavedBranch,
     SavedJoin,
+    SavedUpdates,
     SavedWrites,
     TriggerVersions,
 )
@@ -82,13 +82,30 @@ def load_send(graph: AnyGraph, send: PendingSend) -> Send:
     return Send(send.node, load_json(graph.nodes[send.node].input_adapter, send.node_input))
 
 
-def dump_updates(graph: AnyGraph, updates: Mapping[str, object]) -> dict[str, JsonValue]:
-    return {name: dump_json(graph.channels[name].update_adapter, value) for name, value in updates.items()}
+def dump_updates(graph: AnyGraph, updates: Mapping[str, object]) -> SavedUpdates:
+    return SavedUpdates(
+        updates={
+            name: dump_json(graph.channels[name].update_adapter, value)
+            for name, value in updates.items()
+            if not isinstance(value, Overwrite)
+        },
+        overwrites={
+            name: dump_json(graph.channels[name].adapter, value.value)
+            for name, value in updates.items()
+            if isinstance(value, Overwrite)
+        },
+    )
 
 
-def load_updates(graph: AnyGraph, updates: Mapping[str, JsonValue]) -> dict[str, object]:
-    reject_unknown_channels(graph.channels, updates)
-    return {name: load_json(graph.channels[name].update_adapter, value) for name, value in updates.items()}
+def load_updates(graph: AnyGraph, saved: SavedUpdates) -> dict[str, object]:
+    reject_unknown_channels(graph.channels, [*saved.updates, *saved.overwrites])
+    repeated = sorted(saved.updates.keys() & saved.overwrites.keys())
+    if repeated:
+        raise ValueError(f"the saved writes have both an update and an overwrite for each of {repeated!r}")
+    return {
+        **{name: load_json(graph.channels[name].update_adapter, value) for name, value in saved.updates.items()},
+        **{name: Overwrite(load_json(graph.channels[name].adapter, value)) for name, value in saved.overwrites.items()},
+    }
 
 
 def dump_writes(graph: AnyGraph, writes: TaskWrites) -> SavedWrites:
