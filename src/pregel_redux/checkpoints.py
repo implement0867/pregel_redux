@@ -2,10 +2,12 @@ import asyncio
 from collections.abc import AsyncIterator, Iterator
 from dataclasses import dataclass, field
 from enum import Enum, StrEnum
-from typing import Annotated, Literal, Protocol
+from typing import Annotated, Final, Literal, Protocol
 from uuid import UUID
 
 from pydantic import AwareDatetime, BaseModel, ConfigDict, Field, JsonValue, TypeAdapter
+
+CHECKPOINT_FORMAT_VERSION: Final = 3
 
 
 class CheckpointSource(Enum):
@@ -141,7 +143,7 @@ class ChannelVersions(Record):
 
 
 class Checkpoint(Record):
-    v: Literal[3] = 3
+    v: Literal[3] = CHECKPOINT_FORMAT_VERSION
     id: UUID
     parent_id: UUID | None
     ts: AwareDatetime

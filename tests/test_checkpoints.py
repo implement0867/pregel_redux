@@ -23,7 +23,7 @@ from pregel_redux import (
     Stopped,
     Waiting,
 )
-from pregel_redux.checkpoints import PendingWrite
+from pregel_redux.checkpoints import CHECKPOINT_FORMAT_VERSION, PendingWrite
 from pregel_redux.snapshots import FailedTask, FinishedTask
 from tests.conftest import join_lists
 
@@ -525,7 +525,7 @@ def test_checkpoints_of_a_thread_form_a_chain_in_the_order_of_their_ids(runs: in
     """
     Arrange: a graph with a checkpointer.
     Act: run the graph on one thread a number of times.
-    Assert: each checkpoint has format version 3, a greater id than the one before it, and that one as its parent.
+    Assert: each checkpoint has the current format version, a greater id than the one before it, and that one as its parent.
     """
     checkpointer = InMemoryCheckpointer()
     graph = build_joke_graph(checkpointer, [], [])
@@ -539,7 +539,9 @@ def test_checkpoints_of_a_thread_form_a_chain_in_the_order_of_their_ids(runs: in
     versions = {checkpoint.v for checkpoint in stored}
     assert ids == sorted(set(ids)), f"Expected ids that increase, got {ids}."
     assert parents == [None, *ids[:-1]], f"Expected each parent to be the checkpoint before, got {parents}."
-    assert versions == {3}, f"Expected format version 3, got {versions}."
+    assert versions == {CHECKPOINT_FORMAT_VERSION}, (
+        f"Expected format version {CHECKPOINT_FORMAT_VERSION}, got {versions}."
+    )
 
 
 def test_latest_checkpoint_is_the_one_with_the_greatest_id() -> None:
@@ -622,7 +624,7 @@ def test_overwrite_in_a_command_replaces_the_value_of_the_latest_checkpoint_of_a
 
 def test_checkpoint_of_another_format_version_is_rejected() -> None:
     """
-    Arrange: a thread whose stored records have format version 2.
+    Arrange: a thread whose stored records have the format version before the current one.
     Act: run the thread again without an input.
     Assert: the run raises the ValidationError of Pydantic.
     """
@@ -630,7 +632,8 @@ def test_checkpoint_of_another_format_version_is_rejected() -> None:
     graph = build_joke_graph(checkpointer, [], [])
     asyncio.run(graph.ainvoke({"topics": ["cats"]}, "thread"))
     records = checkpointer.threads["thread"][""]
-    checkpointer.threads["thread"][""] = {key: record.replace('"v":3', '"v":2') for key, record in records.items()}
+    current, earlier = f'"v":{CHECKPOINT_FORMAT_VERSION}', f'"v":{CHECKPOINT_FORMAT_VERSION - 1}'
+    checkpointer.threads["thread"][""] = {key: record.replace(current, earlier) for key, record in records.items()}
 
     with pytest.raises(ValidationError):
         asyncio.run(graph.ainvoke(None, "thread"))
