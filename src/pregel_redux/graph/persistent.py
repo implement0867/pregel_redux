@@ -241,11 +241,15 @@ class PersistentGraph[StateT, InputT, OutputT]:
         loaded = await scope.find(address.checkpoint_id)
         finished: list[tuple[Task, TaskWrites]] = []
         if loaded is None:
-            node = infer_writer(graph, {}) if as_node is None else as_node
+            node = infer_writer(graph, {}, ()) if as_node is None else as_node
             position, step, parent_id, newest_id = graph.open({}), -1, None, None
         else:
             checkpoint = loaded.saved.checkpoint
-            node = infer_writer(graph, checkpoint.versions_seen) if as_node is None else as_node
+            node = (
+                infer_writer(graph, checkpoint.versions_seen, await scope.list_nodes_of_the_last_step(checkpoint))
+                if as_node is None
+                else as_node
+            )
             position = scope.read_position(loaded.saved)
             if address.checkpoint_id is None:
                 journal = ThreadJournal(scope, loaded.saved, loaded.newest_id)
